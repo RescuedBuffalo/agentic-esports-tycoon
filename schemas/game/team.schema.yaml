@@ -1,0 +1,49 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "aet:game/team"
+title: Team
+type: object
+additionalProperties: false
+required: [id, name, region, roster]
+properties:
+  id:
+    type: string
+    pattern: "^[a-z0-9][a-z0-9_-]{2,63}$"
+  name:
+    type: string
+    minLength: 1
+  short_name:
+    type: string
+    maxLength: 8
+  region:
+    type: string
+    enum: [na, eu, kr, cn, sa, sea, oce]
+  founded:
+    type: string
+    format: date
+  roster:
+    type: array
+    minItems: 1
+    items:
+      type: object
+      additionalProperties: false
+      required: [player_id, slot]
+      properties:
+        player_id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9_-]{2,63}$"
+        slot:
+          type: string
+          enum: [starter, sub, coach, analyst]
+  reputation:
+    type: integer
+    minimum: 0
+    maximum: 100
+    default: 50
+  bank_cents:
+    type: integer
+    minimum: 0
+    default: 0
+  fan_base_size:
+    type: integer
+    minimum: 0
+    default: 0

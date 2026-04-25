@@ -1,0 +1,41 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "aet:config/run"
+title: RunConfig
+description: Top-level run settings. Anything that varies between runs of the same build.
+type: object
+additionalProperties: false
+required: [run_id, seed, ticks, paths]
+properties:
+  run_id:
+    type: string
+    pattern: "^[a-z0-9][a-z0-9_-]{2,63}$"
+    description: Stable identifier; used as the directory name for artifacts.
+  seed:
+    type: integer
+    minimum: 0
+    maximum: 4294967295
+    description: Root seed for the RngTree. Same seed + same data = same run.
+  ticks:
+    type: integer
+    minimum: 1
+    description: Total ticks to simulate.
+  snapshot_every:
+    type: integer
+    minimum: 1
+    default: 256
+    description: Tick interval between full world-state snapshots.
+  paths:
+    type: object
+    additionalProperties: false
+    required: [game_data, output]
+    properties:
+      game_data:
+        type: string
+        description: Directory containing game-data YAML (see schemas/game/).
+      output:
+        type: string
+        description: Directory where event logs and snapshots are written.
+  resume_from:
+    type: [string, "null"]
+    default: null
+    description: Optional snapshot path to resume from instead of genesis.

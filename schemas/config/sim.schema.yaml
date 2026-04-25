@@ -1,0 +1,59 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "aet:config/sim"
+title: SimConfig
+description: Knobs that change how the simulation core behaves but not what is in it.
+type: object
+additionalProperties: false
+required: [tick, scheduler]
+properties:
+  tick:
+    type: object
+    additionalProperties: false
+    required: [in_game_minutes]
+    properties:
+      in_game_minutes:
+        type: integer
+        minimum: 1
+        default: 1440
+        description: How much in-game time elapses per tick. 1440 = one day.
+  scheduler:
+    type: object
+    additionalProperties: false
+    properties:
+      max_jobs_per_tick:
+        type: integer
+        minimum: 1
+        default: 1024
+      job_timeout_ms:
+        type: integer
+        minimum: 1
+        default: 5000
+        description: Hard cap on a single agent decision.
+  economy:
+    type: object
+    additionalProperties: false
+    properties:
+      currency:
+        type: string
+        default: USD
+      inflation_pct_per_year:
+        type: number
+        default: 2.0
+      starting_capital:
+        type: number
+        minimum: 0
+        default: 250000
+  rules:
+    type: object
+    additionalProperties: false
+    description: Toggles for optional rule modules. Off by default.
+    properties:
+      enable_streaming_revenue:
+        type: boolean
+        default: true
+      enable_player_morale:
+        type: boolean
+        default: true
+      enable_injuries:
+        type: boolean
+        default: false

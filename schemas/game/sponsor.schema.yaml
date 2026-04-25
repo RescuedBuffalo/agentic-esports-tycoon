@@ -1,0 +1,32 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "aet:game/sponsor"
+title: Sponsor
+type: object
+additionalProperties: false
+required: [id, name, sector, base_offer_cents]
+properties:
+  id:
+    type: string
+    pattern: "^[a-z0-9][a-z0-9_-]{2,63}$"
+  name:
+    type: string
+    minLength: 1
+  sector:
+    type: string
+    enum: [hardware, beverage, apparel, finance, telco, gambling, crypto, other]
+  prestige:
+    type: integer
+    minimum: 0
+    maximum: 100
+    default: 50
+  base_offer_cents:
+    type: integer
+    minimum: 0
+    description: Reference annual offer; multiplied by demand factors at runtime.
+  ethics_flags:
+    type: array
+    description: Tags that fan-sentiment models can react to.
+    items:
+      type: string
+      enum: [age_restricted, environmental_concern, regulatory_risk]
+    default: []
