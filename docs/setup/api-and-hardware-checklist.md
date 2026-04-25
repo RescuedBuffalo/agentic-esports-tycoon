@@ -8,10 +8,10 @@ kicking off Phase 1.
 
 | Provider | Why we need it | Account / key location | Owner | Status |
 | --- | --- | --- | --- | --- |
-| Anthropic API | LLM-driven `gm` agent (default backend). | `ANTHROPIC_API_KEY` in shared 1Password vault `aet/secrets`. | Platform | ☐ |
+| Anthropic API | LLM-driven `gm` agent (default backend). | `ANTHROPIC_API_KEY` in shared 1Password vault `esports-sim/secrets`. | Platform | ☐ |
 | OpenAI API | LLM agent A/B comparisons; embeddings for scout reports. | `OPENAI_API_KEY` in same vault. | Platform | ☐ |
 | Local model gateway | Offline inference for budget runs (vLLM on internal cluster). | Internal endpoint URL in `.env.example`. | Infra | ☐ |
-| Object storage | Event-log + snapshot uploads. | S3-compatible bucket `aet-runs-prod`. | Infra | ☐ |
+| Object storage | Event-log + snapshot uploads. | S3-compatible bucket `esports-sim-runs-prod`. | Infra | ☐ |
 | Telemetry sink | Run metrics. | Prometheus push-gateway or hosted equivalent. | Infra | ☐ |
 
 ### Per-key requirements

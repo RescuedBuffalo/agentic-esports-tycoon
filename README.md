@@ -6,12 +6,15 @@ and reinforcement-learning agents.
 
 This repository is in the **planning phase**. Useful entry points:
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview.
-- [`docs/design/observation-action-space.md`](docs/design/observation-action-space.md) — agent I/O contract.
-- [`docs/design/world-model-state.md`](docs/design/world-model-state.md) — provisional world-model state.
-- [`docs/setup/api-and-hardware-checklist.md`](docs/setup/api-and-hardware-checklist.md) — what we need to procure before training.
-- [`schemas/`](schemas/) — YAML schemas for configs and game data.
-- [`src/aet/`](src/aet/) — Python package (currently: RNG tree + event schemas).
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview, three-layer breakdown.
+- [`docs/design/observation-action-space.md`](docs/design/observation-action-space.md) — match-engine obs/action contract (BUF-79).
+- [`docs/design/world-model-state.md`](docs/design/world-model-state.md) — neural world-model latent shape (BUF-81).
+- [`docs/design/tycoon-obs-action-space.md`](docs/design/tycoon-obs-action-space.md) — management-layer obs/action (companion).
+- [`docs/design/tycoon-state-factorisation.md`](docs/design/tycoon-state-factorisation.md) — management-layer state (companion).
+- [`docs/setup/api-and-hardware-checklist.md`](docs/setup/api-and-hardware-checklist.md) — what we need to procure before training (BUF-80).
+- [`config/`](config/) — data-pipeline configs (BUF-75).
+- [`data/`](data/) — canonical Valorant content the sim consumes (BUF-76).
+- [`src/esports_sim/`](src/esports_sim/) — Python package (currently: RNG tree + event schemas).
 
 ## Quick start (developers)
 

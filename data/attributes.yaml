@@ -1,0 +1,93 @@
+# Canonical attribute list. Every numeric field referenced from data/agents,
+# data/weapons, data/maps must declare itself here. Sim and pipeline read this
+# file at boot; unknown attributes are a hard error.
+
+attributes:
+  # --- Player skills (0..100, hidden ratings the sim uses) -------------------
+  - id: aim
+    kind: player_skill
+    range: [0, 100]
+    description: Mechanical aim accuracy at range under pressure.
+  - id: gamesense
+    kind: player_skill
+    range: [0, 100]
+    description: Map awareness, rotation timing, mid-round adaptation.
+  - id: utility_usage
+    kind: player_skill
+    range: [0, 100]
+    description: Quality of ability deployment for the agent's role.
+  - id: communication
+    kind: player_skill
+    range: [0, 100]
+    description: Calling, comms efficiency, tilt resistance under pressure.
+  - id: clutch
+    kind: player_skill
+    range: [0, 100]
+    description: 1vN performance relative to baseline.
+  - id: mental
+    kind: player_skill
+    range: [0, 100]
+    description: Tilt floor; degrades the others when low.
+
+  # --- Agent attributes ------------------------------------------------------
+  - id: ability_charges
+    kind: agent_metadata
+    range: [0, 4]
+    description: Slots an ability occupies on the agent's bar.
+  - id: ability_cost_credits
+    kind: agent_metadata
+    range: [0, 800]
+    description: Credit cost per charge, 0 if signature / ultimate.
+  - id: ultimate_points_required
+    kind: agent_metadata
+    range: [4, 9]
+    description: Orbs and frags needed to charge the ultimate.
+
+  # --- Weapon attributes -----------------------------------------------------
+  - id: weapon_cost_credits
+    kind: weapon_metadata
+    range: [0, 5000]
+  - id: weapon_damage_head
+    kind: weapon_metadata
+    range: [0, 1000]
+    description: Headshot damage at point-blank, no falloff.
+  - id: weapon_damage_body
+    kind: weapon_metadata
+    range: [0, 1000]
+  - id: weapon_damage_legs
+    kind: weapon_metadata
+    range: [0, 1000]
+  - id: weapon_fire_rate
+    kind: weapon_metadata
+    range: [0, 30]
+    description: Rounds per second.
+  - id: weapon_magazine
+    kind: weapon_metadata
+    range: [0, 100]
+  - id: weapon_wall_penetration
+    kind: weapon_metadata
+    range: [0, 2]
+    description: 0 low, 1 medium, 2 heavy.
+
+  # --- Map attributes --------------------------------------------------------
+  - id: map_sites
+    kind: map_metadata
+    range: [2, 3]
+  - id: map_chokepoints
+    kind: map_metadata
+    range: [2, 8]
+  - id: map_open_to_close_ratio
+    kind: map_metadata
+    range: [0.0, 5.0]
+    description: Long-sightline area divided by close-quarters area.
+
+  # --- Round economy ---------------------------------------------------------
+  - id: credits
+    kind: round_state
+    range: [0, 9000]
+  - id: round_duration_seconds
+    kind: round_state
+    range: [0, 145]
+  - id: spike_timer_seconds
+    kind: round_state
+    range: [0, 45]

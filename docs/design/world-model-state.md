@@ -1,122 +1,157 @@
-# Provisional world-model state representation
+# World-model state representation (provisional)
 
-Status: **Planning / draft**. Closes BUF-81. Pairs with
-[`observation-action-space.md`](observation-action-space.md).
+Status: **Planning / draft**. Closes BUF-81. Companions:
+[`observation-action-space.md`](observation-action-space.md) (BUF-79) and
+[`tycoon-state-factorisation.md`](tycoon-state-factorisation.md) (the
+management-layer state). Feeds BUF-38 (replay buffer / experience storage
+format).
 
-The world model is a learned compression of the full simulation state, used by
-planning agents to roll forward "what if" trajectories without re-running the
-full simulator. This document fixes a **provisional** representation so that
-the rest of the planning artifacts (data layout, encoder skeleton, evaluation
-plan) can lock in. Expect the shapes here to change after the first training
-run.
+This document picks the **provisional** neural world-model state shape for
+the match-engine policy and the dynamics learner. The decision matters for
+BUF-38 because the buffer needs to know whether it's storing discrete tokens,
+continuous vectors, or both — and how big each step is on disk.
 
-## 1. Why a learned state instead of the raw state
+## 1. Why we need this now
 
-The raw `WorldState` is large, sparse, and contains identifiers that are not
-useful as model inputs (UUIDs, free-text scout notes). A learned state lets us:
+Every other piece of the RL pipeline depends on a state encoding being
+nameable:
 
-1. Keep a fixed-dimensional representation regardless of league size.
-2. Drop fields the model has learned to be irrelevant.
-3. Share weights between the dynamics head and the policy / value heads.
+- BUF-30 (match engine) needs to know what its `info` payload should expose
+  to make the world model trainable.
+- BUF-34 (PettingZoo wrapper) needs to know which fields land in obs vs.
+  which are deferred until the dynamics learner asks.
+- BUF-38 (replay buffer) needs a stable on-disk schema for the latent. A
+  256-dim continuous vector and a 32-token-of-categorical-32 sequence have
+  very different storage and lookup costs.
+- The world model itself needs an encoder target shape before any
+  representation-learning sweep can start.
 
-## 2. State factorisation
+## 2. Provisional choice: hybrid RSSM-style latent
 
-The world model state `z_t` is the concatenation of three sub-states. Each
-sub-state is produced by its own encoder; the dynamics module operates on the
-concatenation.
-
-```
-z_t = [ z_org_t  ‖  z_league_t  ‖  z_economy_t ]
-       (D_org=64) (D_league=128) (D_econ=32)
-```
-
-Total provisional dimension: **`D = 224`**. (Subject to change after the first
-representation-learning sweep.)
-
-### 2.1 `z_org` — owned organisation (D=64)
-
-Encodes everything about the player's own org: roster, finances, morale,
-upcoming commitments. Inputs come from the `gm` observation view.
-
-- Roster encoder: per-player MLP → mean-pool over starters, separate mean-pool
-  over subs, concat. Player input features: 5 skill ratings, role one-hot,
-  age, contract length remaining, morale.
-- Finance encoder: small MLP over `[bank_cents, payroll_run_rate,
-  sponsor_run_rate, debt]`, all log-scaled.
-
-### 2.2 `z_league` — competitive landscape (D=128)
-
-Encodes other orgs and tournaments. The space is variable-sized (number of
-orgs and tournaments changes over time), so we use set encoders + cross-attn
-to a fixed bank of learned slot tokens.
-
-- Per-org token: `[public_reputation, public_form_last_8, region_one_hot,
-  ...]`.
-- Per-tournament token: `[tier, days_until, prize_pool_log, region_one_hot]`.
-- Aggregator: cross-attention from a fixed pool of 16 slot queries (chosen so
-  the model can specialise slots to "rivals", "cupcakes", "next opponent",
-  etc.). Output flattened to D=128.
-
-### 2.3 `z_economy` — macro (D=32)
-
-A small MLP over `[inflation_pct, salary_index, sponsor_demand_index,
-fan_growth_rate]`. Mostly a stability signal; rarely changes between adjacent
-ticks.
-
-## 3. Dynamics
-
-We learn a recurrent dynamics module:
+We commit to **a Recurrent State-Space Model (RSSM) latent with a hybrid
+deterministic/stochastic split**, following the Dreamer family:
 
 ```
-z_{t+1} = f_theta( z_t, a_t, e_t )
+state_t = (h_t, z_t)
+  h_t ∈ R^H        # deterministic recurrent state
+  z_t ∈ {one_hot(C)}^N  # stochastic state, N categorical groups of C classes
 ```
 
-- `a_t` — discrete action kind one-hot (≤32 dims) + small continuous payload
-  (≤16 dims), padded.
-- `e_t` — exogenous tick info: in-game date features, scheduled-match flag,
-  is-end-of-season flag.
-- `f_theta` — GRU cell of width 256, plus a residual MLP.
+Provisional dimensions:
 
-Heads attached to `z_t`:
-- Reward head (scalar): `r_t = MLP(z_t)`.
-- Value head (scalar): `V(z_t) = MLP(z_t)`.
-- Policy head (per role): `pi(a | z_t, role) = MLP(z_t, role_embed)`.
-- Reconstruction heads: bank balance bucket, league-table position; trained
-  as auxiliary losses to keep `z_t` informative.
+| Symbol | Meaning | Default | Rationale |
+| --- | --- | --- | --- |
+| `H` | GRU hidden size | 512 | Matches Dreamer-V3 baseline; fits comfortably on a 24 GB GPU. |
+| `N` | Number of categorical groups | 32 | Enough capacity for a 5v5 map state without exploding sample size. |
+| `C` | Classes per group | 32 | Powers-of-two friendly; maps to 5-bit symbols on disk. |
 
-## 4. Training signal
+### 2.1 Why discrete latents (z_t)
 
-Phase 0 (BUF-81 — this issue): no training, just the schema and encoder
-skeleton. We need the shapes nailed down so that BUF-79's tensor view can
-align with the encoder inputs.
+- Dreamer-V3 evidence: discrete categoricals stabilise training across
+  domains without per-task tuning.
+- Compact on disk: `N · ceil(log2 C) = 32 · 5 = 160 bits = 20 bytes` per
+  step's stochastic state. The deterministic `h_t` is what dominates BUF-38
+  storage.
+- Plays well with cross-entropy losses on the dynamics head, which avoids
+  the KL-collapse pathology continuous latents are prone to.
 
-Phase 1 (post-planning): supervised pre-training on logged event streams.
-Targets: next-tick reconstruction of (a) bank balance, (b) league-table
-position, (c) outcome of the next match. This gives us a useful `z_t` before
-any RL touches it.
+### 2.2 Why also keep h_t deterministic
 
-Phase 2: RL fine-tuning of the policy heads with the world model frozen, then
-joint training. PPO baseline; Dreamer-style imagination rollouts are out of
-scope until the supervised phase is healthy.
+- Long-horizon credit assignment in match rounds (10–145 s, 100–1450 sim
+  steps) benefits from a recurrent backbone.
+- A single discrete sample per step would be a high-variance signal for the
+  policy head; mixing it with `h_t` gives a stable substrate.
 
-## 5. Reproducibility
+### 2.3 What we explicitly defer
+
+- **JEPA-style joint-embedding predictive architectures**: attractive as a
+  pre-training signal because they sidestep reconstruction, but the
+  literature on multi-agent partially-observed environments is thinner. We
+  treat JEPA as an alternative encoder that can plug in behind the same
+  `(h_t, z_t)` interface; revisit after a Dreamer baseline lands.
+- **Pure continuous Gaussian latents** (Dreamer-V1/V2 style): worse
+  empirical stability in our setting; rejected.
+- **Token-only models** (no `h_t`): rejected for the round-length reasons
+  above.
+
+## 3. Encoder + decoder shapes
+
+Inputs are the per-agent observation from BUF-79. The encoder is per-agent
+(weight-shared) and emits one `(h_t, z_t)` per agent; the dynamics module
+optionally fuses across teammates via attention.
+
+```
+encoder: BUF-79 obs -> z_t ~ Categorical(N, C)
+prior:   h_t -> z_hat_t ~ Categorical(N, C)        # KL target
+recurrent: h_{t+1} = GRU(h_t, embed(z_t), embed(a_t))
+heads:
+  reward      r_t = MLP(h_t, z_t)
+  termination d_t = MLP(h_t, z_t)
+  obs decoder o_t = MLP(h_t, z_t)        # auxiliary; small reconstruction
+```
+
+We do **not** decode the full observation pixel-perfectly — the auxiliary
+decoder is a lightweight projection over a few salient channels (own HP, own
+position, spike state, observed enemies). Full reconstruction is too large
+to be worth the gradient.
+
+## 4. Implications for BUF-38 (replay buffer storage)
+
+Per env step, per agent, we store:
+
+| Field | Size | Notes |
+| --- | --- | --- |
+| Observation packed bytes | ~6–8 kB | Per BUF-79 layout; dominated by grid patch and rays. |
+| Action packed bytes | ~16 B | Discrete head + small payload. |
+| `h_t` snapshot | 512 × 4 B = 2 kB | float32; switching to bf16 halves this. |
+| `z_t` snapshot | 20 B | 32×32 categorical packed to 5 bits each. |
+| Reward / done | 8 B | |
+| Step metadata | ~32 B | tick, agent_id, rng_path, schema_version. |
+
+Provisional total: **~10 kB / agent / step**. A best-of-13 match capped at
+13 rounds × ~1450 steps × 10 agents ≈ 1.9M steps ≈ **~19 GB / match raw**.
+That number sets a hard ceiling on how many matches we can replay-buffer per
+host without compression; BUF-38 will own that decision.
+
+Storage hooks the buffer must support:
+
+1. **Decouple obs and latent**: the buffer must be able to drop `(h_t, z_t)`
+   if the model version changes (re-encoded from obs on demand) without
+   rewriting the obs payload.
+2. **Versioned latents**: every saved `(h_t, z_t)` carries
+   `(model_version, obs_schema_version)`. Mismatched reads either re-encode
+   (if obs schema matches) or are skipped.
+3. **Trajectory-level access**: the dynamics trainer needs contiguous
+   round-length sequences, so the buffer indexes by `(match_id, round_idx,
+   agent_id)`.
+
+## 5. Determinism
 
 The world-model trainer pulls its own RNG subtree from the run's `RngTree`
-under `wm/<seed_id>` so that swapping a model version does not perturb sim
-randomness for unrelated subsystems (BUF-77).
+under `wm/<seed_id>` (BUF-77). Encoder dropout, KL temperature schedules,
+and replay-buffer shuffling all draw from this subtree so swapping a model
+version does not perturb sim randomness for unrelated subsystems.
 
-## 6. What this document does **not** lock in
+## 6. Open questions
 
-- Exact encoder hyperparameters — keep notebook tuning rights.
-- Dataset partitioning across runs — needs an offline ETL plan.
-- Choice of optimiser — default to AdamW; revisit once we have a loss curve.
-- Which agents actually consume `z_t` first. Likely `gm` only, then `coach`,
-  then `scout`.
+- `(N, C) = (32, 32)` is a starting point; an ablation between `(32, 16)`,
+  `(32, 32)`, and `(48, 32)` should run before any policy training that
+  relies on the latent.
+- Whether the cross-agent attention fuse lives inside the encoder or the
+  dynamics module. Lean toward the dynamics module so single-agent encoders
+  remain reusable for evaluation.
+- KL balancing: Dreamer-V3 uses fixed coefficients; we may need a schedule
+  for highly-asymmetric round openings (eco rounds vs. full-buy).
+- Whether to expose `z_t` to the policy head as samples or as the full
+  categorical distribution. Current plan: samples during rollout, mean
+  during evaluation.
 
 ## 7. Acceptance for closing BUF-81
 
-- [x] Sub-state factorisation (org / league / economy) is named and
-      dimensioned.
-- [x] Dynamics shape and heads are sketched.
-- [x] Training plan is split into phases with explicit phase-0 deliverables.
-- [x] Reproducibility hook into `RngTree` is documented.
+- [x] Latent shape committed: hybrid RSSM `(h_t ∈ R^512, z_t ∈ Categorical^{32×32})`.
+- [x] Discrete-vs-continuous decision is recorded with rationale.
+- [x] JEPA, pure-continuous, and token-only alternatives explicitly weighed
+      and either deferred or rejected.
+- [x] On-disk implications are itemised for BUF-38 with a per-step byte
+      budget.
+- [x] Determinism + versioning hooks documented.

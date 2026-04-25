@@ -1,6 +1,6 @@
 import pytest
 
-from aet.rng import RngTree
+from esports_sim.rng import RngTree
 
 
 def _draw(node, n=4):

@@ -1,0 +1,77 @@
+enabled: true
+
+# Validation runs after derivation + relationships and gates graph_export.
+# Each rule has a stable id, a query / check, a severity, and a threshold.
+# Severity 'error' fails the pipeline; 'warn' surfaces in the report.
+
+rules:
+  - id: matches_have_two_distinct_teams
+    severity: error
+    check: sql
+    query: |
+      SELECT COUNT(*) FROM canonical.matches
+      WHERE home_team_id = away_team_id
+    expected: 0
+
+  - id: every_match_in_a_patch_era
+    severity: error
+    check: sql
+    query: |
+      SELECT COUNT(*) FROM canonical.matches m
+      LEFT JOIN canonical.patch_eras e
+        ON m.played_at BETWEEN e.starts_at
+                            AND COALESCE(e.ends_at, '2999-01-01')
+      WHERE e.id IS NULL
+    expected: 0
+
+  - id: kast_in_range
+    severity: error
+    check: sql
+    query: |
+      SELECT COUNT(*) FROM derived.player_round
+      WHERE kast_pct < 0 OR kast_pct > 1
+    expected: 0
+
+  - id: no_orphaned_player_team_edges
+    severity: error
+    check: sql
+    query: |
+      SELECT COUNT(*) FROM edges.plays_for e
+      LEFT JOIN canonical.players p ON e.from_id = p.id
+      LEFT JOIN canonical.teams   t ON e.to_id   = t.id
+      WHERE p.id IS NULL OR t.id IS NULL
+    expected: 0
+
+  - id: review_queue_is_small
+    severity: warn
+    check: file_lines
+    path: out/entity_resolution/review_queue.jsonl
+    max_lines: 100
+
+  - id: agent_metadata_complete
+    severity: warn
+    check: sql
+    query: |
+      SELECT COUNT(*) FROM canonical.agents
+      WHERE abilities IS NULL OR cardinality(abilities) < 3
+    expected: 0
+
+  - id: map_metadata_complete
+    severity: error
+    check: sql
+    query: |
+      SELECT COUNT(*) FROM canonical.maps
+      WHERE sites IS NULL OR cardinality(sites) NOT IN (2, 3)
+    expected: 0
+
+  - id: weapon_economy_present
+    severity: error
+    check: sql
+    query: |
+      SELECT COUNT(*) FROM canonical.weapons
+      WHERE cost IS NULL OR damage_curve IS NULL
+    expected: 0
+
+report:
+  output_path: out/validation/report.md
+  fail_pipeline_on_error: true

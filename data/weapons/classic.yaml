@@ -1,0 +1,17 @@
+id: classic
+name: Classic
+category: sidearm
+weapon_cost_credits: 0
+fire_mode: semi_auto_or_burst
+weapon_magazine: 12
+damage_curve:
+  point_blank:
+    weapon_damage_head: 78
+    weapon_damage_body: 26
+    weapon_damage_legs: 22
+  long_range:
+    weapon_damage_head: 66
+    weapon_damage_body: 22
+    weapon_damage_legs: 18
+weapon_fire_rate: 6.75
+weapon_wall_penetration: 0

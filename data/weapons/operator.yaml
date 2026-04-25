@@ -1,0 +1,13 @@
+id: operator
+name: Operator
+category: sniper
+weapon_cost_credits: 4700
+fire_mode: bolt_action
+weapon_magazine: 5
+damage_curve:
+  any_range:
+    weapon_damage_head: 255
+    weapon_damage_body: 255
+    weapon_damage_legs: 127
+weapon_fire_rate: 0.6
+weapon_wall_penetration: 2

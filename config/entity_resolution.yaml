@@ -1,0 +1,55 @@
+enabled: true
+
+sources:
+  - name: vlr
+    kind: scraper
+    cursor_table: pipeline.cursors_vlr
+  - name: riot_official
+    kind: api
+    cursor_table: pipeline.cursors_riot
+  - name: liquipedia
+    kind: scraper
+    cursor_table: pipeline.cursors_liquipedia
+
+players:
+  match_keys:
+    - lower(handle)
+    - normalised(real_name)
+    - country_code
+  blocking_keys:
+    - first_two_chars_of_handle
+  scoring:
+    handle_exact: 0.85
+    real_name_jw_min: 0.92
+    country_match_bonus: 0.05
+  thresholds:
+    auto_merge: 0.92
+    review_queue: 0.78
+  manual_overrides_path: data/_overrides/players.yaml
+
+teams:
+  match_keys:
+    - lower(short_name)
+    - normalised(full_name)
+    - region
+  scoring:
+    short_name_exact: 0.9
+    full_name_jw_min: 0.9
+  thresholds:
+    auto_merge: 0.9
+    review_queue: 0.75
+  manual_overrides_path: data/_overrides/teams.yaml
+
+tournaments:
+  match_keys:
+    - normalised(name)
+    - season
+    - region
+  thresholds:
+    auto_merge: 0.95
+    review_queue: 0.85
+  manual_overrides_path: data/_overrides/tournaments.yaml
+
+review_queue:
+  output_path: out/entity_resolution/review_queue.jsonl
+  fail_pipeline_if_size_exceeds: 500

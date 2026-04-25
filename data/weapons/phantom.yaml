@@ -1,0 +1,21 @@
+id: phantom
+name: Phantom
+category: rifle
+weapon_cost_credits: 2900
+fire_mode: full_auto
+weapon_magazine: 30
+damage_curve:
+  short_range:
+    weapon_damage_head: 156
+    weapon_damage_body: 39
+    weapon_damage_legs: 33
+  medium_range:
+    weapon_damage_head: 140
+    weapon_damage_body: 35
+    weapon_damage_legs: 29
+  long_range:
+    weapon_damage_head: 124
+    weapon_damage_body: 31
+    weapon_damage_legs: 26
+weapon_fire_rate: 11.0
+weapon_wall_penetration: 1

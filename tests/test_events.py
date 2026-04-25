@@ -1,7 +1,7 @@
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from aet.schemas.events import (
+from esports_sim.schemas.events import (
     AnyEvent,
     CashTransferred,
     MatchCompleted,

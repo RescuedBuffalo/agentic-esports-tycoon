@@ -1,0 +1,12 @@
+id: ascent
+name: Ascent
+released_in_patch: "1.0"
+retired_in_patch: null
+map_sites: 2
+map_chokepoints: 5
+map_open_to_close_ratio: 2.0
+sites: [a, b]
+notable_features:
+  - mechanical_doors: true
+  - has_mid: true
+layout_image: ascent_minimap_v1.png

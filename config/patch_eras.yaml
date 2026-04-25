@@ -1,0 +1,58 @@
+enabled: true
+
+# Hand-curated boundaries between Valorant patch eras. A 'patch era' is the
+# window during which the meta is stable enough that we treat it as one
+# regime for stat aggregation, model training, and replay buffer slicing.
+#
+# Boundary policy: bump to a new era when ANY of the following ships:
+#   - new agent
+#   - new map (or large layout rework)
+#   - balance change to a top-pick agent that flips its pick rate by >=15%
+#
+# id format: 'eYYYY_NN' where NN increments per calendar year.
+
+eras:
+  - id: e2024_01
+    name: "Iso meta, Sunset stable"
+    starts_at: 2024-01-09T00:00:00Z
+    ends_at:   2024-04-15T00:00:00Z
+    riot_patches: ["8.0", "8.01", "8.04", "8.05", "8.07", "8.08"]
+    notable: ["Iso debut", "Sunset launch settles in"]
+
+  - id: e2024_02
+    name: "Clove meta opens"
+    starts_at: 2024-04-15T00:00:00Z
+    ends_at:   2024-08-05T00:00:00Z
+    riot_patches: ["8.08", "8.09", "8.11", "9.00", "9.01"]
+    notable: ["Clove launch", "Abyss launch (later in window)"]
+
+  - id: e2024_03
+    name: "Abyss settled, Champions cycle"
+    starts_at: 2024-08-05T00:00:00Z
+    ends_at:   2025-01-06T00:00:00Z
+    riot_patches: ["9.02", "9.04", "9.07", "9.10"]
+    notable: ["Champions Seoul", "Sage rework"]
+
+  - id: e2025_01
+    name: "Tejo + map rotation 2025"
+    starts_at: 2025-01-06T00:00:00Z
+    ends_at:   2025-06-23T00:00:00Z
+    riot_patches: ["10.00", "10.01", "10.03", "10.06"]
+    notable: ["Tejo debut", "Map pool rotation"]
+
+  - id: e2025_02
+    name: "Waylay window"
+    starts_at: 2025-06-23T00:00:00Z
+    ends_at:   2026-01-12T00:00:00Z
+    riot_patches: ["10.07", "10.10", "11.00", "11.03"]
+    notable: ["Waylay debut"]
+
+  - id: e2026_01
+    name: "Provisional 2026 opener"
+    starts_at: 2026-01-12T00:00:00Z
+    ends_at: null   # current era; null until the next boundary lands
+    riot_patches: []
+    notable: []
+
+defaults:
+  unknown_match_policy: nearest_prior   # fall back to nearest prior era

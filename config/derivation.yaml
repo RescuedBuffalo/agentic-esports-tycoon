@@ -1,0 +1,55 @@
+enabled: true
+
+# Each entry derives one or more columns on the canonical match table.
+# Inputs reference column paths from the upstream tables; outputs are written
+# to derived.* tables. Order matters: later derivations may depend on earlier.
+derivations:
+  - name: kast
+    output_table: derived.player_round
+    output_columns: [kast_pct]
+    inputs: [round_player_stats]
+    expression: |
+      mean_over_rounds(
+        kill_or_assist_or_survive_or_traded(player_id, round_id)
+      )
+
+  - name: adr
+    output_table: derived.player_match
+    output_columns: [adr]
+    inputs: [round_player_damage]
+    expression: |
+      sum(damage_dealt) / count(distinct round_id)
+
+  - name: first_blood_rate
+    output_table: derived.player_match
+    output_columns: [fb_rate, fd_rate]
+    inputs: [round_player_kills]
+    expression: |
+      ratios(
+        first_kill_in_round_by(player_id),
+        first_death_in_round_by(player_id),
+        denom=count(distinct round_id)
+      )
+
+  - name: agent_specific_metrics
+    output_table: derived.agent_player_match
+    output_columns:
+      - jett_dash_aggression  # Jett-specific
+      - sage_wall_uptime      # Sage-specific
+      - sova_recon_coverage   # Sova-specific
+    inputs: [round_player_abilities, round_player_positions]
+    # Implementation lives in code; this entry just schedules it.
+    impl: esports_sim.pipeline.derivations.agent_specific.run
+
+  - name: economy_metrics
+    output_table: derived.team_round
+    output_columns: [credit_efficiency, save_value_lost]
+    inputs: [round_team_economy, round_outcomes]
+    expression: |
+      credit_efficiency = damage_dealt / credits_spent
+      save_value_lost   = saved_loadout_value when round_lost else 0
+
+backfill:
+  start: 2023-01-01T00:00:00Z
+  chunk_days: 7
+  parallelism: 4
