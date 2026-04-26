@@ -272,32 +272,43 @@ class Ledger:
         cleaner than inserting two rows and joining them in every report query.
         We log the transition via ``phase`` so the audit trail shows what
         happened.
+
+        ``notes`` is *appended* to whatever the pre-flight row already held,
+        not replaced. This matters in break-glass mode and on errors:
+        otherwise an error annotation (``anthropic.APIError: timeout``)
+        would clobber the pre-flight ``override_disable_caps=True`` marker
+        and post-mortems couldn't tell which failed calls slipped through
+        an override. Pass ``None`` to leave existing notes untouched.
         """
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE api_ledger
-                SET input_tokens = ?,
-                    output_tokens = ?,
-                    cache_creation_input_tokens = ?,
-                    cache_read_input_tokens = ?,
-                    usd_cost = ?,
-                    request_id = ?,
-                    phase = ?,
-                    notes = COALESCE(?, notes)
-                WHERE id = ?
+                SET input_tokens = :input_tokens,
+                    output_tokens = :output_tokens,
+                    cache_creation_input_tokens = :cache_creation_input_tokens,
+                    cache_read_input_tokens = :cache_read_input_tokens,
+                    usd_cost = :usd_cost,
+                    request_id = :request_id,
+                    phase = :phase,
+                    notes = CASE
+                        WHEN :note IS NULL THEN notes
+                        WHEN notes IS NULL OR notes = '' THEN :note
+                        ELSE notes || '; ' || :note
+                    END
+                WHERE id = :row_id
                 """,
-                (
-                    int(input_tokens),
-                    int(output_tokens),
-                    int(cache_creation_input_tokens),
-                    int(cache_read_input_tokens),
-                    float(usd_cost),
-                    request_id,
-                    phase,
-                    notes,
-                    row_id,
-                ),
+                {
+                    "input_tokens": int(input_tokens),
+                    "output_tokens": int(output_tokens),
+                    "cache_creation_input_tokens": int(cache_creation_input_tokens),
+                    "cache_read_input_tokens": int(cache_read_input_tokens),
+                    "usd_cost": float(usd_cost),
+                    "request_id": request_id,
+                    "phase": phase,
+                    "note": notes,
+                    "row_id": row_id,
+                },
             )
 
     # ---- reads -------------------------------------------------------------

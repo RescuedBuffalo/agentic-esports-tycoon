@@ -101,7 +101,20 @@ class Governor:
         ``BEGIN IMMEDIATE`` so concurrent governors serialise — without
         that lock two callers both reading $29.95 could each commit a $0.10
         call and end the week at $30.15.
+
+        Raises :class:`ValueError` if ``projected_cost_usd`` is negative —
+        a negative estimate would *reduce* apparent spend in the cap math
+        (admitting over-cap traffic) and, if persisted, grant extra budget
+        for subsequent calls. The right call site fix is to clamp / fix
+        the estimate, not silently mask it here, so we surface the bug.
         """
+        if projected_cost_usd < 0:
+            raise ValueError(
+                f"projected_cost_usd must be non-negative, got {projected_cost_usd!r}. "
+                "A negative estimate would let over-cap traffic through and, if "
+                "persisted, grant extra budget on subsequent calls."
+            )
+
         if self.caps.override_disable_caps:
             # Operator disabled enforcement — log it once, loudly, in the
             # row's notes so post-mortems can find every call that slipped
