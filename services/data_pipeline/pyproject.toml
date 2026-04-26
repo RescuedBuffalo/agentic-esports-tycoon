@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "data-pipeline"
+version = "0.0.1"
+description = "Valorant data ingest service (VLR / Riot / Liquipedia -> data/)."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "esports-sim-shared",
+]
+
+[tool.uv.sources]
+esports-sim-shared = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/data_pipeline"]

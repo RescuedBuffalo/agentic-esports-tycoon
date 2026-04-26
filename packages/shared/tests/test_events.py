@@ -1,6 +1,4 @@
 import pytest
-from pydantic import TypeAdapter, ValidationError
-
 from esports_sim.schemas.events import (
     AnyEvent,
     CashTransferred,
@@ -8,7 +6,7 @@ from esports_sim.schemas.events import (
     MatchScheduled,
     TickAdvanced,
 )
-
+from pydantic import TypeAdapter, ValidationError
 
 _adapter = TypeAdapter(AnyEvent)
 
@@ -71,7 +69,10 @@ def test_cash_transfer_allows_negative_amount():
     # Negative amount is legal (refunds, corrections); only the envelope tick is
     # constrained.
     e = CashTransferred(
-        tick=1, source="sim",
-        from_account="ops", to_account="payroll", amount_cents=-1000,
+        tick=1,
+        source="sim",
+        from_account="ops",
+        to_account="payroll",
+        amount_cents=-1000,
     )
     assert e.amount_cents == -1000

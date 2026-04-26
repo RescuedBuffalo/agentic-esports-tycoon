@@ -1,33 +1,77 @@
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "agentic-esports-tycoon"
 version = "0.0.1"
-description = "Agentic esports tycoon simulation."
-requires-python = ">=3.11"
+description = "Monorepo root: agentic esports tycoon simulation."
+requires-python = ">=3.12,<3.13"
 readme = "README.md"
 dependencies = [
-    "pydantic>=2.6",
-    "PyYAML>=6.0",
-    "numpy>=1.26",
+    "esports-sim-shared",
+    "data-pipeline",
+    "ecosystem",
+    "match-wm",
 ]
 
-[project.optional-dependencies]
+[tool.uv.workspace]
+members = ["packages/*", "services/*"]
+
+[tool.uv.sources]
+esports-sim-shared = { workspace = true }
+data-pipeline = { workspace = true }
+ecosystem = { workspace = true }
+match-wm = { workspace = true }
+
+[dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-picked>=0.5",
     "ruff>=0.4",
+    "black>=24.0",
     "mypy>=1.10",
+    "pre-commit>=3.7",
+    "types-PyYAML",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-ra"
+# --- Tooling configuration shared by every workspace member -------------------
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+# Type-check production code only. Tests run under pytest; type purity inside
+# tests buys little and produces a lot of `-> None` noise.
+files = [
+    "packages/shared/src",
+    "services/data_pipeline/src",
+    "services/ecosystem/src",
+    "services/match_wm/src",
+]
+explicit_package_bases = true
+mypy_path = [
+    "packages/shared/src",
+    "services/data_pipeline/src",
+    "services/ecosystem/src",
+    "services/match_wm/src",
+]
+
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = [
+    "packages/shared/tests",
+    "services/data_pipeline/tests",
+    "services/ecosystem/tests",
+    "services/match_wm/tests",
+]
+addopts = "-ra"
