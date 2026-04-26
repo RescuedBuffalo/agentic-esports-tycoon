@@ -1,0 +1,60 @@
+# Local dev stack. Boot with `make dev` (or `docker compose up -d`).
+#
+# Phase 0 scope: Postgres 16 + Qdrant. Prefect joins as a separate profile in a
+# later phase — declared here as a stub so `docker compose --profile orchestration
+# up` works once the image is pinned. See BUF-5.
+#
+# Image is intentionally light: no GPU, no model servers. Phase 2 concern.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: nexus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nexus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexus}
+      POSTGRES_DB: ${POSTGRES_DB:-nexus}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexus} -d ${POSTGRES_DB:-nexus}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.11.3
+    container_name: nexus-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  prefect:
+    image: prefecthq/prefect:3-latest
+    container_name: nexus-prefect
+    profiles: ["orchestration"]
+    restart: unless-stopped
+    command: prefect server start --host 0.0.0.0
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: >-
+        postgresql+asyncpg://${POSTGRES_USER:-nexus}:${POSTGRES_PASSWORD:-nexus}@postgres:5432/${POSTGRES_DB:-nexus}
+    ports:
+      - "${PREFECT_PORT:-4200}:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  qdrant_data:

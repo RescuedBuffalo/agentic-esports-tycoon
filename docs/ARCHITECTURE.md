@@ -91,7 +91,7 @@ named subtrees and emits typed events (BUF-78).
 - Patch-era boundaries (`config/patch_eras.yaml`) are hand-curated and
   trigger downstream re-aggregation when a new era ships.
 
-### 5.2 Tycoon sim (`src/esports_sim/sim/`, planned)
+### 5.2 Tycoon sim (`services/ecosystem/`, planned)
 
 - Tick-based, single-threaded. One in-game day per tick by default.
 - Pure functions over an immutable `WorldState` snapshot plus an `RngTree`
@@ -99,7 +99,7 @@ named subtrees and emits typed events (BUF-78).
 - Tycoon obs/action contract is defined in
   `docs/design/tycoon-obs-action-space.md`.
 
-### 5.3 2D tactical match engine (`src/esports_sim/match/`, BUF-30, planned)
+### 5.3 2D tactical match engine (`services/match_wm/`, BUF-30, planned)
 
 - Tile-grid sim, ~100 ms per step. Simulates one Valorant round at a time;
   rounds compose into maps and maps into matches.
@@ -109,7 +109,7 @@ named subtrees and emits typed events (BUF-78).
   observation and action space from BUF-79
   (`docs/design/observation-action-space.md`).
 
-### 5.4 World model (`src/esports_sim/wm/`, BUF-81, planned)
+### 5.4 World model (`services/match_wm/`, BUF-81, planned)
 
 - Hybrid RSSM latent: deterministic GRU state + categorical stochastic
   state. See `docs/design/world-model-state.md` for the shape and the
@@ -117,7 +117,7 @@ named subtrees and emits typed events (BUF-78).
 - Trained offline from match-engine trajectories; consumed online by
   policies that want imagination rollouts.
 
-### 5.5 Agent host (`src/esports_sim/agents/`, planned)
+### 5.5 Agent host (`services/ecosystem/` + `services/match_wm/`, planned)
 
 - Subscribes to obs views and writes back actions through typed APIs at both
   layers.
@@ -130,13 +130,13 @@ named subtrees and emits typed events (BUF-78).
 ### 5.6 Event log (BUF-78)
 
 - Append-only. Each event carries `(tick, source, kind, payload, rng_path)`
-  — see `src/esports_sim/schemas/events.py`.
+  — see `packages/shared/src/esports_sim/schemas/events.py`.
 - Snapshots are taken every N ticks (configurable) so long replays don't
   re-fold from genesis.
 
 ### 5.7 RNG tree (BUF-77)
 
-- Hierarchical splittable RNG. `src/esports_sim/rng/tree.py`.
+- Hierarchical splittable RNG. `packages/shared/src/esports_sim/rng/tree.py`.
 - Each subsystem and each agent gets a deterministic, named child stream so
   parallel reads do not race for entropy.
 
@@ -156,27 +156,37 @@ silently.
 
 ## 7. Module map (target)
 
+The repo is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/)
+laid out per BUF-5: shared infrastructure under `packages/`, runnable services
+under `services/`, the player-facing surface under `apps/`.
+
 ```
-src/esports_sim/
-    sim/         # tycoon tick loop, reducers, scheduler         (planned)
-    match/       # 2D tactical match engine                      (BUF-30)
-    agents/      # agent host + backends                         (planned)
-    wm/          # world-model train + serve                     (BUF-81)
-    obs/         # observation builders for both layers          (planned)
-    actions/     # action validators and appliers                (planned)
-    rng/         # RngTree                                       (BUF-77, this PR)
-    schemas/
-        events.py    # Pydantic event union                      (BUF-78, this PR)
-        config.py    # loaders for config/*.yaml                 (planned)
-        gamedata.py  # loaders for data/                         (planned)
-config/      # data-pipeline configs                             (BUF-75, this PR)
-data/        # canonical Valorant content                        (BUF-76, this PR)
+packages/
+    shared/                                                       (BUF-5)
+        src/esports_sim/
+            rng/         # RngTree                                (BUF-77)
+            schemas/
+                events.py    # Pydantic event union               (BUF-78)
+                config.py    # loaders for config/*.yaml          (planned)
+                gamedata.py  # loaders for data/                  (planned)
+services/
+    data_pipeline/   # VLR / Riot / Liquipedia ingest             (BUF-75)
+    ecosystem/       # tycoon tick loop, reducers, scheduler      (planned)
+        # also future home of obs/, actions/, agents/ for the management layer
+    match_wm/        # 2D tactical match engine + world model     (BUF-30, BUF-81)
+        # match engine, PettingZoo wrapper (BUF-34), world model
+apps/
+    game/            # player-facing client (empty stub)
+config/      # data-pipeline configs                              (BUF-75)
+data/        # canonical Valorant content                         (BUF-76)
 docs/
     ARCHITECTURE.md
     design/      # design notes for non-trivial subsystems
     setup/       # operator-facing checklists
-tests/
 ```
+
+Each workspace member ships its own `tests/` directory; pytest is configured at
+the root to discover them all.
 
 ## 8. Open questions tracked elsewhere
 

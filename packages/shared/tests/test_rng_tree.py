@@ -1,5 +1,4 @@
 import pytest
-
 from esports_sim.rng import RngTree
 
 

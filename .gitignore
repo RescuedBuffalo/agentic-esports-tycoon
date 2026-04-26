@@ -15,6 +15,20 @@ venv/
 .vscode/
 .idea/
 
+# Claude Code (user-local settings; shared settings.json is committed)
+.claude/settings.local.json
+
 # Run outputs
 out/
 *.log
+
+# uv
+.uv/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Pre-commit
+.pre-commit-cache/
