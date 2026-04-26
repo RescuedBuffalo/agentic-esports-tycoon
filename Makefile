@@ -5,7 +5,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: help dev up down sync test lint format typecheck precommit ci clean
+.PHONY: help dev up down sync migrate test lint format typecheck precommit ci clean
 
 help:
 	@echo "Targets:"
@@ -13,6 +13,7 @@ help:
 	@echo "  up          Bring up the docker-compose data plane."
 	@echo "  down        Stop & remove the data plane (volumes preserved)."
 	@echo "  sync        Resolve and install the uv workspace (incl. dev group)."
+	@echo "  migrate     Apply Alembic migrations against \$$DATABASE_URL."
 	@echo "  test        Run pytest across all workspace members."
 	@echo "  lint        Run ruff + black --check."
 	@echo "  format      Apply ruff --fix and black."
@@ -39,6 +40,11 @@ down:
 
 sync:
 	uv sync --all-packages
+
+migrate:
+	# Run from packages/shared so alembic finds alembic.ini next door.
+	# DATABASE_URL overrides the dev-compose default (see env.py).
+	cd packages/shared && uv run alembic upgrade head
 
 test:
 	uv run pytest
