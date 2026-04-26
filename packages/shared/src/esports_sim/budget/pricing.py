@@ -112,15 +112,31 @@ def estimate_cost(
     model: str,
     input_tokens: int,
     max_output_tokens: int,
+    has_cache_control: bool = False,
+    cache_write_ttl: str = "5m",
 ) -> float:
     """Worst-case pre-flight estimate: assume the model writes ``max_tokens``.
 
     The post-call ``cost_from_usage`` reconciles to the actual usage. Pre-flight
     estimates are intentionally pessimistic so the governor blocks before
     spending — a small over-estimate is fine, an under-estimate is not.
+
+    Cache pricing: when ``has_cache_control`` is True, input tokens are priced
+    at the cache-write rate (1.25× base for 5m TTL, 2× for 1h). At
+    pre-flight we don't know how the prompt will split between cache-write
+    and cache-read tokens — pricing the whole input as a write is
+    pessimistic but safe. Underestimating here would let calls slip past
+    the cap and post-flight reconciliation would push us over, defeating
+    the entire point of a hard rate limiter.
     """
     p = get_pricing(model)
-    return (input_tokens * p.input_per_mtok + max_output_tokens * p.output_per_mtok) / 1_000_000
+    if has_cache_control:
+        input_rate = (
+            p.cache_write_1h_per_mtok if cache_write_ttl == "1h" else p.cache_write_5m_per_mtok
+        )
+    else:
+        input_rate = p.input_per_mtok
+    return (input_tokens * input_rate + max_output_tokens * p.output_per_mtok) / 1_000_000
 
 
 def cost_from_usage_obj(model: str, usage: Any, *, cache_write_ttl: str = "5m") -> float:

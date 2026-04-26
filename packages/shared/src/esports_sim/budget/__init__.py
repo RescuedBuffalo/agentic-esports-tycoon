@@ -27,7 +27,7 @@ Usage::
 """
 
 from esports_sim.budget.caps import BudgetCaps, default_caps
-from esports_sim.budget.client import claude_call
+from esports_sim.budget.client import claude_call, claude_stream
 from esports_sim.budget.errors import BudgetExhausted
 from esports_sim.budget.governor import Governor
 from esports_sim.budget.ledger import Ledger, LedgerEntry
@@ -56,6 +56,7 @@ __all__ = [
     "PRICING",
     "PurposeSummary",
     "claude_call",
+    "claude_stream",
     "cost_from_usage",
     "default_caps",
     "format_digest",
