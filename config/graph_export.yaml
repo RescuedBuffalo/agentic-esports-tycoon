@@ -1,0 +1,68 @@
+enabled: true
+
+# Where the pipeline writes the data/ tree the sim consumes. The exporter
+# fails closed if validation.yaml has not produced a passing report for the
+# same run id.
+
+output_root: data/
+
+require_passing_validation_run: true
+
+formats:
+  attributes: yaml      # data/attributes.yaml
+  agents: yaml          # data/agents/<agent_id>.yaml
+  weapons: yaml         # data/weapons/<weapon_id>.yaml
+  maps: yaml            # data/maps/<map_id>.yaml
+
+agents:
+  source_table: canonical.agents
+  one_file_per: agent_id
+  fields:
+    - id
+    - name
+    - role
+    - abilities
+    - released_in_patch
+    - retired_in_patch
+  sort_keys: [role, id]
+
+weapons:
+  source_table: canonical.weapons
+  one_file_per: weapon_id
+  fields:
+    - id
+    - name
+    - category
+    - cost
+    - damage_curve
+    - fire_mode
+    - magazine
+  sort_keys: [category, cost, id]
+
+maps:
+  source_table: canonical.maps
+  one_file_per: map_id
+  fields:
+    - id
+    - name
+    - sites
+    - released_in_patch
+    - retired_in_patch
+    - layout_image
+  sort_keys: [id]
+
+attributes:
+  source_table: canonical.attributes
+  fields:
+    - id
+    - name
+    - kind
+    - range
+    - description
+  sort_keys: [kind, id]
+
+write_policy:
+  # The exporter checks files into git via a follow-up bot; it does not push
+  # directly. Failed writes are retried under the same run id.
+  dry_run_unless_flag: --apply
+  diff_summary_path: out/graph_export/diff.md

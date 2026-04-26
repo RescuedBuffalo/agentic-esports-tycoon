@@ -1,0 +1,12 @@
+id: bind
+name: Bind
+released_in_patch: "0.49"
+retired_in_patch: null
+map_sites: 2
+map_chokepoints: 4
+map_open_to_close_ratio: 1.4
+sites: [a, b]
+notable_features:
+  - one_way_teleporters: true
+  - has_mid: false
+layout_image: bind_minimap_v1.png

@@ -1,0 +1,27 @@
+id: omen
+name: Omen
+role: controller
+released_in_patch: "0.49"
+retired_in_patch: null
+abilities:
+  - slot: q
+    id: paranoia
+    charges: 1
+    ability_cost_credits: 300
+    kind: nearsight
+  - slot: e
+    id: dark_cover
+    charges: 2
+    ability_cost_credits: 0
+    kind: smoke_long
+  - slot: c
+    id: shrouded_step
+    charges: 1
+    ability_cost_credits: 150
+    kind: short_teleport
+  - slot: x
+    id: from_the_shadows
+    ultimate_points_required: 7
+    kind: ultimate_long_teleport
+notes:
+  controller_archetype: flex_smokes

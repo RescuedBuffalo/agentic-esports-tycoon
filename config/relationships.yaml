@@ -1,0 +1,59 @@
+enabled: true
+
+# Edge definitions for the entity graph. Each edge has a stable kind, two
+# endpoint entity types, optional time-validity bounds, and optional
+# attributes. The exporter (graph_export.yaml) writes one file per kind.
+edges:
+  - kind: plays_for
+    from: player
+    to: team
+    time_bounded: true   # carries valid_from / valid_to
+    attributes: [role, slot]
+    sources: [contracts_table, roster_changes]
+
+  - kind: coaches
+    from: person
+    to: team
+    time_bounded: true
+    attributes: [role]   # head_coach | assistant | analyst
+    sources: [staff_table]
+
+  - kind: competed_in
+    from: team
+    to: tournament
+    time_bounded: false
+    attributes: [final_placement, prize_won_cents]
+    sources: [tournament_results]
+
+  - kind: played_match
+    from: team
+    to: match
+    time_bounded: false
+    attributes: [side]   # home | away
+    sources: [match_table]
+
+  - kind: played_agent
+    from: player
+    to: agent
+    time_bounded: false
+    attributes: [match_id, map_id, picks, rounds_won]
+    sources: [round_player_stats]
+
+  - kind: played_on_map
+    from: match
+    to: map
+    time_bounded: false
+    attributes: [score_home, score_away, side_first_half]
+    sources: [match_maps]
+
+  - kind: in_patch_era
+    from: match
+    to: patch_era
+    time_bounded: false
+    attributes: []
+    sources: [patch_eras_join]   # joined using config/patch_eras.yaml
+
+denormalisation:
+  # Materialised joins for query speed. The exporter respects this list.
+  emit_player_team_history: true
+  emit_team_tournament_history: true

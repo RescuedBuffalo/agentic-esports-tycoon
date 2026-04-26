@@ -1,0 +1,66 @@
+enabled: true
+
+# DAG of pipeline stages. Each stage maps to a config file in this directory.
+# 'after' encodes hard dependencies; the runner will not start a stage until
+# all listed stages have produced a non-failed run within its freshness window.
+stages:
+  - name: ingest
+    impl: esports_sim.pipeline.stages.ingest.run
+    schedule: "0 */6 * * *"     # every 6 hours
+    timeout_minutes: 30
+    retries: 3
+    backoff_minutes: [1, 5, 15]
+    after: []
+
+  - name: entity_resolution
+    config: entity_resolution.yaml
+    schedule: "0 1 * * *"        # nightly 01:00 UTC
+    timeout_minutes: 45
+    retries: 2
+    backoff_minutes: [5, 15]
+    after: [ingest]
+
+  - name: derivation
+    config: derivation.yaml
+    schedule: "0 2 * * *"
+    timeout_minutes: 60
+    retries: 2
+    backoff_minutes: [5, 15]
+    after: [entity_resolution]
+
+  - name: relationships
+    config: relationships.yaml
+    schedule: "0 3 * * *"
+    timeout_minutes: 30
+    retries: 2
+    backoff_minutes: [5, 15]
+    after: [entity_resolution, derivation]
+
+  - name: validation
+    config: validation.yaml
+    schedule: "30 3 * * *"
+    timeout_minutes: 15
+    retries: 1
+    backoff_minutes: [5]
+    after: [derivation, relationships]
+
+  - name: graph_export
+    config: graph_export.yaml
+    schedule: "0 4 * * *"
+    timeout_minutes: 30
+    retries: 2
+    backoff_minutes: [5, 15]
+    after: [validation]
+
+freshness_windows:
+  # If a stage's last successful run is older than this, downstream stages
+  # treat its outputs as stale and refuse to run.
+  ingest: 12h
+  entity_resolution: 36h
+  derivation: 36h
+  relationships: 36h
+
+alerting:
+  on_failure: pagerduty:data-pipeline
+  on_stale: slack:#data-alerts
+  daily_summary: slack:#data-alerts

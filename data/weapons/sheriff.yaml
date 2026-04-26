@@ -1,0 +1,17 @@
+id: sheriff
+name: Sheriff
+category: sidearm
+weapon_cost_credits: 800
+fire_mode: semi_auto
+weapon_magazine: 6
+damage_curve:
+  point_blank:
+    weapon_damage_head: 159
+    weapon_damage_body: 55
+    weapon_damage_legs: 46
+  long_range:
+    weapon_damage_head: 145
+    weapon_damage_body: 50
+    weapon_damage_legs: 42
+weapon_fire_rate: 4.0
+weapon_wall_penetration: 1

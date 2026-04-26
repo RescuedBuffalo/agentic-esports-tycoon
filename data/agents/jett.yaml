@@ -1,0 +1,27 @@
+id: jett
+name: Jett
+role: duelist
+released_in_patch: "0.49"
+retired_in_patch: null
+abilities:
+  - slot: q
+    id: updraft
+    charges: 2
+    ability_cost_credits: 250
+    kind: mobility
+  - slot: e
+    id: tailwind
+    charges: 1
+    ability_cost_credits: 0   # signature, recharges on kills
+    kind: mobility
+  - slot: c
+    id: cloudburst
+    charges: 3
+    ability_cost_credits: 200
+    kind: smoke_short
+  - slot: x
+    id: blade_storm
+    ultimate_points_required: 7
+    kind: ultimate_weapon
+notes:
+  duelist_archetype: entry
