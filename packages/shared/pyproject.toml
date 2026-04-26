@@ -15,6 +15,15 @@ dependencies = [
     # which wraps client.messages.{create,count_tokens}. Pinned floor matches
     # the SDK we tested adaptive thinking + count_tokens against.
     "anthropic>=0.40",
+    # Database substrate (BUF-6). Async path lives in services; this package
+    # ships the models + migrations so every consumer agrees on the schema.
+    "SQLAlchemy[asyncio]>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    "asyncpg>=0.29",
+    # pgvector Python bindings — registered as a SQLAlchemy type so BUF-28's
+    # vector tables can land without re-plumbing types here.
+    "pgvector>=0.3",
 ]
 
 [project.scripts]
@@ -24,3 +33,6 @@ nexus = "esports_sim.budget.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/esports_sim"]
+# Migrations live at packages/shared/alembic/ and are run from the workspace
+# root (`make migrate`), not from an installed wheel — consumers don't need
+# them at import time.
