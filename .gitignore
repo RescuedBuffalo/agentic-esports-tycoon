@@ -32,3 +32,9 @@ out/
 
 # Pre-commit
 .pre-commit-cache/
+
+# Experiment registry (BUF-69) + budget ledger (BUF-22) local stores.
+# Per-developer; no run artifacts belong in source control.
+state/
+runs/
+.nexus/
