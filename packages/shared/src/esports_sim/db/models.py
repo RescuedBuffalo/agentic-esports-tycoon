@@ -66,7 +66,11 @@ class Entity(Base):
         primary_key=True,
         default=uuid.uuid4,
     )
-    entity_type: Mapped[EntityType] = mapped_column(_entity_type, nullable=False)
+    # ``index=True`` mirrors the ix_entity_entity_type index in the migration.
+    # Without this, alembic autogenerate would treat the DB index as drift and
+    # drop it in a future revision — costly because lots of downstream queries
+    # filter by entity_type.
+    entity_type: Mapped[EntityType] = mapped_column(_entity_type, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

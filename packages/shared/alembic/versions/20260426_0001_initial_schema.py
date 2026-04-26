@@ -221,6 +221,10 @@ def downgrade() -> None:
     for typename in ("review_status", "staging_status", "platform", "entity_type"):
         op.execute(f"DROP TYPE IF EXISTS {typename}")
 
-    # Leaving `CREATE EXTENSION vector` undone is friendly to other databases
-    # on the same instance — but the migration still owns it for symmetry.
-    op.execute("DROP EXTENSION IF EXISTS vector")
+    # Deliberately *not* dropping the `vector` extension. ``upgrade()`` uses
+    # ``CREATE EXTENSION IF NOT EXISTS``, so we can't tell from inside this
+    # migration whether the extension pre-existed. Dropping unconditionally
+    # would either error (if other objects depend on it) or silently break
+    # unrelated schemas in the same database during rollback. If an operator
+    # genuinely needs to remove it, that's a manual ``DROP EXTENSION vector``
+    # outside Alembic.
