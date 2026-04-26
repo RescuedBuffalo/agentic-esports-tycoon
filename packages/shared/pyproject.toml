@@ -11,6 +11,10 @@ dependencies = [
     "pydantic>=2.6",
     "PyYAML>=6.0",
     "numpy>=1.26",
+    # Anthropic SDK — every Claude call goes through the governor (BUF-22),
+    # which wraps client.messages.{create,count_tokens}. Pinned floor matches
+    # the SDK we tested adaptive thinking + count_tokens against.
+    "anthropic>=0.40",
     # Database substrate (BUF-6). Async path lives in services; this package
     # ships the models + migrations so every consumer agrees on the schema.
     "SQLAlchemy[asyncio]>=2.0",
@@ -21,6 +25,11 @@ dependencies = [
     # vector tables can land without re-plumbing types here.
     "pgvector>=0.3",
 ]
+
+[project.scripts]
+# CLI entrypoint for the budget tooling (BUF-22). `nexus budget report`
+# prints the daily digest; `nexus budget tail` follows the ledger live.
+nexus = "esports_sim.budget.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/esports_sim"]
