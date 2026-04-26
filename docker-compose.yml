@@ -8,7 +8,10 @@
 
 services:
   postgres:
-    image: postgres:16
+    # pgvector image is plain Postgres 16 with the vector extension preinstalled
+    # — alembic's `CREATE EXTENSION vector` (BUF-6) needs it. ADR-006 puts
+    # embeddings on this same instance instead of running Qdrant alongside.
+    image: pgvector/pgvector:pg16
     container_name: nexus-postgres
     restart: unless-stopped
     environment:

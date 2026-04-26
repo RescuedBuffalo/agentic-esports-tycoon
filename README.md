@@ -21,6 +21,20 @@ uv run pytest
 
 Copy `.env.example` to `.env` before running anything that needs credentials.
 
+To apply the BUF-6 schema (entity, alias, staging, raw store) to a fresh
+Postgres:
+
+```bash
+make migrate    # uses $DATABASE_URL; defaults to the dev-compose Postgres
+```
+
+Integration tests against Postgres are skipped unless `TEST_DATABASE_URL` is
+set:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://nexus:nexus@localhost:5432/nexus uv run pytest
+```
+
 ## Repo layout
 
 ```
@@ -58,6 +72,7 @@ package has its own `pyproject.toml`, and `uv sync` resolves them together.
 | `make up`         | Bring up the data plane only.                           |
 | `make down`       | Stop the data plane (volumes preserved).                |
 | `make sync`       | Resolve and install the uv workspace.                   |
+| `make migrate`    | Apply Alembic migrations against `$DATABASE_URL`.       |
 | `make test`       | Run pytest across all workspace members.                |
 | `make lint`       | Run ruff + black --check.                               |
 | `make typecheck`  | Run mypy.                                               |
