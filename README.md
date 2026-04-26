@@ -41,6 +41,19 @@ This is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/
 the root `pyproject.toml` declares the members and pins Python 3.12, each
 package has its own `pyproject.toml`, and `uv sync` resolves them together.
 
+## Claude API budget governor (BUF-22)
+
+Every Claude call goes through `esports_sim.budget.claude_call`. The governor
+enforces a $30/week hard cap (with $10 buffer under the $40 weekly budget) and
+per-purpose soft caps, logs every call to a SQLite ledger, and prices usage
+against a versioned per-model table. Inspect spend with:
+
+```bash
+uv run nexus budget report
+```
+
+See `packages/shared/src/esports_sim/budget/__init__.py` for the public API.
+
 ## Useful entry points
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview, three-layer breakdown.
