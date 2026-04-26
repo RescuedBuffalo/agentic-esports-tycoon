@@ -28,7 +28,11 @@ dev: sync up
 	@echo "  Qdrant:   http://localhost:$${QDRANT_HTTP_PORT:-6333}"
 
 up:
-	docker compose up -d postgres qdrant
+	# `--wait` blocks until each service's healthcheck reports healthy. Without
+	# it, compose returns as soon as containers are started (not ready), and
+	# follow-on commands race the Postgres/Qdrant startup. See
+	# https://docs.docker.com/reference/cli/docker/compose/up/#options
+	docker compose up -d --wait postgres qdrant
 
 down:
 	docker compose down
