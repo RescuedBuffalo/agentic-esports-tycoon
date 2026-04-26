@@ -98,23 +98,105 @@ class Ledger:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        # ``timeout`` controls how long SQLite waits on a busy lock before
+        # raising ``OperationalError`` — set generously so a slow concurrent
+        # writer doesn't surface as a spurious failure to the caller. WAL
+        # makes the wait rare in practice (readers don't block writers); the
+        # timeout only matters when two writers contend.
+        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=30.0)
         try:
             # WAL is recommended for one-writer-many-readers workloads; it
             # also keeps reads from blocking writes (a query for the daily
             # digest never blocks the next claude_call).
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout is a server-side fallback that complements the
+            # client-side timeout above — they handle different layers of
+            # contention and SQLite is happy with both set.
+            conn.execute("PRAGMA busy_timeout=30000")
             conn.row_factory = sqlite3.Row
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def serializable_write(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection inside ``BEGIN IMMEDIATE`` for atomic check+write.
+
+        SQLite serialises writers behind a single file lock; ``BEGIN
+        IMMEDIATE`` acquires that lock at the start of the transaction
+        rather than upgrading mid-transaction (which can lose to a racing
+        writer and force a retry). Any reads done inside this block see a
+        snapshot consistent with the lock — exactly what the governor
+        needs so two concurrent calls can't both observe the pre-call
+        spend, both pass the cap check, and both push us over.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
 
     # ---- writes ------------------------------------------------------------
+
+    @staticmethod
+    def _insert(
+        conn: sqlite3.Connection,
+        *,
+        endpoint: str,
+        model: str,
+        purpose: str,
+        phase: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
+        usd_cost: float = 0.0,
+        request_id: str | None = None,
+        notes: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> int:
+        """Insert a row using the supplied connection. Returns the new ``id``.
+
+        Used by :meth:`record` (its own connection) and by the governor's
+        ``preflight`` path (a connection it already opened inside
+        :meth:`serializable_write`). The two need to share insert logic;
+        making this a static helper avoids duplicating the SQL.
+        """
+        ts = (timestamp or _now_utc()).isoformat()
+        cur = conn.execute(
+            """
+            INSERT INTO api_ledger (
+                timestamp, endpoint, model, input_tokens, output_tokens,
+                cache_creation_input_tokens, cache_read_input_tokens,
+                usd_cost, purpose, request_id, phase, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                endpoint,
+                model,
+                int(input_tokens),
+                int(output_tokens),
+                int(cache_creation_input_tokens),
+                int(cache_read_input_tokens),
+                float(usd_cost),
+                purpose,
+                request_id,
+                phase,
+                notes,
+            ),
+        )
+        row_id = cur.lastrowid
+        assert row_id is not None
+        return row_id
 
     def record(
         self,
@@ -133,34 +215,42 @@ class Ledger:
         timestamp: datetime | None = None,
     ) -> int:
         """Insert a row, return the new ``id``."""
-        ts = (timestamp or _now_utc()).isoformat()
         with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO api_ledger (
-                    timestamp, endpoint, model, input_tokens, output_tokens,
-                    cache_creation_input_tokens, cache_read_input_tokens,
-                    usd_cost, purpose, request_id, phase, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ts,
-                    endpoint,
-                    model,
-                    int(input_tokens),
-                    int(output_tokens),
-                    int(cache_creation_input_tokens),
-                    int(cache_read_input_tokens),
-                    float(usd_cost),
-                    purpose,
-                    request_id,
-                    phase,
-                    notes,
-                ),
+            return self._insert(
+                conn,
+                endpoint=endpoint,
+                model=model,
+                purpose=purpose,
+                phase=phase,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                usd_cost=usd_cost,
+                request_id=request_id,
+                notes=notes,
+                timestamp=timestamp,
             )
-            row_id = cur.lastrowid
-            assert row_id is not None
-            return row_id
+
+    @staticmethod
+    def _spend_in_window(
+        conn: sqlite3.Connection,
+        *,
+        since: datetime,
+        purpose: str | None = None,
+    ) -> float:
+        """Run the ``SUM(usd_cost)`` query on a caller-provided connection.
+
+        Same SQL as :meth:`total_spend_since`; factored so the governor can
+        run the read inside the same transaction as the insert.
+        """
+        sql = "SELECT COALESCE(SUM(usd_cost), 0.0) AS total FROM api_ledger WHERE timestamp >= ?"
+        params: list[object] = [since.astimezone(UTC).isoformat()]
+        if purpose is not None:
+            sql += " AND purpose = ?"
+            params.append(purpose)
+        row = conn.execute(sql, params).fetchone()
+        return float(row["total"]) if row is not None else 0.0
 
     def update_post(
         self,
@@ -224,14 +314,8 @@ class Ledger:
         doesn't get billed twice — the pre row is overwritten with actuals
         when ``update_post`` runs.
         """
-        sql = "SELECT COALESCE(SUM(usd_cost), 0.0) AS total " "FROM api_ledger WHERE timestamp >= ?"
-        params: list[object] = [since.astimezone(UTC).isoformat()]
-        if purpose is not None:
-            sql += " AND purpose = ?"
-            params.append(purpose)
         with self._connect() as conn:
-            row = conn.execute(sql, params).fetchone()
-        return float(row["total"]) if row is not None else 0.0
+            return self._spend_in_window(conn, since=since, purpose=purpose)
 
     def weekly_spend(self, *, purpose: str | None = None, now: datetime | None = None) -> float:
         """Sum spend over the rolling 7-day window ending now."""
