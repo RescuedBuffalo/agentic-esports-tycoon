@@ -155,23 +155,63 @@ class Registry:
         db_path: str | Path | None = None,
         runs_dir: str | Path | None = None,
     ) -> None:
-        self.db_path = Path(db_path) if db_path is not None else _resolve_db_path()
-        self.runs_dir = Path(runs_dir) if runs_dir is not None else _resolve_runs_dir()
-        if str(self.db_path) != ":memory:":
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        raw_db = Path(db_path) if db_path is not None else _resolve_db_path()
+        raw_runs_dir = Path(runs_dir) if runs_dir is not None else _resolve_runs_dir()
+
+        # ``:memory:`` is a magic string (not a real path) — leave it alone so
+        # ``sqlite3.connect`` treats it as an in-memory database.
+        self._is_memory_db = str(raw_db) == ":memory:"
+        self.db_path: Path = raw_db if self._is_memory_db else raw_db.resolve()
+
+        # ``runs_dir`` is resolved to an absolute path so rows we INSERT later
+        # carry stable on-disk locations. A relative ``runs/`` written from
+        # one CWD and read from another would otherwise resolve to two
+        # different filesystem locations — exactly the cross-machine /
+        # cross-CWD bug the registry is supposed to prevent.
+        if not self._is_memory_db:
+            raw_runs_dir.mkdir(parents=True, exist_ok=True)
+            raw_db.parent.mkdir(parents=True, exist_ok=True)
+        self.runs_dir: Path = raw_runs_dir.resolve()
+
+        # In-memory SQLite databases are *per-connection* — tables created on
+        # one connection are invisible to a fresh connection. Hold one
+        # persistent connection for the lifetime of the Registry so
+        # ``_init_schema`` and subsequent reads/writes share state. File-
+        # backed databases keep the open-per-call pattern so concurrent
+        # writers don't block each other.
+        self._memory_conn: sqlite3.Connection | None = None
+        if self._is_memory_db:
+            self._memory_conn = self._open_connection()
+
         self._init_schema()
 
     # ---- connection helpers ------------------------------------------------
 
+    def _open_connection(self) -> sqlite3.Connection:
+        """Open a fresh sqlite3 connection with the registry's PRAGMAs applied."""
+        # ``check_same_thread=False`` lets the persistent ``:memory:``
+        # connection be reused across pytest's setup/teardown threads. Has
+        # no effect on file-backed connections that close per call.
+        conn = sqlite3.connect(
+            self.db_path,
+            isolation_level=None,
+            timeout=30.0,
+            check_same_thread=False,
+        )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.row_factory = sqlite3.Row
+        return conn
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=30.0)
+        if self._memory_conn is not None:
+            # Shared connection — do NOT close on exit, the Registry owns it.
+            yield self._memory_conn
+            return
+        conn = self._open_connection()
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.row_factory = sqlite3.Row
             yield conn
         finally:
             conn.close()
