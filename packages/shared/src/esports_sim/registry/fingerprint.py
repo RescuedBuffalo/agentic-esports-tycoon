@@ -11,13 +11,12 @@ Algorithm:
    where ``label`` is the basename (single file) or the directory-relative
    POSIX path (directory walk).
 2. Sort the resulting list by ``(label, sha256)``.
-3. Fold the **input manifest** (sorted basenames of the top-level
-   inputs) into the rolling hash first, then the sorted file-content
-   pairs. The manifest prefix is what makes
-   ``compute_fingerprint([empty_dir])`` distinct from
-   ``compute_fingerprint([])`` — without it both walked to zero files
-   and produced the empty-string sentinel, collapsing the natural-key
-   for "explicitly empty dataset" onto "no data provided at all".
+3. For non-empty file walks, preserve the legacy rolling hash over
+   sorted ``(label, sha256)`` pairs so fingerprints remain stable across
+   upgrades. When the caller provides inputs but the walk yields zero
+   files (e.g. an empty directory), hash a sorted manifest of the
+   top-level basenames instead so ``compute_fingerprint([empty_dir])``
+   is distinct from ``compute_fingerprint([])``.
 
 The sort key for files is ``(label, sha256)`` — *not* just ``label`` —
 so two distinct files with the same basename (``/mnt/a/data.csv`` and
@@ -87,10 +86,11 @@ def compute_fingerprint(paths: Iterable[Path | str]) -> str:
       reserved for callers who genuinely have no data dimension to fold
       into the natural key.
     * Any non-empty input list → 64-character hex digest, even when the
-      walk yields zero files (e.g. the caller passed an empty directory).
-      An empty dataset is *different* from no dataset; collapsing them
-      onto the same fingerprint would let an explicitly-empty dataset
-      reuse a prior run_id that was registered with no data at all.
+      walk yields zero files (e.g. the caller passed an empty
+      directory). An empty dataset is *different* from no dataset;
+      collapsing them onto the same fingerprint would let an
+      explicitly-empty dataset reuse a prior run_id that was registered
+      with no data at all.
 
     Stable across runs as long as the bytes are unchanged. Caller is
     responsible for picking ``paths`` that meaningfully describe the run
@@ -118,19 +118,19 @@ def compute_fingerprint(paths: Iterable[Path | str]) -> str:
 
     rolling = hashlib.sha256()
 
-    # Input manifest: the *basenames* of the top-level inputs, sorted.
-    # This is what gives ``compute_fingerprint([empty_dir])`` a non-empty,
-    # content-derived digest (and one that's distinct from the
-    # ``compute_fingerprint([])`` sentinel). The "INPUT:" prefix
-    # disambiguates the manifest section from the file section that
-    # follows so a path basename can never collide with a file label.
-    for label in sorted(p.name for p in paths_list):
-        rolling.update(b"INPUT:")
-        rolling.update(label.encode("utf-8"))
-        rolling.update(b"\x00")
+    if not hashed:
+        # Preserve legacy fingerprints for all non-empty file sets by
+        # only using the manifest fallback when the walk yields zero
+        # files. This keeps historical idempotency behavior stable while
+        # still separating "explicitly empty input path(s)" from
+        # "no data provided" (the empty-string sentinel above).
+        for label in sorted(p.name for p in paths_list):
+            rolling.update(b"INPUT_EMPTY:")
+            rolling.update(label.encode("utf-8"))
+            rolling.update(b"\x00")
+        return rolling.hexdigest()
 
     for label, file_hash in hashed:
-        rolling.update(b"FILE:")
         rolling.update(label.encode("utf-8"))
         rolling.update(b"\x00")
         rolling.update(file_hash.encode("ascii"))

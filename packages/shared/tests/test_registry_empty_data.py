@@ -8,10 +8,11 @@ empty data directory"* as the same natural key as *"caller passed no
 data at all"*, silently reusing a prior ``run_id`` for what was meant
 to be a distinct experiment registration.
 
-The fix: when the input list is non-empty, fold the **input manifest**
-(sorted basenames of the top-level inputs) into the rolling hash before
-the file-content pairs. ``[]`` still returns ``""``; ``[empty_dir]``
-now produces a real digest derived from the directory's basename.
+The fix: preserve legacy hashing for non-empty file sets, but when the
+input list is non-empty and the walk yields zero files, hash a stable
+manifest of top-level input basenames instead. ``[]`` still returns
+``""``; ``[empty_dir]`` now produces a real digest derived from the
+directory's basename.
 """
 
 from __future__ import annotations
@@ -106,6 +107,38 @@ def test_populated_directory_fingerprint_is_still_permutation_invariant(
     b.write_bytes(b"bravo")
 
     assert compute_fingerprint([a, b]) == compute_fingerprint([b, a])
+
+
+def test_non_empty_inputs_keep_legacy_fingerprint_shape(tmp_path: Path) -> None:
+    """Regression: non-empty datasets keep pre-fix digest compatibility.
+
+    The empty-dir collision fix must not alter historical fingerprints
+    for normal (non-empty) workloads, or ``Registry.register`` would
+    mint new run IDs after an upgrade.
+    """
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_bytes(b"alpha")
+    b.write_bytes(b"beta")
+
+    # Legacy algorithm shape:
+    # sorted (label, file_sha256) then roll ``label + NUL + hash + NUL``.
+    import hashlib
+
+    file_rows = [
+        (a.name, hashlib.sha256(a.read_bytes()).hexdigest()),
+        (b.name, hashlib.sha256(b.read_bytes()).hexdigest()),
+    ]
+    file_rows.sort()
+
+    legacy = hashlib.sha256()
+    for label, digest in file_rows:
+        legacy.update(label.encode("utf-8"))
+        legacy.update(b"\x00")
+        legacy.update(digest.encode("ascii"))
+        legacy.update(b"\x00")
+
+    assert compute_fingerprint([a, b]) == legacy.hexdigest()
 
 
 # ---- Registry level ------------------------------------------------------
