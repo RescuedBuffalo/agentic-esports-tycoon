@@ -414,3 +414,139 @@ def test_staging_save_with_valid_canonical_persists(db_session) -> None:
     sr.save(db_session)
     db_session.flush()
     assert sr.canonical_id == entity.canonical_id
+
+
+def test_staging_unset_status_lands_as_pending(db_session) -> None:
+    """Constructing a row without a status must rely on the column default.
+
+    Regression for a code-review finding: the validator used to dereference
+    ``record.status.value`` on the error path, which would raise
+    AttributeError when ``status`` was None at ``before_insert`` time. The
+    Python-level ``default=StagingStatus.PENDING`` populates the attribute
+    in time and the defensive None branch keeps the validator robust if a
+    caller somehow gets past it.
+    """
+    sr = StagingRecord(
+        source="vlr",
+        entity_type=EntityType.PLAYER,
+        canonical_id=None,
+        payload={"name": "TenZ"},
+        # status deliberately omitted — server_default + Python default
+        # should both kick in.
+    )
+    db_session.add(sr)
+    db_session.flush()
+    db_session.refresh(sr)
+    assert sr.status is StagingStatus.PENDING
+
+
+# --- alias uniqueness race recovery -----------------------------------------
+
+
+def test_create_path_recovers_from_concurrent_alias_insert(db_session, monkeypatch) -> None:
+    """Two workers race past the (platform, platform_id) lookup.
+
+    Simulate the race by monkeypatching ``_lookup_exact_alias`` to miss on
+    the first call (the resolver thinks no alias exists and falls into the
+    CREATED path), then return the real row on the recovery lookup. The
+    savepoint must catch the IntegrityError on the alias insert, roll back
+    the orphan entity, and degrade into a MATCHED return for the loser.
+    """
+    from esports_sim.resolver import core
+
+    first = resolve_entity(
+        db_session,
+        platform=Platform.VLR,
+        platform_id="vlr-race",
+        platform_name="Racer",
+        entity_type=EntityType.PLAYER,
+    )
+    assert first.status is ResolutionStatus.CREATED
+
+    real_lookup = core._lookup_exact_alias
+    calls = {"n": 0}
+
+    def fake_lookup(session, **kwargs):  # type: ignore[no-untyped-def]
+        # Miss only on the very first call (the pre-flight lookup at the top
+        # of resolve_entity); subsequent recovery lookups behave normally.
+        if calls["n"] == 0:
+            calls["n"] += 1
+            return None
+        return real_lookup(session, **kwargs)
+
+    monkeypatch.setattr(core, "_lookup_exact_alias", fake_lookup)
+
+    second = resolve_entity(
+        db_session,
+        platform=Platform.VLR,
+        platform_id="vlr-race",
+        platform_name="Racer",
+        entity_type=EntityType.PLAYER,
+    )
+    assert second.status is ResolutionStatus.MATCHED
+    assert second.canonical_id == first.canonical_id
+
+    aliases = (
+        db_session.execute(select(EntityAlias).where(EntityAlias.platform_id == "vlr-race"))
+        .scalars()
+        .all()
+    )
+    # No orphan entity, no second alias row.
+    assert len(aliases) == 1
+    entities = (
+        db_session.execute(select(Entity).where(Entity.entity_type == EntityType.PLAYER))
+        .scalars()
+        .all()
+    )
+    assert len(entities) == 1
+
+
+def test_auto_merge_path_recovers_from_concurrent_alias_insert(db_session, monkeypatch) -> None:
+    """The AUTO_MERGED path must also degrade into MATCHED on a race."""
+    from esports_sim.resolver import core
+
+    # Seed an existing canonical so the auto-merge branch fires.
+    entity = make_entity(entity_type=EntityType.PLAYER)
+    db_session.add(entity)
+    db_session.add(
+        make_entity_alias(
+            entity=entity,
+            platform=Platform.VLR,
+            platform_id="vlr-tenz",
+            platform_name="TenZ",
+        )
+    )
+    db_session.flush()
+
+    # First resolve creates the Liquipedia alias under the existing canonical.
+    first = resolve_entity(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="liq-tenz",
+        platform_name="tenz",
+        entity_type=EntityType.PLAYER,
+    )
+    assert first.status is ResolutionStatus.AUTO_MERGED
+
+    # Now make the second call miss the initial exact lookup so it tries to
+    # auto-merge again — and crash into the unique constraint we just set.
+    real_lookup = core._lookup_exact_alias
+    calls = {"n": 0}
+
+    def fake_lookup(session, **kwargs):  # type: ignore[no-untyped-def]
+        if calls["n"] == 0:
+            calls["n"] += 1
+            return None
+        return real_lookup(session, **kwargs)
+
+    monkeypatch.setattr(core, "_lookup_exact_alias", fake_lookup)
+
+    second = resolve_entity(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="liq-tenz",
+        platform_name="tenz",
+        entity_type=EntityType.PLAYER,
+    )
+    assert second.status is ResolutionStatus.MATCHED
+    assert second.canonical_id == entity.canonical_id

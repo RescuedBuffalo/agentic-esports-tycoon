@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from rapidfuzz import fuzz, utils
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from esports_sim.db.enums import EntityType, Platform, ReviewStatus, StagingStatus
@@ -133,7 +134,7 @@ def resolve_entity(
 
     if candidates and candidates[0].score >= AUTO_MERGE_THRESHOLD:
         top = candidates[0]
-        _insert_alias(
+        raced = _try_insert_alias_or_recover(
             session,
             canonical_id=top.canonical_id,
             platform=platform,
@@ -141,6 +142,8 @@ def resolve_entity(
             platform_name=platform_name,
             confidence=top.score,
         )
+        if raced is not None:
+            return raced
         return ResolveResult(
             status=ResolutionStatus.AUTO_MERGED,
             canonical_id=top.canonical_id,
@@ -173,17 +176,26 @@ def resolve_entity(
         )
 
     # No exact, no fuzzy hit — mint a brand-new canonical and seed alias 1.0.
-    new_entity = Entity(entity_type=entity_type)
-    session.add(new_entity)
-    session.flush()  # populate canonical_id before we reference it
-    _insert_alias(
-        session,
-        canonical_id=new_entity.canonical_id,
-        platform=platform,
-        platform_id=platform_id,
-        platform_name=platform_name,
-        confidence=1.0,
-    )
+    # Wrap entity + alias in a savepoint so a concurrent worker that won the
+    # alias race doesn't strand an orphan entity row in the DB on our side.
+    try:
+        with session.begin_nested():
+            new_entity = Entity(entity_type=entity_type)
+            session.add(new_entity)
+            session.flush()  # populate canonical_id before we reference it
+            _insert_alias(
+                session,
+                canonical_id=new_entity.canonical_id,
+                platform=platform,
+                platform_id=platform_id,
+                platform_name=platform_name,
+                confidence=1.0,
+            )
+    except IntegrityError:
+        # Another resolver call inserted the (platform, platform_id) alias
+        # between our lookup and our flush; the savepoint rolled back our
+        # entity. Re-fetch and degrade gracefully into a MATCHED return.
+        return _matched_after_race(session, platform=platform, platform_id=platform_id)
     return ResolveResult(
         status=ResolutionStatus.CREATED,
         canonical_id=new_entity.canonical_id,
@@ -262,6 +274,67 @@ def _insert_alias(
     session.add(alias)
     session.flush()
     return alias
+
+
+def _try_insert_alias_or_recover(
+    session: Session,
+    *,
+    canonical_id: uuid.UUID,
+    platform: Platform,
+    platform_id: str,
+    platform_name: str,
+    confidence: float,
+) -> ResolveResult | None:
+    """Insert the alias under a savepoint; recover if a concurrent worker won.
+
+    Used by the AUTO_MERGED path (where the canonical already exists). Two
+    parallel workers can both miss the initial exact-alias lookup and both
+    race to insert against the unique ``(platform, platform_id)`` key; the
+    savepoint lets us catch the loser's IntegrityError without invalidating
+    the outer transaction.
+
+    Returns ``None`` on the happy path so the caller can build its
+    AUTO_MERGED result, or a MATCHED :class:`ResolveResult` when the race
+    has already been resolved by someone else.
+    """
+    try:
+        with session.begin_nested():
+            _insert_alias(
+                session,
+                canonical_id=canonical_id,
+                platform=platform,
+                platform_id=platform_id,
+                platform_name=platform_name,
+                confidence=confidence,
+            )
+    except IntegrityError:
+        return _matched_after_race(session, platform=platform, platform_id=platform_id)
+    return None
+
+
+def _matched_after_race(session: Session, *, platform: Platform, platform_id: str) -> ResolveResult:
+    """Re-lookup after a concurrent insert won the (platform, platform_id) race.
+
+    The alias must exist by the time we get here — that's why we caught the
+    IntegrityError. If somehow the lookup misses, surface the original
+    failure rather than silently returning a wrong answer; otherwise
+    degrade into MATCHED so the caller's idempotent retry contract holds.
+    """
+    existing = _lookup_exact_alias(session, platform=platform, platform_id=platform_id)
+    if existing is None:
+        # The unique violation says a row exists; not finding it means the
+        # session view is genuinely inconsistent. Re-raising would be the
+        # safer option, but we're past the original try block — instead
+        # raise a fresh, descriptive error.
+        raise RuntimeError(
+            "alias unique violation recovery: post-conflict lookup missed "
+            f"({platform.value}, {platform_id}); session view inconsistent"
+        )
+    return ResolveResult(
+        status=ResolutionStatus.MATCHED,
+        canonical_id=existing.canonical_id,
+        confidence=existing.confidence,
+    )
 
 
 def _find_pending_review(

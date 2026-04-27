@@ -170,6 +170,14 @@ class StagingRecord(Base):
     status: Mapped[StagingStatus] = mapped_column(
         _staging_status,
         nullable=False,
+        # Mirror the server_default at the Python layer so the attribute is
+        # populated before ``before_insert`` fires. Without this, a row
+        # constructed without an explicit status had ``record.status is None``
+        # at validation time — the canonical-id check would raise
+        # AttributeError on the error path's ``.value`` deref instead of
+        # letting Postgres apply its default. ``server_default`` still owns
+        # the on-disk default for hand-written SQL.
+        default=StagingStatus.PENDING,
         server_default=StagingStatus.PENDING.value,
         index=True,
     )
@@ -220,7 +228,13 @@ _NULL_CANONICAL_OK: frozenset[StagingStatus] = frozenset(
 def _check_canonical_invariant(record: StagingRecord) -> None:
     if record.canonical_id is not None:
         return
-    if record.status in _NULL_CANONICAL_OK:
+    # ``status`` may be ``None`` at ``before_insert`` time when a caller
+    # constructed the row without setting it and is relying on the column
+    # default — the row will land as ``pending``, which is a legal
+    # null-canonical state. Treat that case as already-cleared rather than
+    # falling through to the error formatter (which would AttributeError on
+    # ``None.value``).
+    if record.status is None or record.status in _NULL_CANONICAL_OK:
         return
     raise StagingInvariantError(
         f"StagingRecord with status={record.status.value!r} requires a "
