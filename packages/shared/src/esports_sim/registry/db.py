@@ -27,7 +27,7 @@ import shutil
 import sqlite3
 import subprocess
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,7 +37,7 @@ from esports_sim.registry.errors import (
     RegistryError,
     RunNotFoundError,
 )
-from esports_sim.registry.fingerprint import compute_fingerprint, hash_file
+from esports_sim.registry.fingerprint import compute_fingerprint
 
 # Defaults follow the issue: state/registry.db + runs/. Both relative to
 # the process CWD so dev environments and CI both Just Work without env
@@ -219,12 +219,18 @@ class Registry:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
-            # Migrate older DBs that pre-date the run_dir column. SQLite
-            # raises OperationalError("duplicate column name") when the
-            # column already exists; suppressing that is the idiomatic
-            # idempotent ADD COLUMN.
-            with suppress(sqlite3.OperationalError):
+            # Migrate older DBs that pre-date the run_dir column. The only
+            # OperationalError we expect (and want to swallow) is the
+            # "duplicate column name" one that fires when the column is
+            # already there — every other OperationalError (database
+            # locked, real schema corruption, ...) means migration didn't
+            # run and downstream INSERTs would fail with mysterious
+            # "no such column" / corrupt-row errors. Surface those.
+            try:
                 conn.execute("ALTER TABLE runs ADD COLUMN run_dir TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
 
     # ---- public API --------------------------------------------------------
 
@@ -279,7 +285,17 @@ class Registry:
         if not config.exists():
             raise FileNotFoundError(f"config file not found: {config}")
 
-        config_hash = hash_file(config)
+        # Read the config bytes once and use the same buffer for both the
+        # hash (idempotency key) and the snapshot copy. Reading twice —
+        # `hash_file()` for the hash and `shutil.copy2()` for the snapshot
+        # later — would let a concurrent writer mutate the file between the
+        # two reads, leaving the stored ``config_hash`` describing one set
+        # of bytes and ``runs/{run_id}/config.yaml`` describing another.
+        # Configs are KB-scale YAML; reading them whole into memory is
+        # cheap. The data fingerprint helper still streams large data
+        # files in 1 MiB chunks.
+        config_bytes = config.read_bytes()
+        config_hash = hashlib.sha256(config_bytes).hexdigest()
         if data_fingerprint is None:
             data_fingerprint = compute_fingerprint(data_paths or [])
 
@@ -322,7 +338,9 @@ class Registry:
             except FileExistsError:
                 continue
             snapshot_path = run_dir / f"config{config.suffix or '.yaml'}"
-            shutil.copy2(config, snapshot_path)
+            # Write from the bytes we already hashed — guaranteed to match
+            # ``config_hash`` even if the source file mutates concurrently.
+            snapshot_path.write_bytes(config_bytes)
 
             started_at = _now_utc()
             git_sha = _current_git_sha()
