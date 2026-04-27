@@ -27,7 +27,7 @@ import shutil
 import sqlite3
 import subprocess
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS runs (
     git_sha TEXT,
     started_at TEXT NOT NULL,
     finished_at TEXT,
+    -- Absolute (or CWD-relative) path to the run's artifact directory at
+    -- *register time*. We persist it so RunRecord.run_dir is stable across
+    -- registry openings — opening with a different ``runs_dir`` later
+    -- doesn't silently relocate the artifacts of an existing row.
+    run_dir TEXT NOT NULL DEFAULT '',
     config_snapshot_path TEXT NOT NULL,
     -- sha256 of the *original* config file's bytes. Together with kind
     -- and data_fingerprint this is the natural key for idempotent
@@ -100,6 +105,12 @@ class RunRecord:
     Downstream code asks for paths via this object instead of building
     ``runs/{run_id}/...`` strings inline — that way a future move of the
     artifact root only touches the registry.
+
+    ``run_dir`` is the *stored* path persisted at register time, not a
+    value derived from whoever opens the registry now. Opening with a
+    different ``runs_dir`` later doesn't relocate the artifacts of an
+    existing row — and downstream code that resumes a registered run
+    always reads/writes under the directory the run was created in.
     """
 
     run_id: str
@@ -107,17 +118,12 @@ class RunRecord:
     git_sha: str | None
     started_at: datetime
     finished_at: datetime | None
+    run_dir: Path
     config_snapshot_path: str
     config_hash: str
     data_fingerprint: str
     status: RunStatus
     notes: str | None
-    runs_dir: Path
-
-    @property
-    def run_dir(self) -> Path:
-        """Absolute (or CWD-relative) directory holding this run's artifacts."""
-        return self.runs_dir / self.run_id
 
     @property
     def config_snapshot(self) -> Path:
@@ -173,6 +179,12 @@ class Registry:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
+            # Migrate older DBs that pre-date the run_dir column. SQLite
+            # raises OperationalError("duplicate column name") when the
+            # column already exists; suppressing that is the idiomatic
+            # idempotent ADD COLUMN.
+            with suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE runs ADD COLUMN run_dir TEXT NOT NULL DEFAULT ''")
 
     # ---- public API --------------------------------------------------------
 
@@ -259,11 +271,16 @@ class Registry:
         for _attempt in range(_MAX_RUN_ID_RETRIES):
             run_id = _generate_run_id(kind)
             run_dir = self.runs_dir / run_id
-            if run_dir.exists():
-                # A sibling process already minted this id and started
-                # creating its dir; let them have it and try again.
+            try:
+                # ``exist_ok=False`` raises FileExistsError if the dir was
+                # created between our id generation and now — by either
+                # this process (extremely unlikely) or a sibling that just
+                # registered with the same id. Don't pre-check with
+                # ``exists()``: that's TOCTOU and the race fires under
+                # exactly the workload this loop exists to handle.
+                run_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
                 continue
-            run_dir.mkdir(parents=True, exist_ok=False)
             snapshot_path = run_dir / f"config{config.suffix or '.yaml'}"
             shutil.copy2(config, snapshot_path)
 
@@ -276,15 +293,16 @@ class Registry:
                         """
                         INSERT INTO runs (
                             run_id, kind, git_sha, started_at, finished_at,
-                            config_snapshot_path, config_hash, data_fingerprint,
-                            status, notes
-                        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                            run_dir, config_snapshot_path, config_hash,
+                            data_fingerprint, status, notes
+                        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             run_id,
                             kind,
                             git_sha,
                             started_at.isoformat(),
+                            str(run_dir),
                             str(snapshot_path),
                             config_hash,
                             data_fingerprint,
@@ -414,6 +432,14 @@ class Registry:
         return None if row is None else str(row["run_id"])
 
     def _row_to_record(self, row: sqlite3.Row) -> RunRecord:
+        # ``run_dir`` is the *stored* path. Older rows (registered before
+        # the column existed) carry an empty string — fall back to the
+        # caller's ``runs_dir / run_id`` so the lookup still resolves,
+        # while accepting that the fallback inherits the original bug
+        # for those legacy rows. Fresh registrations always populate the
+        # column.
+        stored_run_dir = row["run_dir"]
+        run_dir = Path(stored_run_dir) if stored_run_dir else self.runs_dir / str(row["run_id"])
         return RunRecord(
             run_id=str(row["run_id"]),
             kind=str(row["kind"]),
@@ -422,12 +448,12 @@ class Registry:
             finished_at=(
                 datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None
             ),
+            run_dir=run_dir,
             config_snapshot_path=str(row["config_snapshot_path"]),
             config_hash=str(row["config_hash"]),
             data_fingerprint=str(row["data_fingerprint"]),
             status=RunStatus(row["status"]),
             notes=row["notes"],
-            runs_dir=self.runs_dir,
         )
 
 
