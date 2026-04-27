@@ -11,13 +11,20 @@ Algorithm:
    where ``label`` is the basename (single file) or the directory-relative
    POSIX path (directory walk).
 2. Sort the resulting list by ``(label, sha256)``.
-3. Roll the sorted pairs into a final SHA-256.
+3. Fold the **input manifest** (sorted basenames of the top-level
+   inputs) into the rolling hash first, then the sorted file-content
+   pairs. The manifest prefix is what makes
+   ``compute_fingerprint([empty_dir])`` distinct from
+   ``compute_fingerprint([])`` — without it both walked to zero files
+   and produced the empty-string sentinel, collapsing the natural-key
+   for "explicitly empty dataset" onto "no data provided at all".
 
-The sort key is ``(label, sha256)`` — *not* just ``label`` — so two
-distinct files with the same basename (``/mnt/a/data.csv`` and
-``/mnt/b/data.csv``, or two directories both named ``shards``) produce a
-canonical, content-derived ordering. Sorting by label alone would leave
-duplicates in caller-provided order, breaking permutation invariance.
+The sort key for files is ``(label, sha256)`` — *not* just ``label`` —
+so two distinct files with the same basename (``/mnt/a/data.csv`` and
+``/mnt/b/data.csv``, or two directories both named ``shards``) produce
+a canonical, content-derived ordering. Sorting by label alone would
+leave duplicates in caller-provided order, breaking permutation
+invariance.
 
 If callers have a more efficient fingerprint for their input shape
 (e.g., a DuckDB row-count + min/max digest for tabular data), they can
@@ -75,10 +82,15 @@ def _iter_files(paths: Iterable[Path]) -> list[tuple[str, Path]]:
 def compute_fingerprint(paths: Iterable[Path | str]) -> str:
     """Return a deterministic SHA-256 over the contents of *paths*.
 
-    * Empty input → empty string. The registry uses ``""`` as a sentinel
-      for "no data fingerprint, only config matters" so don't conflate
-      it with a real digest.
-    * Otherwise → 64-character hex digest.
+    * Empty input list (``compute_fingerprint([])``) → empty string. The
+      registry uses ``""`` as the "no data provided" sentinel; this is
+      reserved for callers who genuinely have no data dimension to fold
+      into the natural key.
+    * Any non-empty input list → 64-character hex digest, even when the
+      walk yields zero files (e.g. the caller passed an empty directory).
+      An empty dataset is *different* from no dataset; collapsing them
+      onto the same fingerprint would let an explicitly-empty dataset
+      reuse a prior run_id that was registered with no data at all.
 
     Stable across runs as long as the bytes are unchanged. Caller is
     responsible for picking ``paths`` that meaningfully describe the run
@@ -90,11 +102,11 @@ def compute_fingerprint(paths: Iterable[Path | str]) -> str:
     """
     paths_list = [Path(p) for p in paths]
     if not paths_list:
+        # Reserved sentinel for "no data provided at all". An empty
+        # *directory* still produces a real digest — see below.
         return ""
 
     files = _iter_files(paths_list)
-    if not files:
-        return ""
 
     # Hash up front so the sort can use the file digest as the tie-breaker
     # for label collisions. Without this, two files named ``data.csv``
@@ -105,7 +117,20 @@ def compute_fingerprint(paths: Iterable[Path | str]) -> str:
     hashed.sort()
 
     rolling = hashlib.sha256()
+
+    # Input manifest: the *basenames* of the top-level inputs, sorted.
+    # This is what gives ``compute_fingerprint([empty_dir])`` a non-empty,
+    # content-derived digest (and one that's distinct from the
+    # ``compute_fingerprint([])`` sentinel). The "INPUT:" prefix
+    # disambiguates the manifest section from the file section that
+    # follows so a path basename can never collide with a file label.
+    for label in sorted(p.name for p in paths_list):
+        rolling.update(b"INPUT:")
+        rolling.update(label.encode("utf-8"))
+        rolling.update(b"\x00")
+
     for label, file_hash in hashed:
+        rolling.update(b"FILE:")
         rolling.update(label.encode("utf-8"))
         rolling.update(b"\x00")
         rolling.update(file_hash.encode("ascii"))
