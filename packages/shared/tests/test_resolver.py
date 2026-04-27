@@ -550,3 +550,76 @@ def test_auto_merge_path_recovers_from_concurrent_alias_insert(db_session, monke
     )
     assert second.status is ResolutionStatus.MATCHED
     assert second.canonical_id == entity.canonical_id
+
+
+def test_unrelated_integrity_error_is_not_swallowed_by_create_path(db_session, monkeypatch) -> None:
+    """A non-race IntegrityError must propagate, not become a fake MATCHED.
+
+    Regression for a code-review finding: the CREATED-path savepoint used
+    to catch any IntegrityError. If an unrelated pending object in the
+    same session caused flush to fail (e.g. a duplicate
+    ``raw_record.content_hash``), the resolver would misclassify it as the
+    alias race and return a wrong MATCHED for a row that was never written.
+    """
+    from esports_sim.resolver import core
+    from sqlalchemy.exc import IntegrityError
+
+    def fake_insert_alias(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        # Simulate a different-constraint unique violation. The constraint
+        # name is *not* uq_entity_alias_platform_platform_id, so the resolver
+        # must re-raise rather than degrade into MATCHED.
+        raise IntegrityError(
+            "INSERT INTO raw_record",
+            {},
+            Exception("violates unique constraint uq_raw_record_content_hash"),
+        )
+
+    monkeypatch.setattr(core, "_insert_alias", fake_insert_alias)
+
+    with pytest.raises(IntegrityError):
+        resolve_entity(
+            db_session,
+            platform=Platform.VLR,
+            platform_id="vlr-fresh",
+            platform_name="Fresh",
+            entity_type=EntityType.PLAYER,
+        )
+
+
+def test_unrelated_integrity_error_is_not_swallowed_by_auto_merge_path(
+    db_session, monkeypatch
+) -> None:
+    """Same guarantee for the AUTO_MERGED-path recovery branch."""
+    from esports_sim.resolver import core
+    from sqlalchemy.exc import IntegrityError
+
+    # Seed an existing canonical + alias so AUTO_MERGED is the path under test.
+    entity = make_entity(entity_type=EntityType.PLAYER)
+    db_session.add(entity)
+    db_session.add(
+        make_entity_alias(
+            entity=entity,
+            platform=Platform.VLR,
+            platform_id="vlr-tenz",
+            platform_name="TenZ",
+        )
+    )
+    db_session.flush()
+
+    def fake_insert_alias(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise IntegrityError(
+            "INSERT INTO raw_record",
+            {},
+            Exception("violates unique constraint uq_raw_record_content_hash"),
+        )
+
+    monkeypatch.setattr(core, "_insert_alias", fake_insert_alias)
+
+    with pytest.raises(IntegrityError):
+        resolve_entity(
+            db_session,
+            platform=Platform.LIQUIPEDIA,
+            platform_id="liq-tenz",
+            platform_name="tenz",
+            entity_type=EntityType.PLAYER,
+        )

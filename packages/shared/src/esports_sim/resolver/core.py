@@ -51,6 +51,30 @@ _SCORE_DIVISOR: float = 100.0
 # only ever needs the best handful; bloating the row hurts both DB and UI.
 _MAX_REVIEW_CANDIDATES: int = 5
 
+# Name of the unique constraint that protects ``(platform, platform_id)`` on
+# the alias table — defined alongside :class:`EntityAlias`. The race-recovery
+# branches use this to distinguish the constraint they expect from any other
+# unique violation that might surface during a flush of unrelated session
+# state. Hard-coded rather than introspected because if the constraint name
+# ever changes, the matching here must be re-validated by hand.
+_ALIAS_UNIQUE_CONSTRAINT: str = "uq_entity_alias_platform_platform_id"
+
+
+def _is_alias_uniqueness_violation(error: IntegrityError) -> bool:
+    """True iff this IntegrityError is the (platform, platform_id) race.
+
+    Postgres surfaces the violated constraint name on ``error.orig.diag``
+    (psycopg). Falling back to a substring check on ``str(error)`` keeps the
+    detection useful when that introspection isn't available — the
+    constraint name is unique enough to make string matching safe.
+    """
+    orig = getattr(error, "orig", None)
+    diag = getattr(orig, "diag", None)
+    constraint_name = getattr(diag, "constraint_name", None)
+    if constraint_name == _ALIAS_UNIQUE_CONSTRAINT:
+        return True
+    return _ALIAS_UNIQUE_CONSTRAINT in str(error)
+
 
 class ResolutionStatus(enum.StrEnum):
     """The four terminal states of :func:`resolve_entity`."""
@@ -191,10 +215,16 @@ def resolve_entity(
                 platform_name=platform_name,
                 confidence=1.0,
             )
-    except IntegrityError:
-        # Another resolver call inserted the (platform, platform_id) alias
-        # between our lookup and our flush; the savepoint rolled back our
-        # entity. Re-fetch and degrade gracefully into a MATCHED return.
+    except IntegrityError as exc:
+        # Only swallow the (platform, platform_id) race; any other constraint
+        # violation surfaced by the flush — e.g. an unrelated duplicate key
+        # on RawRecord.content_hash or a different scraper's pending object —
+        # belongs to its caller and must propagate. Misclassifying it would
+        # silently replace the real DB error with a wrong MATCHED return.
+        if not _is_alias_uniqueness_violation(exc):
+            raise
+        # Savepoint rolled back our orphan entity. Re-fetch and degrade
+        # gracefully into a MATCHED return.
         return _matched_after_race(session, platform=platform, platform_id=platform_id)
     return ResolveResult(
         status=ResolutionStatus.CREATED,
@@ -307,7 +337,13 @@ def _try_insert_alias_or_recover(
                 platform_name=platform_name,
                 confidence=confidence,
             )
-    except IntegrityError:
+    except IntegrityError as exc:
+        # See the equivalent guard in resolve_entity's CREATED branch: only
+        # the alias unique constraint is the race we know how to recover
+        # from; everything else (different table, different constraint) must
+        # surface so the caller sees the real failure.
+        if not _is_alias_uniqueness_violation(exc):
+            raise
         return _matched_after_race(session, platform=platform, platform_id=platform_id)
     return None
 
