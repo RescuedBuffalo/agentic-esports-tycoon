@@ -267,12 +267,25 @@ def _insert_alias(
 def _find_pending_review(
     session: Session, *, platform: Platform, platform_id: str
 ) -> AliasReviewQueue | None:
-    stmt = select(AliasReviewQueue).where(
-        AliasReviewQueue.platform == platform,
-        AliasReviewQueue.platform_id == platform_id,
-        AliasReviewQueue.status == ReviewStatus.PENDING,
+    # ``alias_review_queue`` has no uniqueness constraint over
+    # (platform, platform_id, status=pending) and the enqueue path is
+    # non-atomic, so two concurrent resolver calls can each insert a pending
+    # row before either notices the other. A third call's idempotency check
+    # would then see two rows; ``.scalar_one_or_none()`` would crash with
+    # ``MultipleResultsFound``, turning the retry path into a hard failure.
+    # Take the oldest pending row instead: any pending match is enough to
+    # treat the (platform, platform_id) as already queued.
+    stmt = (
+        select(AliasReviewQueue)
+        .where(
+            AliasReviewQueue.platform == platform,
+            AliasReviewQueue.platform_id == platform_id,
+            AliasReviewQueue.status == ReviewStatus.PENDING,
+        )
+        .order_by(AliasReviewQueue.created_at)
+        .limit(1)
     )
-    return session.execute(stmt).scalar_one_or_none()
+    return session.execute(stmt).scalars().first()
 
 
 # Re-export so callers writing ``from esports_sim.resolver.core import ...``

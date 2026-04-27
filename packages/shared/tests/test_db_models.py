@@ -130,16 +130,8 @@ def test_alias_same_platform_id_different_platform_is_legal(db_session) -> None:
 
 
 def test_staging_record_defaults_pending(db_session) -> None:
-    """`status` defaults to pending so scrapers can omit it.
-
-    Attach a canonical_id because BUF-7 forbids a null canonical with any
-    status besides ``review``/``blocked``; the assertion here is about the
-    status default, not the canonical-id state.
-    """
-    e = make_entity()
-    db_session.add(e)
-    db_session.flush()
-    sr = make_staging_record(canonical_id=e.canonical_id)
+    """`status` defaults to pending so scrapers can omit it."""
+    sr = make_staging_record()
     db_session.add(sr)
     db_session.flush()
     db_session.refresh(sr)

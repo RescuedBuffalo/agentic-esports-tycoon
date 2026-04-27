@@ -140,13 +140,15 @@ class EntityAlias(Base):
 class StagingRecord(Base):
     """Scraped payload waiting for the resolver.
 
-    ``canonical_id`` is nullable so a row can be parked before the resolver
-    decides what entity it belongs to. BUF-7's ``StagingRecord.save()``
-    enforces the rule that a null ``canonical_id`` is only legal when the
-    status is ``blocked`` or ``review``. The :func:`_validate_canonical_id`
-    listener wired further down is the runtime backstop: even a scraper that
-    bypasses :meth:`save` and calls ``session.add`` directly cannot push a
-    null-canonical row in any status besides those two.
+    ``canonical_id`` is nullable to support the documented staging
+    lifecycle: ``pending`` rows queued for the resolver, ``review`` rows
+    deferred to a human reviewer, and ``blocked`` rows kept only for
+    audit may all legitimately carry a null canonical id. The bypass that
+    BUF-7 closes is the ``processed`` state — once a row is marked as
+    fully processed, the canonical id MUST be set. ``StagingRecord.save()``
+    plus the event listener below refuse to flush a ``processed`` row with
+    a null canonical id, which is the only way a scraper could "finish"
+    a staging row without actually consulting the resolver.
     """
 
     __tablename__ = "staging_record"
@@ -180,12 +182,11 @@ class StagingRecord(Base):
     def save(self, session: Session) -> None:
         """Persist this record, enforcing the canonical-id invariant.
 
-        BUF-7 requires the resolver to be the only thing that fills in a
-        ``canonical_id``. A row that is neither under review nor blocked must
-        therefore already carry a non-null canonical_id by the time it lands
-        in the session — anything else means a scraper tried to skip the
-        resolver. This wrapper raises :class:`StagingInvariantError` rather
-        than letting the row reach the database.
+        Refuses to add a ``processed`` row whose ``canonical_id`` is still
+        null — the only way that combination can arise is a scraper marking
+        a staging row as fully processed without actually consulting the
+        resolver. ``pending``/``review``/``blocked`` rows may legitimately
+        have a null canonical_id and pass through unchanged.
 
         Direct ``session.add(record)`` is also covered by the event listener
         below; ``save()`` exists so call sites read intentionally and so
@@ -198,19 +199,21 @@ class StagingRecord(Base):
 class StagingInvariantError(ValueError):
     """Raised when a :class:`StagingRecord` violates BUF-7's resolver rule.
 
-    A staging row may only carry a null ``canonical_id`` when its
-    ``status`` is ``blocked`` (kept for audit, never reprocessed) or
-    ``review`` (deferred to the alias review queue). Any other status with a
-    null canonical id means a scraper tried to write through without going
-    through :func:`esports_sim.resolver.resolve_entity` — refuse it loudly
+    A ``processed`` staging row whose ``canonical_id`` is null is the
+    bypass case: a scraper has declared the row "done" without going
+    through :func:`esports_sim.resolver.resolve_entity`. Refuse it loudly
     rather than corrupting the canonical join key.
     """
 
 
-# Statuses where a null canonical_id is meaningful state, not a bug. Kept as a
+# Statuses where a null canonical_id is meaningful state, not a bug. ``pending``
+# is the pre-resolver queue state; ``review`` and ``blocked`` are terminal
+# states the resolver itself produces when it can't (or won't) auto-decide.
+# Only ``processed`` requires a non-null canonical_id, because that's the
+# state that asserts "this row has a canonical mapping". Kept as a
 # module-level frozenset so the listener and the wrapper can't drift apart.
 _NULL_CANONICAL_OK: frozenset[StagingStatus] = frozenset(
-    {StagingStatus.BLOCKED, StagingStatus.REVIEW}
+    {StagingStatus.PENDING, StagingStatus.REVIEW, StagingStatus.BLOCKED}
 )
 
 
@@ -220,9 +223,10 @@ def _check_canonical_invariant(record: StagingRecord) -> None:
     if record.status in _NULL_CANONICAL_OK:
         return
     raise StagingInvariantError(
-        "StagingRecord with null canonical_id requires status=blocked or "
-        f"status=review (got {record.status.value!r}). The resolver "
-        "(BUF-7) is the only sanctioned writer of canonical_id."
+        f"StagingRecord with status={record.status.value!r} requires a "
+        "non-null canonical_id. The resolver (BUF-7) is the only sanctioned "
+        "writer of that column; marking a row processed without one means a "
+        "scraper bypassed resolve_entity()."
     )
 
 

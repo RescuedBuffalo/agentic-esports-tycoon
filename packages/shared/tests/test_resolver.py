@@ -357,15 +357,17 @@ def test_tenz_resolves_to_same_canonical_via_vlr_then_liquipedia(db_session) -> 
 # --- StagingRecord.save() guard ---------------------------------------------
 
 
-def test_staging_save_rejects_null_canonical_in_pending(db_session) -> None:
-    """A PENDING staging row without a canonical_id is a resolver bypass."""
+def test_staging_save_allows_null_canonical_in_pending(db_session) -> None:
+    """PENDING is the pre-resolver queue state; null canonical is fine."""
     sr = make_staging_record(canonical_id=None, status=StagingStatus.PENDING)
-    with pytest.raises(StagingInvariantError):
-        sr.save(db_session)
+    sr.save(db_session)
+    db_session.flush()
+    assert sr.canonical_id is None
+    assert sr.status is StagingStatus.PENDING
 
 
 def test_staging_save_rejects_null_canonical_in_processed(db_session) -> None:
-    """PROCESSED is a write-through state; null canonical is illegal."""
+    """PROCESSED is the only status that asserts the row has a canonical id."""
     sr = make_staging_record(canonical_id=None, status=StagingStatus.PROCESSED)
     with pytest.raises(StagingInvariantError):
         sr.save(db_session)
