@@ -49,6 +49,12 @@ _DEFAULT_RUNS_DIR = Path("runs")
 # and -/_/.; no path separators, no whitespace. Anchored to whole string.
 _KIND_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
+# How many times we retry register() on a run_id PK collision. Each retry
+# generates a new {YYMMDD-HHMMSS-6hex} suffix; with 24 bits of entropy
+# per second, five retries makes a true collision storm vanishingly
+# unlikely while keeping the failure mode bounded.
+_MAX_RUN_ID_RETRIES = 5
+
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -233,53 +239,81 @@ class Registry:
         if existing is not None:
             return existing
 
-        run_id = _generate_run_id(kind)
-        run_dir = self.runs_dir / run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_path = run_dir / f"config{config.suffix or '.yaml'}"
-        shutil.copy2(config, snapshot_path)
+        # Two distinct IntegrityError scenarios collapse onto the same
+        # exception type and have to be disambiguated by inspecting the DB:
+        #
+        #   (a) **Natural-key race**. UNIQUE(kind, config_hash,
+        #       data_fingerprint) fired because another writer registered
+        #       the same triple between our pre-flight lookup and our
+        #       insert. The run is theirs; return their run_id.
+        #
+        #   (b) **run_id PK collision**. _generate_run_id mints
+        #       ``{kind}-{YYMMDD-HHMMSS}-{6hex}`` — 24 bits of suffix
+        #       entropy per second. Two concurrent registrations of
+        #       *different* triples can land on the same id at sub-second
+        #       resolution. Retry with a fresh id.
+        #
+        # The shape of the recovery is "look up the natural key, if found
+        # → (a), otherwise → (b)" inside a bounded retry loop.
+        last_error: sqlite3.IntegrityError | None = None
+        for _attempt in range(_MAX_RUN_ID_RETRIES):
+            run_id = _generate_run_id(kind)
+            run_dir = self.runs_dir / run_id
+            if run_dir.exists():
+                # A sibling process already minted this id and started
+                # creating its dir; let them have it and try again.
+                continue
+            run_dir.mkdir(parents=True, exist_ok=False)
+            snapshot_path = run_dir / f"config{config.suffix or '.yaml'}"
+            shutil.copy2(config, snapshot_path)
 
-        started_at = _now_utc()
-        git_sha = _current_git_sha()
+            started_at = _now_utc()
+            git_sha = _current_git_sha()
 
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO runs (
-                        run_id, kind, git_sha, started_at, finished_at,
-                        config_snapshot_path, config_hash, data_fingerprint,
-                        status, notes
-                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        run_id,
-                        kind,
-                        git_sha,
-                        started_at.isoformat(),
-                        str(snapshot_path),
-                        config_hash,
-                        data_fingerprint,
-                        RunStatus.RUNNING.value,
-                        notes,
-                    ),
+            try:
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO runs (
+                            run_id, kind, git_sha, started_at, finished_at,
+                            config_snapshot_path, config_hash, data_fingerprint,
+                            status, notes
+                        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            kind,
+                            git_sha,
+                            started_at.isoformat(),
+                            str(snapshot_path),
+                            config_hash,
+                            data_fingerprint,
+                            RunStatus.RUNNING.value,
+                            notes,
+                        ),
+                    )
+            except sqlite3.IntegrityError as e:
+                last_error = e
+                # Tear down the half-built dir before deciding which
+                # branch we're in — both branches discard our work.
+                shutil.rmtree(run_dir, ignore_errors=True)
+                existing = self._lookup_existing(
+                    kind=kind,
+                    config_hash=config_hash,
+                    data_fingerprint=data_fingerprint,
                 )
-        except sqlite3.IntegrityError:
-            # Race: another writer registered the same triple between our
-            # lookup and insert. Fall back to whatever they got and tear
-            # down our half-built directory so the on-disk view stays
-            # consistent with the DB.
-            shutil.rmtree(run_dir, ignore_errors=True)
-            existing = self._lookup_existing(
-                kind=kind,
-                config_hash=config_hash,
-                data_fingerprint=data_fingerprint,
-            )
-            if existing is None:  # pragma: no cover - defensive
-                raise
-            return existing
+                if existing is not None:
+                    # (a) Natural-key race — adopt the other writer's id.
+                    return existing
+                # (b) run_id PK collision — try again with a fresh id.
+                continue
+            return run_id
 
-        return run_id
+        raise RegistryError(  # pragma: no cover - 5 collisions in a row is essentially unreachable
+            f"Could not register run after {_MAX_RUN_ID_RETRIES} attempts due to "
+            f"run_id collisions. Check the system clock and entropy source. "
+            f"Last error: {last_error}"
+        )
 
     def finalize(
         self,
@@ -415,9 +449,16 @@ def _now_utc() -> datetime:
 
 
 def _generate_run_id(kind: str) -> str:
-    """``{kind}-{YYMMDD-HHMMSS}-{4hex}`` — sortable, human-readable, unique."""
+    """``{kind}-{YYMMDD-HHMMSS}-{6hex}`` — sortable, human-readable, unique.
+
+    24 bits of suffix entropy keeps the per-second collision probability
+    at ~1/16M for two simultaneous starts of the same kind. The
+    ``register`` retry loop catches the residual collisions; bumping past
+    24 bits would be belt-and-suspenders. (Original 16-bit suffix was
+    flagged in PR review for being too tight under concurrent starts.)
+    """
     ts = _now_utc().strftime("%y%m%d-%H%M%S")
-    suffix = secrets.token_hex(2)  # 4 hex chars
+    suffix = secrets.token_hex(3)  # 6 hex chars (24 bits)
     return f"{kind}-{ts}-{suffix}"
 
 
