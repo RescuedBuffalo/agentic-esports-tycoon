@@ -55,6 +55,29 @@ This is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/
 the root `pyproject.toml` declares the members and pins Python 3.12, each
 package has its own `pyproject.toml`, and `uv sync` resolves them together.
 
+## Experiment registry (BUF-69)
+
+Every training run, graph snapshot, and world-model pretrain registers
+itself in `state/registry.db` and gets a deterministic `run_id`. All
+artifacts live under `runs/{run_id}/`. Downstream code resolves paths
+via `Registry.get(run_id)` — nothing hardcodes `runs/...`.
+
+```bash
+# Register a new run (idempotent: same config + data → same run_id)
+uv run nexus run register --kind=graph-snapshot --config=configs/graph/era_7.09.yaml
+
+# List runs (filter by --kind / --status)
+uv run nexus run ls --kind=rl-train
+
+# Inspect one
+uv run nexus run show <run_id>
+
+# Mark terminal
+uv run nexus run finalize <run_id> --status=completed --notes="ok"
+```
+
+Public Python API: `from esports_sim.registry import Registry, RunStatus`.
+
 ## Claude API budget governor (BUF-22)
 
 Every Claude call goes through `esports_sim.budget.claude_call`. The governor

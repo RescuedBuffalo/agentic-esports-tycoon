@@ -27,9 +27,10 @@ dependencies = [
 ]
 
 [project.scripts]
-# CLI entrypoint for the budget tooling (BUF-22). `nexus budget report`
-# prints the daily digest; `nexus budget tail` follows the ledger live.
-nexus = "esports_sim.budget.cli:main"
+# Top-level CLI. Subcommands register via add_subparser:
+#   nexus budget report        — BUF-22 spend digest
+#   nexus run register/ls/show — BUF-69 experiment registry
+nexus = "esports_sim.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/esports_sim"]
