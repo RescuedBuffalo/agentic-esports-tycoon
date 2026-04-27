@@ -18,11 +18,13 @@ from sqlalchemy import (
     ForeignKey,
     String,
     UniqueConstraint,
+    event,
     func,
 )
 from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Mapped, Mapper, Session, mapped_column, relationship
 
 from esports_sim.db.base import Base
 from esports_sim.db.enums import EntityType, Platform, ReviewStatus, StagingStatus
@@ -141,7 +143,10 @@ class StagingRecord(Base):
     ``canonical_id`` is nullable so a row can be parked before the resolver
     decides what entity it belongs to. BUF-7's ``StagingRecord.save()``
     enforces the rule that a null ``canonical_id`` is only legal when the
-    status is ``blocked`` or ``review``.
+    status is ``blocked`` or ``review``. The :func:`_validate_canonical_id`
+    listener wired further down is the runtime backstop: even a scraper that
+    bypasses :meth:`save` and calls ``session.add`` directly cannot push a
+    null-canonical row in any status besides those two.
     """
 
     __tablename__ = "staging_record"
@@ -171,6 +176,76 @@ class StagingRecord(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+    def save(self, session: Session) -> None:
+        """Persist this record, enforcing the canonical-id invariant.
+
+        BUF-7 requires the resolver to be the only thing that fills in a
+        ``canonical_id``. A row that is neither under review nor blocked must
+        therefore already carry a non-null canonical_id by the time it lands
+        in the session — anything else means a scraper tried to skip the
+        resolver. This wrapper raises :class:`StagingInvariantError` rather
+        than letting the row reach the database.
+
+        Direct ``session.add(record)`` is also covered by the event listener
+        below; ``save()`` exists so call sites read intentionally and so
+        unit tests can assert against a single named code path.
+        """
+        _check_canonical_invariant(self)
+        session.add(self)
+
+
+class StagingInvariantError(ValueError):
+    """Raised when a :class:`StagingRecord` violates BUF-7's resolver rule.
+
+    A staging row may only carry a null ``canonical_id`` when its
+    ``status`` is ``blocked`` (kept for audit, never reprocessed) or
+    ``review`` (deferred to the alias review queue). Any other status with a
+    null canonical id means a scraper tried to write through without going
+    through :func:`esports_sim.resolver.resolve_entity` — refuse it loudly
+    rather than corrupting the canonical join key.
+    """
+
+
+# Statuses where a null canonical_id is meaningful state, not a bug. Kept as a
+# module-level frozenset so the listener and the wrapper can't drift apart.
+_NULL_CANONICAL_OK: frozenset[StagingStatus] = frozenset(
+    {StagingStatus.BLOCKED, StagingStatus.REVIEW}
+)
+
+
+def _check_canonical_invariant(record: StagingRecord) -> None:
+    if record.canonical_id is not None:
+        return
+    if record.status in _NULL_CANONICAL_OK:
+        return
+    raise StagingInvariantError(
+        "StagingRecord with null canonical_id requires status=blocked or "
+        f"status=review (got {record.status.value!r}). The resolver "
+        "(BUF-7) is the only sanctioned writer of canonical_id."
+    )
+
+
+@event.listens_for(StagingRecord, "before_insert")
+def _staging_before_insert(
+    _mapper: Mapper[StagingRecord],
+    _connection: Connection,
+    target: StagingRecord,
+) -> None:
+    # SQLAlchemy event hook. Backstop for ``session.add(StagingRecord(...))``
+    # paths that don't go through ``StagingRecord.save``. Note: this does not
+    # fire for FK-cascade SET NULL, which happens inside Postgres — that's
+    # the audit-trail outcome the schema deliberately allows.
+    _check_canonical_invariant(target)
+
+
+@event.listens_for(StagingRecord, "before_update")
+def _staging_before_update(
+    _mapper: Mapper[StagingRecord],
+    _connection: Connection,
+    target: StagingRecord,
+) -> None:
+    _check_canonical_invariant(target)
 
 
 class RawRecord(Base):
@@ -236,6 +311,7 @@ __all__ = [
     "Entity",
     "EntityAlias",
     "StagingRecord",
+    "StagingInvariantError",
     "RawRecord",
     "AliasReviewQueue",
 ]
