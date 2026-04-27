@@ -24,6 +24,7 @@ from esports_sim.db.models import (
     Entity,
     EntityAlias,
     RawRecord,
+    StagingInvariantError,
     StagingRecord,
 )
 
@@ -36,6 +37,7 @@ __all__ = [
     "Entity",
     "EntityAlias",
     "StagingRecord",
+    "StagingInvariantError",
     "RawRecord",
     "AliasReviewQueue",
 ]

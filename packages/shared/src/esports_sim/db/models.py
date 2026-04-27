@@ -16,13 +16,17 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     String,
     UniqueConstraint,
+    event,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Mapped, Mapper, Session, mapped_column, relationship
 
 from esports_sim.db.base import Base
 from esports_sim.db.enums import EntityType, Platform, ReviewStatus, StagingStatus
@@ -138,10 +142,15 @@ class EntityAlias(Base):
 class StagingRecord(Base):
     """Scraped payload waiting for the resolver.
 
-    ``canonical_id`` is nullable so a row can be parked before the resolver
-    decides what entity it belongs to. BUF-7's ``StagingRecord.save()``
-    enforces the rule that a null ``canonical_id`` is only legal when the
-    status is ``blocked`` or ``review``.
+    ``canonical_id`` is nullable to support the documented staging
+    lifecycle: ``pending`` rows queued for the resolver, ``review`` rows
+    deferred to a human reviewer, and ``blocked`` rows kept only for
+    audit may all legitimately carry a null canonical id. The bypass that
+    BUF-7 closes is the ``processed`` state — once a row is marked as
+    fully processed, the canonical id MUST be set. ``StagingRecord.save()``
+    plus the event listener below refuse to flush a ``processed`` row with
+    a null canonical id, which is the only way a scraper could "finish"
+    a staging row without actually consulting the resolver.
     """
 
     __tablename__ = "staging_record"
@@ -163,6 +172,14 @@ class StagingRecord(Base):
     status: Mapped[StagingStatus] = mapped_column(
         _staging_status,
         nullable=False,
+        # Mirror the server_default at the Python layer so the attribute is
+        # populated before ``before_insert`` fires. Without this, a row
+        # constructed without an explicit status had ``record.status is None``
+        # at validation time — the canonical-id check would raise
+        # AttributeError on the error path's ``.value`` deref instead of
+        # letting Postgres apply its default. ``server_default`` still owns
+        # the on-disk default for hand-written SQL.
+        default=StagingStatus.PENDING,
         server_default=StagingStatus.PENDING.value,
         index=True,
     )
@@ -171,6 +188,84 @@ class StagingRecord(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+    def save(self, session: Session) -> None:
+        """Persist this record, enforcing the canonical-id invariant.
+
+        Refuses to add a ``processed`` row whose ``canonical_id`` is still
+        null — the only way that combination can arise is a scraper marking
+        a staging row as fully processed without actually consulting the
+        resolver. ``pending``/``review``/``blocked`` rows may legitimately
+        have a null canonical_id and pass through unchanged.
+
+        Direct ``session.add(record)`` is also covered by the event listener
+        below; ``save()`` exists so call sites read intentionally and so
+        unit tests can assert against a single named code path.
+        """
+        _check_canonical_invariant(self)
+        session.add(self)
+
+
+class StagingInvariantError(ValueError):
+    """Raised when a :class:`StagingRecord` violates BUF-7's resolver rule.
+
+    A ``processed`` staging row whose ``canonical_id`` is null is the
+    bypass case: a scraper has declared the row "done" without going
+    through :func:`esports_sim.resolver.resolve_entity`. Refuse it loudly
+    rather than corrupting the canonical join key.
+    """
+
+
+# Statuses where a null canonical_id is meaningful state, not a bug. ``pending``
+# is the pre-resolver queue state; ``review`` and ``blocked`` are terminal
+# states the resolver itself produces when it can't (or won't) auto-decide.
+# Only ``processed`` requires a non-null canonical_id, because that's the
+# state that asserts "this row has a canonical mapping". Kept as a
+# module-level frozenset so the listener and the wrapper can't drift apart.
+_NULL_CANONICAL_OK: frozenset[StagingStatus] = frozenset(
+    {StagingStatus.PENDING, StagingStatus.REVIEW, StagingStatus.BLOCKED}
+)
+
+
+def _check_canonical_invariant(record: StagingRecord) -> None:
+    if record.canonical_id is not None:
+        return
+    # ``status`` may be ``None`` at ``before_insert`` time when a caller
+    # constructed the row without setting it and is relying on the column
+    # default — the row will land as ``pending``, which is a legal
+    # null-canonical state. Treat that case as already-cleared rather than
+    # falling through to the error formatter (which would AttributeError on
+    # ``None.value``).
+    if record.status is None or record.status in _NULL_CANONICAL_OK:
+        return
+    raise StagingInvariantError(
+        f"StagingRecord with status={record.status.value!r} requires a "
+        "non-null canonical_id. The resolver (BUF-7) is the only sanctioned "
+        "writer of that column; marking a row processed without one means a "
+        "scraper bypassed resolve_entity()."
+    )
+
+
+@event.listens_for(StagingRecord, "before_insert")
+def _staging_before_insert(
+    _mapper: Mapper[StagingRecord],
+    _connection: Connection,
+    target: StagingRecord,
+) -> None:
+    # SQLAlchemy event hook. Backstop for ``session.add(StagingRecord(...))``
+    # paths that don't go through ``StagingRecord.save``. Note: this does not
+    # fire for FK-cascade SET NULL, which happens inside Postgres — that's
+    # the audit-trail outcome the schema deliberately allows.
+    _check_canonical_invariant(target)
+
+
+@event.listens_for(StagingRecord, "before_update")
+def _staging_before_update(
+    _mapper: Mapper[StagingRecord],
+    _connection: Connection,
+    target: StagingRecord,
+) -> None:
+    _check_canonical_invariant(target)
 
 
 class RawRecord(Base):
@@ -205,6 +300,13 @@ class AliasReviewQueue(Base):
     ``candidates`` is a JSON array of plausible canonical_ids with their
     similarity scores; the human reviewer picks one or marks the row blocked.
     See BUF-16 for the CLI/UI that drains this.
+
+    Uniqueness is enforced via the partial index ``ix_alias_review_queue_pending_unique``
+    over ``(platform, platform_id) WHERE status = 'pending'``: at most one
+    pending review row per handle. The resolver's pending-enqueue path
+    relies on this so two concurrent calls can't both check-then-insert
+    and produce duplicate human-review work; the loser catches the unique
+    violation and degrades to "already enqueued".
     """
 
     __tablename__ = "alias_review_queue"
@@ -231,11 +333,26 @@ class AliasReviewQueue(Base):
         nullable=False,
     )
 
+    __table_args__ = (
+        # Partial unique index: at most one pending row per (platform, platform_id).
+        # The literal ``status = 'pending'`` matches Postgres's stored enum
+        # value; using the enum object here would round-trip through Python
+        # repr and produce the wrong predicate string.
+        Index(
+            "ix_alias_review_queue_pending_unique",
+            "platform",
+            "platform_id",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
 
 __all__ = [
     "Entity",
     "EntityAlias",
     "StagingRecord",
+    "StagingInvariantError",
     "RawRecord",
     "AliasReviewQueue",
 ]

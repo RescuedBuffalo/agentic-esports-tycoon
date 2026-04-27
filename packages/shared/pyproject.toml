@@ -24,6 +24,10 @@ dependencies = [
     # pgvector Python bindings — registered as a SQLAlchemy type so BUF-28's
     # vector tables can land without re-plumbing types here.
     "pgvector>=0.3",
+    # Fuzzy string matcher used by the canonical-id resolver (BUF-7). C-backed
+    # implementation of token-set + WRatio scoring; keeps the resolver fast
+    # enough that running it inline on every staging row is acceptable.
+    "rapidfuzz>=3.6",
 ]
 
 [project.scripts]
