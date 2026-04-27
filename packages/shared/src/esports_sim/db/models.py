@@ -16,10 +16,12 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     String,
     UniqueConstraint,
     event,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -298,6 +300,13 @@ class AliasReviewQueue(Base):
     ``candidates`` is a JSON array of plausible canonical_ids with their
     similarity scores; the human reviewer picks one or marks the row blocked.
     See BUF-16 for the CLI/UI that drains this.
+
+    Uniqueness is enforced via the partial index ``ix_alias_review_queue_pending_unique``
+    over ``(platform, platform_id) WHERE status = 'pending'``: at most one
+    pending review row per handle. The resolver's pending-enqueue path
+    relies on this so two concurrent calls can't both check-then-insert
+    and produce duplicate human-review work; the loser catches the unique
+    violation and degrades to "already enqueued".
     """
 
     __tablename__ = "alias_review_queue"
@@ -322,6 +331,20 @@ class AliasReviewQueue(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+
+    __table_args__ = (
+        # Partial unique index: at most one pending row per (platform, platform_id).
+        # The literal ``status = 'pending'`` matches Postgres's stored enum
+        # value; using the enum object here would round-trip through Python
+        # repr and produce the wrong predicate string.
+        Index(
+            "ix_alias_review_queue_pending_unique",
+            "platform",
+            "platform_id",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
     )
 
 

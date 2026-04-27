@@ -623,3 +623,142 @@ def test_unrelated_integrity_error_is_not_swallowed_by_auto_merge_path(
             platform_name="tenz",
             entity_type=EntityType.PLAYER,
         )
+
+
+# --- pending-review enqueue uniqueness --------------------------------------
+
+
+def test_pending_review_enqueue_enforces_partial_unique_index(db_session) -> None:
+    """The DB now refuses a second pending row for the same handle.
+
+    The resolver's idempotency on the PENDING path used to depend on a
+    pre-check that was racy under concurrent calls. The partial unique
+    index ``ix_alias_review_queue_pending_unique`` is the schema-level
+    guarantee. Hand-insert two pending rows for the same
+    ``(platform, platform_id)`` — the second must raise.
+    """
+    from esports_sim.db.models import AliasReviewQueue
+    from sqlalchemy.exc import IntegrityError
+
+    db_session.add(
+        AliasReviewQueue(
+            platform=Platform.LIQUIPEDIA,
+            platform_id="liq-dup",
+            platform_name="Dup",
+            candidates=[{"canonical_id": "x", "name": "y", "score": 0.8}],
+            reason="fuzzy_below_auto_merge",
+            status=ReviewStatus.PENDING,
+        )
+    )
+    db_session.flush()
+
+    db_session.add(
+        AliasReviewQueue(
+            platform=Platform.LIQUIPEDIA,
+            platform_id="liq-dup",
+            platform_name="Dup",
+            candidates=[{"canonical_id": "x", "name": "y", "score": 0.8}],
+            reason="fuzzy_below_auto_merge",
+            status=ReviewStatus.PENDING,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+    db_session.rollback()
+
+
+def test_pending_review_partial_index_only_covers_pending(db_session) -> None:
+    """Resolved/skipped rows for the same handle must coexist with a pending one.
+
+    The partial predicate (``WHERE status='pending'``) is what makes the
+    resolver's "one open review per handle" rule useful: a row that's
+    been resolved or skipped no longer occupies the slot. Encode that
+    here so a future migration that widens the predicate gets caught.
+    """
+    from esports_sim.db.models import AliasReviewQueue
+
+    db_session.add(
+        AliasReviewQueue(
+            platform=Platform.LIQUIPEDIA,
+            platform_id="liq-multi",
+            platform_name="Multi",
+            candidates=[{"canonical_id": "x", "name": "y", "score": 0.8}],
+            reason="fuzzy_below_auto_merge",
+            status=ReviewStatus.RESOLVED,
+        )
+    )
+    db_session.add(
+        AliasReviewQueue(
+            platform=Platform.LIQUIPEDIA,
+            platform_id="liq-multi",
+            platform_name="Multi",
+            candidates=[{"canonical_id": "x", "name": "y", "score": 0.8}],
+            reason="fuzzy_below_auto_merge",
+            status=ReviewStatus.PENDING,
+        )
+    )
+    db_session.flush()  # resolved + pending for the same handle is legal
+
+
+def test_unrelated_integrity_error_is_not_swallowed_by_pending_path(
+    db_session, monkeypatch
+) -> None:
+    """A non-race IntegrityError on the PENDING path must propagate."""
+    from esports_sim.resolver import core
+    from sqlalchemy.exc import IntegrityError
+
+    # Seed two players so the resolver lands in the review band.
+    e1 = make_entity(entity_type=EntityType.PLAYER)
+    e2 = make_entity(entity_type=EntityType.PLAYER)
+    db_session.add_all([e1, e2])
+    db_session.add_all(
+        [
+            make_entity_alias(
+                entity=e1,
+                platform=Platform.VLR,
+                platform_id="vlr-sentinel",
+                platform_name="Sentinel",
+            ),
+            make_entity_alias(
+                entity=e2,
+                platform=Platform.VLR,
+                platform_id="vlr-sinatraa",
+                platform_name="Sinatraa",
+            ),
+        ]
+    )
+    db_session.flush()
+
+    real_enqueue = core._enqueue_pending_review_idempotent
+
+    def faulty_enqueue(*args, **kwargs):  # type: ignore[no-untyped-def]
+        # Simulate an unrelated unique violation surfacing inside the
+        # savepoint flush — the resolver's pending-path guard must re-raise
+        # rather than swallowing it as a duplicate-pending-review race.
+        raise IntegrityError(
+            "INSERT INTO raw_record",
+            {},
+            Exception("violates unique constraint uq_raw_record_content_hash"),
+        )
+
+    monkeypatch.setattr(core, "_enqueue_pending_review_idempotent", faulty_enqueue)
+
+    with pytest.raises(IntegrityError):
+        resolve_entity(
+            db_session,
+            platform=Platform.LIQUIPEDIA,
+            platform_id="liq-sentinal",
+            platform_name="Sentinal",
+            entity_type=EntityType.PLAYER,
+        )
+
+    # Sanity: restoring the helper makes the call succeed.
+    monkeypatch.setattr(core, "_enqueue_pending_review_idempotent", real_enqueue)
+    result = resolve_entity(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="liq-sentinal-2",
+        platform_name="Sentinal",
+        entity_type=EntityType.PLAYER,
+    )
+    assert result.status is ResolutionStatus.PENDING

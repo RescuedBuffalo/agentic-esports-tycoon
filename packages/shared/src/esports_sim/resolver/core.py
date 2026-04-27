@@ -51,29 +51,38 @@ _SCORE_DIVISOR: float = 100.0
 # only ever needs the best handful; bloating the row hurts both DB and UI.
 _MAX_REVIEW_CANDIDATES: int = 5
 
-# Name of the unique constraint that protects ``(platform, platform_id)`` on
-# the alias table — defined alongside :class:`EntityAlias`. The race-recovery
-# branches use this to distinguish the constraint they expect from any other
-# unique violation that might surface during a flush of unrelated session
-# state. Hard-coded rather than introspected because if the constraint name
-# ever changes, the matching here must be re-validated by hand.
+# Constraint names hard-coded so the resolver can distinguish "the race
+# I expected to recover from" from "any other unique violation". These names
+# are defined alongside the models and migration; if either changes, the
+# matching here must be re-validated by hand.
 _ALIAS_UNIQUE_CONSTRAINT: str = "uq_entity_alias_platform_platform_id"
+_REVIEW_QUEUE_PENDING_UNIQUE_INDEX: str = "ix_alias_review_queue_pending_unique"
 
 
-def _is_alias_uniqueness_violation(error: IntegrityError) -> bool:
-    """True iff this IntegrityError is the (platform, platform_id) race.
+def _matches_constraint(error: IntegrityError, constraint_name: str) -> bool:
+    """Return True iff this IntegrityError names ``constraint_name``.
 
-    Postgres surfaces the violated constraint name on ``error.orig.diag``
-    (psycopg). Falling back to a substring check on ``str(error)`` keeps the
-    detection useful when that introspection isn't available — the
-    constraint name is unique enough to make string matching safe.
+    Postgres surfaces the violated constraint on ``error.orig.diag.constraint_name``
+    (psycopg). The substring fallback over ``str(error)`` keeps the check
+    useful when that introspection isn't available — constraint names in
+    this schema are unique enough to make string matching safe.
     """
     orig = getattr(error, "orig", None)
     diag = getattr(orig, "diag", None)
-    constraint_name = getattr(diag, "constraint_name", None)
-    if constraint_name == _ALIAS_UNIQUE_CONSTRAINT:
+    name = getattr(diag, "constraint_name", None)
+    if name == constraint_name:
         return True
-    return _ALIAS_UNIQUE_CONSTRAINT in str(error)
+    return constraint_name in str(error)
+
+
+def _is_alias_uniqueness_violation(error: IntegrityError) -> bool:
+    """True iff this IntegrityError is the (platform, platform_id) race."""
+    return _matches_constraint(error, _ALIAS_UNIQUE_CONSTRAINT)
+
+
+def _is_pending_review_uniqueness_violation(error: IntegrityError) -> bool:
+    """True iff this IntegrityError is the pending-review enqueue race."""
+    return _matches_constraint(error, _REVIEW_QUEUE_PENDING_UNIQUE_INDEX)
 
 
 class ResolutionStatus(enum.StrEnum):
@@ -176,22 +185,21 @@ def resolve_entity(
         )
 
     if candidates and candidates[0].score >= REVIEW_THRESHOLD:
-        # Idempotent review enqueue: if a pending row already exists for this
-        # (platform, platform_id) the second call must be a no-op so a retried
-        # scraper doesn't pile up duplicate human-review work.
-        existing = _find_pending_review(session, platform=platform, platform_id=platform_id)
-        if existing is None:
-            session.add(
-                AliasReviewQueue(
-                    platform=platform,
-                    platform_id=platform_id,
-                    platform_name=platform_name,
-                    candidates=[c.to_json() for c in candidates],
-                    reason="fuzzy_below_auto_merge",
-                    status=ReviewStatus.PENDING,
-                )
-            )
-            session.flush()
+        # Idempotent review enqueue. A pre-check + insert is racy on its own —
+        # two concurrent calls would both observe "no pending row" and both
+        # enqueue. The partial unique index
+        # ``ix_alias_review_queue_pending_unique`` over
+        # ``(platform, platform_id) WHERE status='pending'`` makes the loser's
+        # insert fail with a constraint violation; a savepoint scopes that
+        # failure so the outer transaction stays usable, and we degrade to
+        # "already enqueued, return PENDING".
+        _enqueue_pending_review_idempotent(
+            session,
+            platform=platform,
+            platform_id=platform_id,
+            platform_name=platform_name,
+            candidates=candidates,
+        )
         return ResolveResult(
             status=ResolutionStatus.PENDING,
             canonical_id=None,
@@ -373,17 +381,56 @@ def _matched_after_race(session: Session, *, platform: Platform, platform_id: st
     )
 
 
+def _enqueue_pending_review_idempotent(
+    session: Session,
+    *,
+    platform: Platform,
+    platform_id: str,
+    platform_name: str,
+    candidates: list[ResolveCandidate],
+) -> None:
+    """Enqueue a pending review row, tolerating concurrent inserts.
+
+    The partial unique index ``ix_alias_review_queue_pending_unique`` over
+    ``(platform, platform_id) WHERE status='pending'`` is what actually
+    enforces "at most one pending row per handle". This function wraps the
+    insert in a savepoint so a concurrent winner's index violation surfaces
+    as a clean exception we can swallow — the caller still returns PENDING,
+    the duplicate human-review work doesn't materialise, and the outer
+    transaction stays usable.
+    """
+    try:
+        with session.begin_nested():
+            session.add(
+                AliasReviewQueue(
+                    platform=platform,
+                    platform_id=platform_id,
+                    platform_name=platform_name,
+                    candidates=[c.to_json() for c in candidates],
+                    reason="fuzzy_below_auto_merge",
+                    status=ReviewStatus.PENDING,
+                )
+            )
+            session.flush()
+    except IntegrityError as exc:
+        # Only the pending-review partial-unique violation is a race we can
+        # absorb. Anything else (a different constraint, a different table)
+        # is a real DB failure that belongs to its caller.
+        if not _is_pending_review_uniqueness_violation(exc):
+            raise
+        # Idempotent retry: the row another worker enqueued is good enough.
+
+
 def _find_pending_review(
     session: Session, *, platform: Platform, platform_id: str
 ) -> AliasReviewQueue | None:
-    # ``alias_review_queue`` has no uniqueness constraint over
-    # (platform, platform_id, status=pending) and the enqueue path is
-    # non-atomic, so two concurrent resolver calls can each insert a pending
-    # row before either notices the other. A third call's idempotency check
-    # would then see two rows; ``.scalar_one_or_none()`` would crash with
-    # ``MultipleResultsFound``, turning the retry path into a hard failure.
-    # Take the oldest pending row instead: any pending match is enough to
-    # treat the (platform, platform_id) as already queued.
+    """Read the oldest pending review row for a handle, if any.
+
+    Kept around for callers (CLI tooling, BUF-16 reviewer UI) that need to
+    introspect what's queued. The resolver itself no longer reads through
+    here — the partial unique index is the source of truth on the write
+    path.
+    """
     stmt = (
         select(AliasReviewQueue)
         .where(
