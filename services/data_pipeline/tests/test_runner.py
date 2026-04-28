@@ -311,3 +311,145 @@ def test_cadence_metadata_round_trips() -> None:
     """The scheduler-facing ``cadence`` property is preserved through the ABC."""
     connector = FakeConnector(payloads=[], cadence=timedelta(minutes=15))
     assert connector.cadence == timedelta(minutes=15)
+
+
+# --- rate-limit ordering regression (Codex P1) ----------------------------
+
+
+def test_rate_limiter_acquired_before_fetch_advances(db_session) -> None:
+    """``acquire`` must run *before* each ``next()`` on the fetch iterator.
+
+    Regression for a Codex review finding: the runner used to call
+    ``rate_limiter.acquire()`` inside the loop body, which fires *after*
+    Python has already advanced the generator and run the connector's
+    upstream HTTP code. The fix moves acquisition between iterator
+    advances. We verify by snapshotting the limiter's acquire-count
+    just before each yield and asserting the count is at least
+    ``yield_index + 1`` — i.e., a token had already been pulled by
+    that point.
+    """
+    bucket = TokenBucket(capacity=10, refill_per_second=1000.0)
+    acquire_count = {"n": 0}
+    real_acquire = bucket.acquire
+
+    def counting_acquire() -> None:
+        acquire_count["n"] += 1
+        real_acquire()
+
+    bucket.acquire = counting_acquire  # type: ignore[method-assign]
+
+    yield_observations: list[tuple[int, int]] = []
+
+    class OrderTracker(FakeConnector):
+        def fetch(self, since):  # type: ignore[no-untyped-def]
+            for i, payload in enumerate(self._payloads):
+                # Snapshot acquire-count before yielding. If the runner
+                # is correct, the limiter has already deducted a token
+                # by this moment — i.e., ``acquire_count`` >= i+1.
+                yield_observations.append((i, acquire_count["n"]))
+                yield payload
+
+    connector = OrderTracker(
+        payloads=[
+            make_player_payload(platform_id=f"vlr-{i}", platform_name=f"P{i}") for i in range(3)
+        ],
+    )
+
+    run_ingestion(connector, session=db_session, since=_EPOCH, rate_limiter=bucket)
+
+    assert yield_observations, "fetch never yielded; ordering check is moot"
+    for yield_idx, observed_acquire_count in yield_observations:
+        assert observed_acquire_count >= yield_idx + 1, (
+            f"yield {yield_idx} happened with acquire_count={observed_acquire_count}; "
+            "limiter must run before the iterator advances"
+        )
+
+
+# --- per-record errors raised from transform (Codex P1) -------------------
+
+
+def test_schema_drift_raised_from_transform_does_not_abort_run(db_session) -> None:
+    """Regression for a Codex review finding.
+
+    ``errors.py`` documents ``SchemaDriftError`` as a per-record error
+    raised from ``validate`` *or* ``transform``. The runner used to
+    catch it only around ``validate``, so a ``transform`` that raised
+    drift would escape and abort the entire pass. The fix wraps the
+    materialised ``transform(...)`` call in the same handler.
+    """
+
+    def transform_with_drift(payload: dict[str, Any]) -> Iterable[IngestionRecord]:
+        if payload.get("trigger_drift"):
+            raise SchemaDriftError("transform: required key 'platform_id' missing")
+        yield IngestionRecord(
+            entity_type=EntityType.PLAYER,
+            platform_id=payload["platform_id"],
+            platform_name=payload["platform_name"],
+            payload=payload,
+        )
+
+    connector = FakeConnector(
+        payloads=[
+            make_player_payload(platform_id="vlr-1", platform_name="Alpha"),
+            {"trigger_drift": True, "junk": True},
+            make_player_payload(platform_id="vlr-3", platform_name="Gamma"),
+        ],
+        transform_fn=transform_with_drift,
+    )
+
+    stats = run_ingestion(connector, session=db_session, since=_EPOCH)
+
+    # All three raw payloads landed (raw-first persistence happens before
+    # validate/transform), but only the two well-formed ones produced a
+    # staging row. The drifting middle payload bumps the schema_drifts
+    # counter and the run continues.
+    assert stats.fetched == 3
+    assert stats.schema_drifts == 1
+    assert stats.processed == 2
+    assert len(db_session.execute(select(StagingRecord)).scalars().all()) == 2
+
+
+def test_partial_transform_drop_on_mid_iteration_drift(db_session) -> None:
+    """A transform that yields N records and *then* raises drift drops all N.
+
+    Resolver writes are payload-level: once the connector signals the
+    payload is malformed, half-translated records would corrupt the
+    staging table. The runner materialises ``transform``'s output so
+    the drift is caught synchronously and no record from the bad
+    payload reaches the resolver.
+    """
+
+    def transform_partial(payload: dict[str, Any]) -> Iterable[IngestionRecord]:
+        for player in payload["players"]:
+            if player.get("malformed"):
+                raise SchemaDriftError("player record missing 'id'")
+            yield IngestionRecord(
+                entity_type=EntityType.PLAYER,
+                platform_id=player["id"],
+                platform_name=player["name"],
+                payload=player,
+            )
+
+    connector = FakeConnector(
+        payloads=[
+            {
+                "match_id": "m-1",
+                "players": [
+                    {"id": "vlr-1", "name": "TenZ"},
+                    {"id": "vlr-2", "name": "Sacy"},
+                    {"malformed": True},
+                    {"id": "vlr-4", "name": "Zekken"},
+                ],
+            }
+        ],
+        transform_fn=transform_partial,
+    )
+
+    stats = run_ingestion(connector, session=db_session, since=_EPOCH)
+    assert stats.fetched == 1
+    assert stats.schema_drifts == 1
+    # No staging rows for the broken payload — the eager-list materialisation
+    # means we only commit a payload's records once the whole transform
+    # succeeds.
+    assert stats.processed == 0
+    assert len(db_session.execute(select(StagingRecord)).scalars().all()) == 0

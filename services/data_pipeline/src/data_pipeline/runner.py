@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -78,12 +79,13 @@ def run_ingestion(
     stats = IngestionStats()
     bound.info("ingestion.start", since=since.isoformat())
 
-    for raw_payload in connector.fetch(since):
-        # Rate-limit per upstream record. Putting this on the *consumer*
-        # side, not inside ``fetch``, means tests don't have to plumb a
-        # fake clock through every connector subclass.
-        rate_limiter.acquire()
-
+    # Rate-limit *around* each ``next()`` rather than inside the loop body
+    # — a connector that issues its HTTP request before yielding (the
+    # documented contract) would otherwise run unmetered, with the limiter
+    # acting as after-the-fact bookkeeping. ``_rate_limited`` brackets each
+    # iterator advance with an ``acquire`` so the bucket gates real upstream
+    # traffic.
+    for raw_payload in _rate_limited(connector.fetch(since), rate_limiter):
         content_hash = _hash_payload(raw_payload)
         log = bound.bind(content_hash=content_hash)
 
@@ -105,6 +107,13 @@ def run_ingestion(
 
         try:
             validated = connector.validate(raw_payload)
+            # Materialise transform's output so an exception raised
+            # mid-iteration is caught here rather than escaping the runner.
+            # ``errors.py`` documents drift / transient errors as payload-
+            # level concerns; once transform raises one, the whole payload
+            # is malformed — drop any records it had already yielded so a
+            # half-translated payload can't pollute the staging table.
+            records = list(connector.transform(validated))
         except SchemaDriftError as exc:
             stats.schema_drifts += 1
             log.warning("ingestion.schema_drift", code="SCHEMA_DRIFT", detail=str(exc))
@@ -114,7 +123,7 @@ def run_ingestion(
             log.warning("ingestion.transient_error", code="TRANSIENT_ERROR", detail=str(exc))
             continue
 
-        for record in connector.transform(validated):
+        for record in records:
             _process_record(
                 session,
                 connector=connector,
@@ -231,6 +240,33 @@ def _staging_row_from_result(
         payload=record.payload,
         status=StagingStatus.PROCESSED,
     )
+
+
+def _rate_limited(
+    iterable: Iterable[dict[str, Any]],
+    limiter: TokenBucket,
+) -> Iterator[dict[str, Any]]:
+    """Bracket each ``next()`` on ``iterable`` with ``limiter.acquire()``.
+
+    The runner can't put ``acquire`` inside a plain ``for`` body: Python
+    advances the iterator (running the connector's ``fetch`` body up to
+    the next ``yield``, which is where the upstream HTTP call happens)
+    *before* the body runs. Acquiring here — between iterator advances
+    — keeps the bucket gating actual upstream traffic, not after-the-
+    fact bookkeeping.
+
+    A side effect: if the iterator is exhausted we've already paid one
+    token detecting end-of-stream. Acceptable in practice — burst
+    capacity is virtually always > 1 and the wasted token doesn't
+    introduce any extra wait.
+    """
+    iterator = iter(iterable)
+    while True:
+        limiter.acquire()
+        try:
+            yield next(iterator)
+        except StopIteration:
+            return
 
 
 def _hash_payload(payload: dict[str, Any]) -> str:
