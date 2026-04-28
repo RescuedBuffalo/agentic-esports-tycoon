@@ -33,13 +33,12 @@ from esports_sim.resolver import (
     ResolutionStatus,
     resolve_entity,
 )
-from sqlalchemy import select
-
-from tests.fixtures import (
+from fixtures import (
     make_entity,
     make_entity_alias,
     make_staging_record,
 )
+from sqlalchemy import select
 
 pytestmark = pytest.mark.integration
 
