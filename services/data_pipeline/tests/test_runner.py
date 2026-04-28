@@ -453,3 +453,136 @@ def test_partial_transform_drop_on_mid_iteration_drift(db_session) -> None:
     # succeeds.
     assert stats.processed == 0
     assert len(db_session.execute(select(StagingRecord)).scalars().all()) == 0
+
+
+# --- transient errors retain retryability (Codex P2) ----------------------
+
+
+def test_transient_error_does_not_persist_raw(db_session) -> None:
+    """Regression for a Codex review finding.
+
+    ``TransientFetchError`` is documented as a recoverable per-record
+    skip whose ``content_hash`` must NOT land in ``raw_record``;
+    otherwise the next scheduled run dedups the same payload and the
+    temporary upstream blip becomes a permanent drop. The runner used
+    to persist raw before validate, breaking that contract.
+    """
+    from data_pipeline import TransientFetchError
+
+    def flaky_validate(payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("flaky"):
+            raise TransientFetchError("upstream returned 503 mid-parse")
+        return payload
+
+    connector = FakeConnector(
+        payloads=[
+            make_player_payload(platform_id="vlr-1", platform_name="Alpha"),
+            {"flaky": True, "platform_id": "vlr-2", "platform_name": "Beta"},
+            make_player_payload(platform_id="vlr-3", platform_name="Gamma"),
+        ],
+        validate_fn=flaky_validate,
+    )
+
+    stats = run_ingestion(connector, session=db_session, since=_EPOCH)
+
+    assert stats.transient_errors == 1
+    assert stats.processed == 2
+    # Two raw rows landed (the well-formed payloads); the transient one
+    # left no audit trail so the next run can re-fetch it.
+    raw_rows = db_session.execute(select(RawRecord)).scalars().all()
+    assert len(raw_rows) == 2
+
+
+def test_transient_error_payload_can_succeed_on_retry(db_session) -> None:
+    """The same payload that hit a transient error must retry cleanly.
+
+    Simulates two ingestion passes against the same FakeConnector
+    state. First pass: validate raises ``TransientFetchError`` for one
+    payload. Second pass: the upstream has recovered, validate passes,
+    the payload reaches the resolver and writes a staging row.
+    """
+    from data_pipeline import TransientFetchError
+
+    fail_once = {"done": False}
+
+    def recovering_validate(payload: dict[str, Any]) -> dict[str, Any]:
+        if payload["platform_id"] == "vlr-flaky" and not fail_once["done"]:
+            fail_once["done"] = True
+            raise TransientFetchError("first attempt: timeout")
+        return payload
+
+    payloads = [make_player_payload(platform_id="vlr-flaky", platform_name="Flaky")]
+
+    first_run = run_ingestion(
+        FakeConnector(payloads=payloads, validate_fn=recovering_validate),
+        session=db_session,
+        since=_EPOCH,
+    )
+    assert first_run.transient_errors == 1
+    assert first_run.processed == 0
+    assert len(db_session.execute(select(RawRecord)).scalars().all()) == 0
+
+    second_run = run_ingestion(
+        FakeConnector(payloads=payloads, validate_fn=recovering_validate),
+        session=db_session,
+        since=_EPOCH,
+    )
+    # Second pass observes the same content_hash but no prior raw row,
+    # so dedup doesn't fire — validate succeeds, resolver runs, staging
+    # row appears.
+    assert second_run.transient_errors == 0
+    assert second_run.processed == 1
+    assert len(db_session.execute(select(StagingRecord)).scalars().all()) == 1
+
+
+# --- unexpected resolver exceptions propagate (Codex P1) ------------------
+
+
+def test_unexpected_resolver_exception_is_not_swallowed(db_session, monkeypatch) -> None:
+    """Regression for a Codex review finding.
+
+    ``_process_record`` used to ``except Exception`` over the resolver
+    call, downgrading every failure — including non-recoverable DB
+    faults — to a logged per-record skip. The fix narrows the catch to
+    :class:`IngestionError`; anything else propagates so the
+    fatal-by-default rule holds.
+    """
+    from data_pipeline import runner
+
+    def boom(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        # Simulate the kind of fault ``resolve_entity`` would explicitly
+        # re-raise — e.g., a unique-constraint violation that the
+        # savepoint couldn't recover from.
+        raise RuntimeError("alias unique violation recovery: post-conflict lookup missed")
+
+    monkeypatch.setattr(runner, "resolve_entity", boom)
+
+    connector = FakeConnector(
+        payloads=[make_player_payload(platform_id="vlr-x", platform_name="X")]
+    )
+
+    with pytest.raises(RuntimeError, match="post-conflict lookup missed"):
+        run_ingestion(connector, session=db_session, since=_EPOCH)
+
+
+def test_ingestion_error_from_resolver_is_still_skipped(db_session, monkeypatch) -> None:
+    """The narrow ``except IngestionError`` branch still works — only
+    ``IngestionError`` and its subclasses get the per-record skip."""
+    from data_pipeline import IngestionError, runner
+
+    def soft_fail(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise IngestionError("connector-side validate leaked an error")
+
+    monkeypatch.setattr(runner, "resolve_entity", soft_fail)
+
+    connector = FakeConnector(
+        payloads=[
+            make_player_payload(platform_id="vlr-1", platform_name="A"),
+            make_player_payload(platform_id="vlr-2", platform_name="B"),
+        ]
+    )
+
+    stats = run_ingestion(connector, session=db_session, since=_EPOCH)
+    # Both records hit the soft-error branch; the run completes.
+    assert stats.resolver_errors == 2
+    assert stats.processed == 0

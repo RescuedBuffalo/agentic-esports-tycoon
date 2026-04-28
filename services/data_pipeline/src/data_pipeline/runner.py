@@ -94,9 +94,39 @@ def run_ingestion(
             log.debug("ingestion.duplicate")
             continue
 
-        # Persist raw first. Even if validate/transform throws below, the
-        # blob is on disk so a maintainer can re-run the parser offline
-        # against ``raw_record`` rather than re-fetching upstream.
+        # Run validate + transform *before* persisting raw. The split
+        # matters for retryability:
+        #   * SchemaDriftError is permanent (the upstream source has
+        #     changed shape) — persist raw so a maintainer can re-parse
+        #     offline against ``raw_record`` rather than re-fetching.
+        #   * TransientFetchError is recoverable (timeout, 5xx, transient
+        #     parse glitch) — must NOT persist raw, otherwise the
+        #     content_hash dedups the same payload on the next run and
+        #     the temporary blip becomes a permanent drop.
+        # Materialise transform's output so an exception raised mid-
+        # iteration is caught here rather than escaping the runner; once
+        # transform raises, half-translated records would corrupt staging.
+        try:
+            validated = connector.validate(raw_payload)
+            records = list(connector.transform(validated))
+        except TransientFetchError as exc:
+            stats.transient_errors += 1
+            log.warning("ingestion.transient_error", code="TRANSIENT_ERROR", detail=str(exc))
+            continue
+        except SchemaDriftError as exc:
+            _persist_raw(
+                session,
+                source=connector.source_name,
+                payload=raw_payload,
+                content_hash=content_hash,
+            )
+            stats.fetched += 1
+            stats.schema_drifts += 1
+            log.warning("ingestion.schema_drift", code="SCHEMA_DRIFT", detail=str(exc))
+            continue
+
+        # Happy path: persist raw, then resolve and write a staging row
+        # per emitted record.
         _persist_raw(
             session,
             source=connector.source_name,
@@ -104,24 +134,6 @@ def run_ingestion(
             content_hash=content_hash,
         )
         stats.fetched += 1
-
-        try:
-            validated = connector.validate(raw_payload)
-            # Materialise transform's output so an exception raised
-            # mid-iteration is caught here rather than escaping the runner.
-            # ``errors.py`` documents drift / transient errors as payload-
-            # level concerns; once transform raises one, the whole payload
-            # is malformed — drop any records it had already yielded so a
-            # half-translated payload can't pollute the staging table.
-            records = list(connector.transform(validated))
-        except SchemaDriftError as exc:
-            stats.schema_drifts += 1
-            log.warning("ingestion.schema_drift", code="SCHEMA_DRIFT", detail=str(exc))
-            continue
-        except TransientFetchError as exc:
-            stats.transient_errors += 1
-            log.warning("ingestion.transient_error", code="TRANSIENT_ERROR", detail=str(exc))
-            continue
 
         for record in records:
             _process_record(
@@ -156,9 +168,14 @@ def _process_record(
 ) -> None:
     """Resolve one record and write its staging row.
 
-    Resolver failures are logged and skipped, not raised: a single
-    ambiguous handle shouldn't take down a 1000-row crawl. The raw row
-    is already persisted, so the resolver can be re-run later.
+    Per-record skips are limited to the documented per-record family
+    (:class:`IngestionError` and its subclasses). Anything else — most
+    notably ``IntegrityError`` and other SQLAlchemy faults that
+    ``resolve_entity`` deliberately re-raises — is a genuine data-layer
+    failure and propagates so the run stops. Per the module docstring's
+    "fatal-by-default for the unexpected" rule: silently swallowing a
+    DB inconsistency would let a botched run continue and leave the
+    canonical store half-written.
     """
     try:
         result = resolve_entity(
@@ -169,26 +186,14 @@ def _process_record(
             entity_type=record.entity_type,
         )
     except IngestionError as exc:
-        # Resolver shouldn't raise these, but a connector-side validate
-        # could have leaked one out — bubble them as resolver errors so
-        # the staging row isn't written.
+        # Connector-side IngestionError leaked out of validate — already
+        # logged under ``RESOLVER_ERROR``; skip the staging write but
+        # keep the run alive.
         stats.resolver_errors += 1
         log.warning(
             "ingestion.resolver_error",
             code="RESOLVER_ERROR",
             detail=str(exc),
-            platform_id=record.platform_id,
-        )
-        return
-    except Exception as exc:
-        # Catch-all for resolver bugs: log under a distinct event so
-        # ``CONNECTOR_ERROR`` (connector misuse) and ``RESOLVER_ERROR``
-        # (resolver crash) stay separable in dashboards.
-        stats.resolver_errors += 1
-        log.error(
-            "ingestion.resolver_error",
-            code="RESOLVER_ERROR",
-            detail=repr(exc),
             platform_id=record.platform_id,
         )
         return
