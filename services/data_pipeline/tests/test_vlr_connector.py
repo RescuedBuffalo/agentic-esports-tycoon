@@ -270,9 +270,7 @@ def test_since_filter_excludes_older_match_rows() -> None:
     must drop the 2025 ones; the 2026 ones must pass through."""
     connector = _build_connector(
         page_urls=(("matches", f"{VLR_BASE_URL}/matches?completed"),),
-        fetcher=_make_fetcher(
-            {f"{VLR_BASE_URL}/matches?completed": _read_fixture("matches.html")}
-        ),
+        fetcher=_make_fetcher({f"{VLR_BASE_URL}/matches?completed": _read_fixture("matches.html")}),
     )
     since = datetime(2026, 1, 1, tzinfo=UTC)
     payloads = list(connector.fetch(since))
@@ -297,6 +295,86 @@ def test_since_filter_passes_rows_without_timestamps() -> None:
     # Even with a since in the year 2099, ranking rows pass because
     # they have no timestamp.
     assert len(records) > 0
+
+
+def test_match_anchor_inherits_timestamp_from_ancestor() -> None:
+    """``data-utc-ts`` on a wrapping ``<div>`` propagates to inner anchors.
+
+    VLR's match-list cards put the kickoff timestamp on the wrapping
+    ``<div class="match-item" data-utc-ts="...">`` rather than the team
+    anchor itself. Reading only the anchor's own attrs would let those
+    matches bypass the connector's ``since`` filter on every run; the
+    parser instead inherits ``data-utc-ts`` (and ``data-match-id``)
+    from the closest enclosing ancestor.
+    """
+    nested_html = """
+    <html><body>
+      <div class="match-item" data-utc-ts="2025-12-15T10:00:00Z" data-match-id="m-old">
+        <a href="/team/2593/paper-rex">Paper Rex</a>
+        <a href="/team/8877/drx">DRX</a>
+      </div>
+      <div class="match-item" data-utc-ts="2026-04-26T22:00:00Z" data-match-id="m-new">
+        <a href="/team/188/leviatan">LEVIATAN</a>
+        <a href="/team/4915/loud">LOUD</a>
+      </div>
+    </body></html>
+    """
+    matches_url = f"{VLR_BASE_URL}/matches?completed"
+    connector = _build_connector(
+        page_urls=(("matches", matches_url),),
+        fetcher=_make_fetcher({matches_url: nested_html}),
+    )
+    since = datetime(2026, 1, 1, tzinfo=UTC)
+    payloads = list(connector.fetch(since))
+    records = list(connector.transform(connector.validate(payloads[0])))
+
+    # The 2025-12 card's two anchors must be filtered out via inherited
+    # ancestor timestamp; the 2026-04 card's two anchors pass.
+    ids = {r.platform_id for r in records}
+    assert ids == {"188", "4915"}
+    # And the inherited match_id is on each kept row's payload, so the
+    # transform sees the row-level metadata even when the anchor itself
+    # carried none.
+    for record in records:
+        assert record.payload["match_id"] == "m-new"
+
+
+def test_emitted_payload_is_stable_across_runs() -> None:
+    """The fetched payload must not include per-run metadata.
+
+    Including ``fetched_at`` / ``since`` would make the same upstream
+    page hash differently every pass, defeating the runner's
+    ``RawRecord.content_hash`` dedup. We assert two things:
+
+    1. The emitted dict's keys are exactly what the parser produced
+       (no volatile fields snuck in).
+    2. Hashing the JSON bytes of two ``fetch`` passes against the same
+       fixture produces identical digests.
+    """
+    import hashlib
+    import json
+
+    fixture_url = f"{VLR_BASE_URL}/stats"
+    connector = _build_connector(
+        page_urls=(("stats", fixture_url),),
+        fetcher=_make_fetcher({fixture_url: _read_fixture("stats.html")}),
+    )
+    payload_a = list(connector.fetch(_EPOCH))[0]
+    payload_b = list(connector.fetch(_EPOCH))[0]
+
+    # No volatile metadata leaked through.
+    assert "fetched_at" not in payload_a
+    assert "since" not in payload_a
+    assert set(payload_a.keys()) == {"page_type", "url", "rows"}
+
+    # And the bytes match — same fixture, same hash.
+    digest_a = hashlib.sha256(
+        json.dumps(payload_a, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    digest_b = hashlib.sha256(
+        json.dumps(payload_b, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert digest_a == digest_b
 
 
 # --- fetch + rate limiter --------------------------------------------------
@@ -519,27 +597,33 @@ def test_tenz_to_tenz_rename_does_not_split_canonical(db_session: Any) -> None:
     )
     run_ingestion(pass_one, session=db_session, since=_EPOCH, rate_limiter=bucket)
 
-    aliases_after_pass_one = db_session.execute(
-        select(EntityAlias).where(
-            EntityAlias.platform == Platform.VLR, EntityAlias.platform_id == "9"
+    aliases_after_pass_one = (
+        db_session.execute(
+            select(EntityAlias).where(
+                EntityAlias.platform == Platform.VLR, EntityAlias.platform_id == "9"
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(aliases_after_pass_one) == 1
     canonical_before = aliases_after_pass_one[0].canonical_id
 
     pass_two = _build_connector(
         page_urls=only_stats,
-        fetcher=_make_fetcher(
-            {f"{VLR_BASE_URL}/stats": _read_fixture("stats_renamed_tenz.html")}
-        ),
+        fetcher=_make_fetcher({f"{VLR_BASE_URL}/stats": _read_fixture("stats_renamed_tenz.html")}),
     )
     run_ingestion(pass_two, session=db_session, since=_EPOCH, rate_limiter=bucket)
 
-    aliases_after_pass_two = db_session.execute(
-        select(EntityAlias).where(
-            EntityAlias.platform == Platform.VLR, EntityAlias.platform_id == "9"
+    aliases_after_pass_two = (
+        db_session.execute(
+            select(EntityAlias).where(
+                EntityAlias.platform == Platform.VLR, EntityAlias.platform_id == "9"
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     # Still exactly one alias; same canonical. The rename does not split
     # the entity.
     assert len(aliases_after_pass_two) == 1

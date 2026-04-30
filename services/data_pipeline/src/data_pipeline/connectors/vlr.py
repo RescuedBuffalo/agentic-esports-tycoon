@@ -297,36 +297,87 @@ class _AnchorCollector(HTMLParser):
 
     We use the stdlib parser rather than BeautifulSoup to keep
     ``data_pipeline`` free of an extra runtime dependency — the parsing
-    we need is anchor-shape recognition, not full DOM traversal. A
-    ``data-*`` attribute snapshot is captured so :class:`VLRParser` can
-    pull match completion timestamps off the row without a second pass.
+    we need is anchor-shape recognition, not full DOM traversal.
+
+    For each anchor we capture both its own ``data-*`` attributes *and*
+    the closest enclosing ``data-utc-ts`` / ``data-match-id`` from any
+    ancestor open at the time the anchor is encountered. VLR's match
+    cards put the completion timestamp on the wrapping ``<div
+    class="match-item">`` rather than the team anchor, so reading the
+    anchor in isolation would always see a ``None`` timestamp and let
+    every match bypass the connector's ``since`` filter on every run.
+    Inheriting from ancestors fixes that without forcing a full DOM
+    traversal — we only track the two attributes the parser actually
+    consumes.
     """
+
+    # The two ancestor data-attrs we propagate down into anchors. Add
+    # more here only when a parser actually needs to read them; every
+    # extra key inflates per-tag bookkeeping for every page.
+    _INHERITED_DATA_ATTRS = ("data-utc-ts", "data-match-id")
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.anchors: list[dict[str, Any]] = []
         self._current: dict[str, Any] | None = None
+        # One frame per currently-open ancestor element that introduced
+        # one of the inherited data-attrs. Pushed on ``handle_starttag``
+        # for non-anchor tags carrying any tracked attr; popped on the
+        # matching ``handle_endtag``. The stack lets us correctly scope
+        # inheritance even when sibling rows reuse different ids.
+        self._inherited_stack: list[tuple[str, dict[str, str]]] = []
+
+    def _current_inherited(self) -> dict[str, str]:
+        """Flatten the active inheritance stack into one attr map.
+
+        Later (more deeply-nested) frames win — that mirrors normal CSS
+        / DOM "innermost ancestor" semantics. Empty when no enclosing
+        element carries a tracked attribute.
+        """
+        merged: dict[str, str] = {}
+        for _tag, frame in self._inherited_stack:
+            merged.update(frame)
+        return merged
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag != "a":
-            return
         attr_map = {k: v for k, v in attrs if v is not None}
+        if tag != "a":
+            inherited = {
+                key: attr_map[key] for key in self._INHERITED_DATA_ATTRS if key in attr_map
+            }
+            if inherited:
+                self._inherited_stack.append((tag, inherited))
+            return
         href = attr_map.get("href")
         if not href:
             return
+        # Inherit ancestor data-attrs *only* when the anchor itself
+        # doesn't already carry the same key — explicit beats inherited
+        # so a row that does decorate the anchor keeps its own value.
+        for key, value in self._current_inherited().items():
+            attr_map.setdefault(key, value)
         self._current = {"href": href, "attrs": attr_map, "text_parts": []}
 
     def handle_endtag(self, tag: str) -> None:
-        if tag != "a" or self._current is None:
+        if tag == "a":
+            if self._current is None:
+                return
+            text = "".join(self._current["text_parts"]).strip()
+            anchor = {
+                "href": self._current["href"],
+                "text": text,
+                "attrs": self._current["attrs"],
+            }
+            self.anchors.append(anchor)
+            self._current = None
             return
-        text = "".join(self._current["text_parts"]).strip()
-        anchor = {
-            "href": self._current["href"],
-            "text": text,
-            "attrs": self._current["attrs"],
-        }
-        self.anchors.append(anchor)
-        self._current = None
+        # Pop the deepest matching frame for this tag, if any. The check
+        # tolerates malformed HTML (missing close tag) by leaving frames
+        # for outer tags untouched.
+        for index in range(len(self._inherited_stack) - 1, -1, -1):
+            if self._inherited_stack[index][0] == tag:
+                del self._inherited_stack[index]
+                return
 
     def handle_data(self, data: str) -> None:
         if self._current is not None:
@@ -553,12 +604,22 @@ class VLRConnector(Connector):
                     f"vlr fetch failed for {url}: {type(exc).__name__}: {exc}"
                 ) from exc
             rows = list(self._parser.parse(page_type, rendered))
+            # Apply the since-filter here, before emitting the payload.
+            # We deliberately do NOT stash ``fetched_at`` / ``since`` on
+            # the yielded dict: the runner hashes payload bytes for
+            # dedup, and any per-run metadata would make the same
+            # upstream page hash differently every pass — defeating
+            # ``RawRecord.content_hash`` replay detection. Filtering
+            # rows here keeps the emitted payload a pure content
+            # snapshot. ``RawRecord.fetched_at`` already records the
+            # crawl time at the row level via its server default.
+            kept_rows = [
+                row.to_payload() for row in rows if row.timestamp is None or row.timestamp > since
+            ]
             yield {
                 "page_type": page_type,
                 "url": url,
-                "rows": [row.to_payload() for row in rows],
-                "fetched_at": datetime.now(UTC).isoformat(),
-                "since": since.isoformat(),
+                "rows": kept_rows,
             }
 
     def validate(self, raw_payload: dict[str, Any]) -> dict[str, Any]:
@@ -605,22 +666,19 @@ class VLRConnector(Connector):
         return raw_payload
 
     def transform(self, validated_payload: dict[str, Any]) -> Iterable[IngestionRecord]:
-        """Project rows into resolver inputs, applying the since filter.
+        """Project rows into resolver inputs.
 
         ``platform_id`` is the VLR-stable id (parsed from the page URL
         and copied onto ``vlr_id``), *not* the display name. The
         resolver's exact-alias lookup keys on it for idempotence; using
         the display name would split the canonical row the moment VLR
         re-cased "TenZ" -> "tenz".
+
+        The since-filter is applied during ``fetch`` (before the
+        payload is hashed for dedup), so this method just projects
+        whatever rows the validated payload contains.
         """
-        since = _parse_iso_timestamp(validated_payload.get("since"))
         for row in validated_payload["rows"]:
-            row_ts = _parse_iso_timestamp(row.get("timestamp"))
-            # Page-level timestamps are optional: rankings don't expose
-            # one, and the spec says "pages without timestamps just
-            # yield current state". So ``None`` always passes.
-            if since is not None and row_ts is not None and row_ts <= since:
-                continue
             yield IngestionRecord(
                 entity_type=EntityType(row["entity_type"]),
                 platform_id=row["vlr_id"],
