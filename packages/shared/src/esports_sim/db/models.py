@@ -294,6 +294,50 @@ class RawRecord(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
 
 
+class PatchNote(Base):
+    """One game patch's release notes — a document, not a resolver entity (BUF-83).
+
+    Patch notes don't fit the ``(platform, platform_id)`` alias model the
+    rest of the schema is built around: there is no fuzzy matching, no
+    canonical merging, no per-platform handle. They are versioned
+    documents keyed by ``patch_version`` (e.g. ``"8.05"``), fed into BUF-24
+    patch-intent extraction downstream. Storing them here rather than in
+    ``raw_record`` makes ``patch_version`` and ``published_at`` first-class
+    queryable columns.
+
+    Idempotency: ``patch_version`` is unique, so the patch-notes runner can
+    UPSERT on it. A re-scrape of the same article updates ``raw_html`` /
+    ``body_text`` / ``fetched_at`` in place rather than inserting a
+    duplicate row — safe to re-run on the weekly cadence.
+    """
+
+    __tablename__ = "patch_note"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    # 32 chars is more than enough for ``"Major.Minor"`` or ``"Major.Minor.Hotfix"``;
+    # narrowing the column makes the unique-index footprint tiny.
+    patch_version: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    # Indexed for the freshness check the validator runs against the most
+    # recent ``published_at`` per source — see ``nexus validate``.
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    raw_html: Mapped[str] = mapped_column(nullable=False)
+    body_text: Mapped[str] = mapped_column(nullable=False)
+    url: Mapped[str] = mapped_column(String(512), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
 class AliasReviewQueue(Base):
     """Items the fuzzy matcher couldn't auto-decide.
 
@@ -349,10 +393,11 @@ class AliasReviewQueue(Base):
 
 
 __all__ = [
+    "AliasReviewQueue",
     "Entity",
     "EntityAlias",
-    "StagingRecord",
-    "StagingInvariantError",
+    "PatchNote",
     "RawRecord",
-    "AliasReviewQueue",
+    "StagingInvariantError",
+    "StagingRecord",
 ]

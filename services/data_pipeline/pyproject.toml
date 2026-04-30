@@ -13,10 +13,14 @@ dependencies = [
     # content_hash so a faulty connector run can be reconstructed from logs
     # alone; structlog's processor pipeline keeps that contract testable.
     "structlog>=24.1",
-    # HTTP client for the Riot API connector (BUF-82) and other future
-    # API-backed scrapers. Imported lazily inside the default ``http_get``
-    # factory so unit tests that inject a fake never need it on the path.
+    # HTTP client for the Riot API connector (BUF-82), Liquipedia (BUF-11),
+    # and patch-notes (BUF-83) connectors. Imported lazily inside each
+    # default ``http_get`` factory so unit tests that inject a fake never
+    # need it on the path.
     "httpx>=0.27",
+    # HTML parsing for the playvalorant.com patch-notes scraper (BUF-83).
+    # ``beautifulsoup4`` is the de-facto choice for tag-structure extraction.
+    "beautifulsoup4>=4.12",
 ]
 
 [tool.uv.sources]
