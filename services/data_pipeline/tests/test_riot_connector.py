@@ -20,7 +20,6 @@ import pytest
 from data_pipeline import (
     IngestionRecord,
     SchemaDriftError,
-    TransientFetchError,
     run_ingestion,
 )
 from data_pipeline.connectors.riot import RiotConnector, _parse_retry_after
@@ -210,11 +209,16 @@ def test_validate_raises_schema_drift_on_non_dict_match_block() -> None:
 # --- fetch: 429 / Retry-After / 5xx ---------------------------------------
 
 
-def test_fetch_raises_transient_fetch_error_on_429() -> None:
-    """A 429 on the matchlist endpoint short-circuits the seed.
+def test_fetch_429_on_matchlist_skips_seed_and_continues() -> None:
+    """A 429 on the matchlist endpoint logs + skips that seed.
 
-    The runner skips the row without persisting raw, so the next pass
-    retries the same seed — that's the contract.
+    The runner's post-yield error handling can't see exceptions raised
+    during iterator advancement, so propagating ``TransientFetchError``
+    from inside ``fetch`` would abort the whole pass and skip every
+    remaining seed PUUID. The connector now catches and downgrades to
+    a per-seed skip; the rest of the run still completes. ``Retry-After``
+    is still honoured before the skip so we don't immediately re-pound
+    the rate-limited endpoint inside the same bucket window.
     """
     sleeps: list[float] = []
     http = _FakeHttp(
@@ -228,10 +232,11 @@ def test_fetch_raises_transient_fetch_error_on_429() -> None:
     )
     connector = _make_connector(http_get=http, sleeper=sleeps.append)
 
-    with pytest.raises(TransientFetchError, match="429"):
-        list(connector.fetch(_EPOCH))
+    payloads = list(connector.fetch(_EPOCH))
 
-    # ``Retry-After: 2`` was honoured before raising.
+    # Seed was skipped — no payloads produced — but the run did not
+    # propagate the error. ``Retry-After: 2`` was honoured.
+    assert payloads == []
     assert sleeps == [2.0]
 
 
@@ -239,7 +244,9 @@ def test_fetch_caps_retry_after_defensively() -> None:
     """A garbage Retry-After value is capped, not honoured verbatim.
 
     A buggy or malicious upstream that sends Retry-After: 1000000 must
-    not wedge the run for a million seconds.
+    not wedge the run for a million seconds. The cap is honoured even
+    on the now-skip-not-raise path: the seed is still skipped, but the
+    cap applies first to limit the inline backoff.
     """
     sleeps: list[float] = []
     http = _FakeHttp(
@@ -252,55 +259,123 @@ def test_fetch_caps_retry_after_defensively() -> None:
         }
     )
     connector = _make_connector(http_get=http, sleeper=sleeps.append)
-    with pytest.raises(TransientFetchError):
-        list(connector.fetch(_EPOCH))
+    payloads = list(connector.fetch(_EPOCH))
+    assert payloads == []
     assert sleeps == [120.0]  # the module's _MAX_RETRY_AFTER_SECONDS
 
 
 def test_fetch_handles_missing_retry_after_header() -> None:
-    """No Retry-After header — no sleep, but still TransientFetchError."""
+    """No Retry-After header — no sleep, and the seed is skipped cleanly."""
     sleeps: list[float] = []
-    http = _FakeHttp(
-        {"matchlists/by-puuid": {"status_code": 429, "headers": {}, "json": None}}
-    )
+    http = _FakeHttp({"matchlists/by-puuid": {"status_code": 429, "headers": {}, "json": None}})
     connector = _make_connector(http_get=http, sleeper=sleeps.append)
-    with pytest.raises(TransientFetchError):
-        list(connector.fetch(_EPOCH))
+    payloads = list(connector.fetch(_EPOCH))
+    assert payloads == []
     assert sleeps == []  # nothing slept; bucket alone gates the next attempt
 
 
-def test_fetch_raises_transient_on_5xx() -> None:
-    http = _FakeHttp(
-        {"matchlists/by-puuid": {"status_code": 503, "headers": {}, "json": None}}
-    )
+def test_fetch_5xx_on_matchlist_skips_seed_and_continues() -> None:
+    """5xx is recoverable — log + skip the seed, don't abort the run."""
+    http = _FakeHttp({"matchlists/by-puuid": {"status_code": 503, "headers": {}, "json": None}})
     connector = _make_connector(http_get=http)
-    with pytest.raises(TransientFetchError, match="503"):
-        list(connector.fetch(_EPOCH))
+    payloads = list(connector.fetch(_EPOCH))
+    assert payloads == []
 
 
 def test_fetch_raises_schema_drift_on_400() -> None:
-    """Non-rate-limit, non-5xx errors are payload bugs — preserve via SchemaDrift."""
-    http = _FakeHttp(
-        {"matchlists/by-puuid": {"status_code": 404, "headers": {}, "json": None}}
-    )
+    """Non-rate-limit, non-5xx errors are payload bugs — preserve via SchemaDrift.
+
+    SchemaDriftError still propagates out of ``fetch`` (the connector
+    only absorbs ``TransientFetchError``). A 4xx on a seed PUUID is a
+    permanent miss — bad PUUID, expired key, etc. — and the maintainer
+    needs to see it loudly rather than silently dropping the seed.
+    """
+    http = _FakeHttp({"matchlists/by-puuid": {"status_code": 404, "headers": {}, "json": None}})
     connector = _make_connector(http_get=http)
     with pytest.raises(SchemaDriftError, match="404"):
         list(connector.fetch(_EPOCH))
 
 
-def test_fetch_translates_unknown_http_get_exception_to_transient() -> None:
-    """Raw network errors from the http_get shim become TransientFetchError.
+def test_fetch_unknown_http_exception_is_skipped_per_seed() -> None:
+    """Raw network errors from the http_get shim become a per-seed skip.
 
-    A connect-timeout shouldn't burn the retry slot — the runner needs
-    to skip without persisting raw so the next pass re-tries.
+    ``_get`` translates a generic exception into ``TransientFetchError``;
+    that's then caught by ``fetch`` and the seed is skipped without
+    propagating. A connect-timeout shouldn't burn the whole run.
     """
 
     def boom(url: str, params: dict[str, Any]) -> dict[str, Any]:
         raise OSError("connect timeout")
 
     connector = _make_connector(http_get=boom)
-    with pytest.raises(TransientFetchError, match="connect timeout"):
-        list(connector.fetch(_EPOCH))
+    payloads = list(connector.fetch(_EPOCH))
+    assert payloads == []
+
+
+def test_fetch_dedupes_match_id_across_seeds() -> None:
+    """Two seeds whose matchlists share a match emit it exactly once.
+
+    Tier-1 VCT pros frequently scrim each other; without a per-pass
+    seen-match-id guard, the same 10-player match would be fetched and
+    inserted N times — once per seed. The connector tracks
+    ``seen_match_ids`` for the duration of one ``fetch`` pass so each
+    match flows through exactly once. The second seed's matchlist is
+    still loaded (we need to know which matches it discovered to
+    populate the watermark), but its already-seen entries don't
+    re-fetch the detail endpoint.
+    """
+    shared_match_id = "match-shared"
+    seeds = ["PUUID-A", "PUUID-B"]
+
+    def matchlist_for(_seed: str) -> dict[str, Any]:
+        return {
+            "history": [
+                {"matchId": shared_match_id, "gameStartTimeMillis": 1700000000000},
+            ]
+        }
+
+    detail_calls: list[str] = []
+
+    def fake_http(url: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if "matchlists/by-puuid" in url:
+            return {"status_code": 200, "headers": {}, "json": matchlist_for(url)}
+        if f"matches/{shared_match_id}" in url:
+            detail_calls.append(url)
+            return {"status_code": 200, "headers": {}, "json": _ok_match()["json"]}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    connector = _make_connector(http_get=fake_http, seed_puuids=seeds)
+    payloads = list(connector.fetch(_EPOCH))
+
+    # The shared match is yielded exactly once — even though both seeds
+    # surfaced it via their matchlists.
+    match_ids = [p["match_id"] for p in payloads]
+    assert match_ids == [shared_match_id]
+    # And the detail endpoint was only hit once.
+    assert len(detail_calls) == 1
+
+
+def test_fetch_payload_omits_puuid_seed_for_stable_content_hash() -> None:
+    """Yielded payloads must not include the discovering ``puuid_seed``.
+
+    The runner hashes payload bytes for ``RawRecord.content_hash``
+    dedup; including which seed surfaced the match would make the
+    same Riot response hash differently if the seed list changes
+    between runs, breaking replay detection.
+    """
+    http = _FakeHttp(
+        {
+            "matchlists/by-puuid": _matchlist_response(),
+            "matches/match-001": _ok_match(),
+            "matches/match-002": _ok_match(),
+        }
+    )
+    connector = _make_connector(http_get=http)
+    payloads = list(connector.fetch(_EPOCH))
+    assert payloads, "fixture should have produced at least one match"
+    for payload in payloads:
+        assert "puuid_seed" not in payload
+        assert set(payload.keys()) == {"match_id", "match"}
 
 
 # --- fetch: since watermark ----------------------------------------------
@@ -468,5 +543,3 @@ def test_pipeline_idempotent_on_re_run(db_session) -> None:  # type: ignore[no-u
     assert len(staging) == 20
     aliases = db_session.execute(select(EntityAlias)).scalars().all()
     assert len(aliases) == 10
-
-

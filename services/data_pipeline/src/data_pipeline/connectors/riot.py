@@ -236,18 +236,47 @@ class RiotConnector(Connector):
 
             {
                 "match_id": <riot match id>,
-                "puuid_seed": <the seed PUUID we found this match through>,
                 "match": <full Riot match response>,
             }
 
-        ``puuid_seed`` is preserved so a re-run can re-attribute the
-        match if the seed list changes; the canonical link is the
-        match ID.
+        Two correctness properties this loop enforces:
+
+        * **Cross-seed dedup.** Tier-1 VCT pros frequently scrim each
+          other; the same match appears in N seeds' matchlists. We
+          keep a ``seen_match_ids`` set scoped to this fetch pass and
+          skip already-emitted matches so a 10-player scrim isn't
+          fetched 10× and inserted 10× into ``staging_record``.
+        * **Stable content hash.** We deliberately do NOT stash the
+          discovering ``puuid_seed`` on the yielded payload. The
+          runner hashes payload bytes for ``RawRecord.content_hash``
+          dedup; folding the seed in would make the same match hash
+          differently on a re-run with a different seed list. Seed
+          attribution is observable via the ``riot.matchlist_loaded``
+          structured-log line and the ``raw_record.fetched_at``
+          temporal proximity to that call.
+
+        Per-record HTTP failures (``TransientFetchError`` from a 429 or
+        a 5xx) are caught here and **logged + skipped** rather than
+        propagated. ``run_ingestion``'s post-yield error handling can't
+        see exceptions raised during iterator advancement (i.e. inside
+        the ``self._fetch_match`` call before the next ``yield``), so
+        one rate-limited request would otherwise abort the whole pass
+        and skip every remaining seed PUUID.
         """
         since_millis = int(since.timestamp() * 1000)
+        seen_match_ids: set[str] = set()
 
         for puuid in self._seed_puuids:
-            matchlist = self._fetch_matchlist(puuid)
+            try:
+                matchlist = self._fetch_matchlist(puuid)
+            except TransientFetchError as exc:
+                self._log.warning(
+                    "riot.matchlist_fetch_skipped",
+                    code="TRANSIENT_FETCH_ERROR",
+                    puuid_seed=puuid,
+                    detail=str(exc),
+                )
+                continue
             history = matchlist.get("history") or []
             for match_ref in history:
                 # ``gameStartTimeMillis`` is Riot's documented field; an
@@ -270,10 +299,30 @@ class RiotConnector(Connector):
                     )
                     continue
 
-                match_payload = self._fetch_match(match_id)
+                if match_id in seen_match_ids:
+                    # Cross-seed dedup: another seed already surfaced
+                    # this match in the current pass.
+                    continue
+                seen_match_ids.add(match_id)
+
+                try:
+                    match_payload = self._fetch_match(match_id)
+                except TransientFetchError as exc:
+                    self._log.warning(
+                        "riot.match_fetch_skipped",
+                        code="TRANSIENT_FETCH_ERROR",
+                        match_id=match_id,
+                        puuid_seed=puuid,
+                        detail=str(exc),
+                    )
+                    # Allow a future pass to retry this match by removing
+                    # it from the seen-set; otherwise a transient blip
+                    # turns into a permanent drop.
+                    seen_match_ids.discard(match_id)
+                    continue
+
                 yield {
                     "match_id": match_id,
-                    "puuid_seed": puuid,
                     "match": match_payload,
                 }
 
@@ -345,9 +394,7 @@ class RiotConnector(Connector):
                 )
                 continue
 
-            slimmed_rounds = [
-                _slim_round_for_player(round_data, puuid) for round_data in rounds
-            ]
+            slimmed_rounds = [_slim_round_for_player(round_data, puuid) for round_data in rounds]
 
             yield IngestionRecord(
                 entity_type=EntityType.PLAYER,
@@ -366,16 +413,12 @@ class RiotConnector(Connector):
 
     def _fetch_matchlist(self, puuid: str) -> dict[str, Any]:
         url = (
-            f"https://{self._region}.api.riotgames.com"
-            f"/val/match/v1/matchlists/by-puuid/{puuid}"
+            f"https://{self._region}.api.riotgames.com" f"/val/match/v1/matchlists/by-puuid/{puuid}"
         )
         return self._get(url, {})
 
     def _fetch_match(self, match_id: str) -> dict[str, Any]:
-        url = (
-            f"https://{self._region}.api.riotgames.com"
-            f"/val/match/v1/matches/{match_id}"
-        )
+        url = f"https://{self._region}.api.riotgames.com" f"/val/match/v1/matches/{match_id}"
         return self._get(url, {})
 
     def _get(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -425,9 +468,7 @@ class RiotConnector(Connector):
             )
             if retry_after > 0:
                 self._sleeper(retry_after)
-            raise TransientFetchError(
-                f"Riot 429 at {url}; retry-after={retry_after}s"
-            )
+            raise TransientFetchError(f"Riot 429 at {url}; retry-after={retry_after}s")
 
         if status is not None and 500 <= status < 600:
             self._log.warning(
@@ -442,9 +483,7 @@ class RiotConnector(Connector):
         # (bad PUUID, expired key, missing match) and persisting the
         # raw row helps a maintainer diagnose. SchemaDriftError makes
         # the runner persist raw and continue.
-        raise SchemaDriftError(
-            f"Riot returned unexpected status {status} for {url}; body={body!r}"
-        )
+        raise SchemaDriftError(f"Riot returned unexpected status {status} for {url}; body={body!r}")
 
 
 def _parse_retry_after(header_value: Any) -> float:
