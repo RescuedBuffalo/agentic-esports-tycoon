@@ -245,6 +245,56 @@ def test_schema_drift_logs_and_continues(db_session, caplog) -> None:
     )
 
 
+def test_unexpected_connector_exception_logs_connector_error_and_propagates(
+    db_session, caplog
+) -> None:
+    """Regression for a Codex review finding.
+
+    A connector error that isn't ``IngestionError`` (e.g., ``KeyError``
+    from a parser regression) must surface a structured
+    ``CONNECTOR_ERROR`` log line — carrying the bound ``source`` and
+    ``content_hash`` context — *before* the exception propagates and
+    aborts the run. Without that, postmortems lose the failing-payload
+    trail even though the run correctly stopped.
+    """
+
+    def buggy_validate(payload: dict[str, Any]) -> dict[str, Any]:
+        # Mimic a parser regression: a previously-stable field has gone
+        # missing and the connector hasn't been updated to handle it.
+        return {"normalised": payload["nonexistent_field"]}
+
+    connector = FakeConnector(
+        payloads=[make_player_payload(platform_id="vlr-1", platform_name="A")],
+        validate_fn=buggy_validate,
+    )
+
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.EventRenamer("event"),
+            structlog.stdlib.render_to_log_kwargs,
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
+    caplog.set_level(logging.ERROR, logger="data_pipeline.ingestion")
+
+    with pytest.raises(KeyError):
+        run_ingestion(connector, session=db_session, since=_EPOCH)
+
+    connector_error_records = [
+        r
+        for r in caplog.records
+        if "CONNECTOR_ERROR" in r.getMessage() or getattr(r, "code", None) == "CONNECTOR_ERROR"
+    ]
+    assert (
+        connector_error_records
+    ), "expected a CONNECTOR_ERROR log line before the exception propagated; got: " + ", ".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
 # --- rate limiting wired through ------------------------------------------
 
 

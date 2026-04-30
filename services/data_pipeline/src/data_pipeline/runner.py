@@ -130,6 +130,16 @@ def run_ingestion(
             stats.schema_drifts += 1
             log.warning("ingestion.schema_drift", code="SCHEMA_DRIFT", detail=str(exc))
             continue
+        except Exception:
+            # Unknown connector failure (parser regression, KeyError on a
+            # field that disappeared, etc.). Per the connector contract
+            # this is fatal-by-default — but we still owe operators the
+            # structured ``CONNECTOR_ERROR`` event with the same
+            # ``source`` + ``content_hash`` context every other path
+            # emits, otherwise postmortems lose the failing-payload trail.
+            # Log first, then re-raise so the run stops.
+            log.exception("ingestion.connector_error", code="CONNECTOR_ERROR")
+            raise
 
         # Happy path: persist raw, then resolve and write a staging row
         # per emitted record.
