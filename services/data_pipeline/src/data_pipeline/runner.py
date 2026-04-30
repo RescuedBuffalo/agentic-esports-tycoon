@@ -267,8 +267,17 @@ def _rate_limited(
     fact bookkeeping.
 
     On end-of-stream, we've paid for a ``next()`` that ultimately
-    returned no payload — refund that token so a low-rate connector
-    isn't charged tail latency for a request the loop never made.
+    returned no payload — refund that token (when supported) so a
+    low-rate connector's quota isn't silently halved by the EOS probe.
+    ``refund`` is treated as optional so duck-typed limiters that only
+    implement ``acquire`` still complete a run cleanly; only the
+    runner's default :class:`TokenBucket` opts into refunding.
+
+    The wait time spent waiting for that final acquire on an empty
+    bucket is unavoidable: detecting end-of-stream requires advancing
+    the iterator, which can only legally happen after we've gated the
+    upstream call with a token. The refund recovers the token; the
+    tail wait is a fundamental cost of acquire-before-fetch.
     """
     iterator = iter(iterable)
     while True:
@@ -276,7 +285,13 @@ def _rate_limited(
         try:
             yield next(iterator)
         except StopIteration:
-            limiter.refund()
+            # Optional: only refund if the limiter implements it. Wrappers
+            # used by tests / instrumentation (see ``CountingBucket`` in
+            # ``test_runner.py``) often expose ``acquire`` only — calling
+            # ``refund`` unconditionally would AttributeError there.
+            refund = getattr(limiter, "refund", None)
+            if callable(refund):
+                refund()
             return
 
 

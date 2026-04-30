@@ -680,3 +680,46 @@ def test_eos_token_is_refunded_to_bucket(db_session) -> None:
     # ``try_acquire`` should succeed, then the bucket is exhausted.
     assert bucket.try_acquire() is True
     assert bucket.try_acquire() is False
+
+
+def test_limiter_without_refund_completes_run_cleanly(db_session) -> None:
+    """Runner must tolerate duck-typed limiters that only implement ``acquire``.
+
+    Regression for a Codex review finding: ``_rate_limited`` used to
+    call ``limiter.refund()`` unconditionally on ``StopIteration``,
+    which AttributeErrored on instrumentation wrappers (the
+    ``CountingBucket`` pattern below) that expose only the minimal
+    contract. Ingestion would process every record successfully and
+    then crash at end-of-stream. The fix probes for ``refund`` via
+    :func:`getattr` and skips it when missing.
+    """
+    real_bucket = TokenBucket(capacity=10, refill_per_second=10.0)
+    acquire_calls = {"n": 0}
+
+    class AcquireOnlyLimiter:
+        """Deliberately exposes only ``acquire`` — no ``refund``."""
+
+        def acquire(self) -> None:
+            acquire_calls["n"] += 1
+            real_bucket.acquire()
+
+    connector = FakeConnector(
+        payloads=[
+            make_player_payload(platform_id="vlr-1", platform_name="A"),
+            make_player_payload(platform_id="vlr-2", platform_name="B"),
+        ]
+    )
+
+    # Without the hasattr guard this would raise AttributeError on EOS.
+    stats = run_ingestion(
+        connector,
+        session=db_session,
+        since=_EPOCH,
+        rate_limiter=AcquireOnlyLimiter(),  # type: ignore[arg-type]
+    )
+
+    assert stats.processed == 2
+    # 2 yields + 1 EOS probe = 3 acquires. The probe still pays a
+    # token (no refund support on this limiter); that's the trade-off
+    # for exposing only the minimal contract.
+    assert acquire_calls["n"] == 3
