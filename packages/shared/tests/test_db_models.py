@@ -18,16 +18,15 @@ from esports_sim.db.models import (
     Entity,
     EntityAlias,
 )
-from sqlalchemy import inspect, select, text
-from sqlalchemy.exc import IntegrityError
-
-from tests.fixtures import (
+from fixtures import (
     make_entity,
     make_entity_alias,
     make_raw_record,
     make_review_queue_item,
     make_staging_record,
 )
+from sqlalchemy import inspect, select, text
+from sqlalchemy.exc import IntegrityError
 
 pytestmark = pytest.mark.integration
 

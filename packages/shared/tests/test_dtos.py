@@ -19,15 +19,14 @@ from esports_sim.schemas.dtos import (
     RawRecordDTO,
     StagingRecordDTO,
 )
-from pydantic import ValidationError
-
-from tests.fixtures import (
+from fixtures import (
     make_entity,
     make_entity_alias,
     make_raw_record,
     make_review_queue_item,
     make_staging_record,
 )
+from pydantic import ValidationError
 
 
 def test_entity_dto_from_orm() -> None:

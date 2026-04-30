@@ -9,6 +9,10 @@ description = "Valorant data ingest service (VLR / Riot / Liquipedia -> data/)."
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "esports-sim-shared",
+    # Structured logging (BUF-9). Every ingestion line carries source +
+    # content_hash so a faulty connector run can be reconstructed from logs
+    # alone; structlog's processor pipeline keeps that contract testable.
+    "structlog>=24.1",
 ]
 
 [tool.uv.sources]
