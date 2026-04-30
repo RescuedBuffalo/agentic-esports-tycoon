@@ -119,5 +119,22 @@ class TokenBucket:
                 return True
             return False
 
+    def refund(self) -> None:
+        """Return one previously-acquired token to the bucket.
+
+        The intended caller is the iterator wrapper in
+        :mod:`data_pipeline.runner`: when the connector's ``fetch``
+        raises ``StopIteration``, the runner has just paid a token for
+        a ``next()`` call that ultimately produced no upstream request.
+        Returning the token keeps the limiter from over-charging on
+        end-of-stream.
+
+        Capped at ``capacity`` so a stray refund without a prior
+        acquire can't grow the bucket past its declared burst size.
+        """
+        with self._lock:
+            self._refill()
+            self._tokens = min(float(self._capacity), self._tokens + 1.0)
+
 
 __all__ = ["TokenBucket"]

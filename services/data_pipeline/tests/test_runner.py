@@ -586,3 +586,97 @@ def test_ingestion_error_from_resolver_is_still_skipped(db_session, monkeypatch)
     # Both records hit the soft-error branch; the run completes.
     assert stats.resolver_errors == 2
     assert stats.processed == 0
+
+
+# --- source-scoped dedup (Codex P1) --------------------------------------
+
+
+def test_dedup_is_scoped_by_connector_source(db_session) -> None:
+    """Two connectors emitting byte-identical JSON each persist a raw row.
+
+    Regression for a Codex review finding: the dedup hash used to ignore
+    ``source``, so the second connector's payload would collide on
+    ``content_hash`` with the first's and be silently dropped before
+    the resolver ran. The fix folds ``source`` into the hash input.
+    """
+    payload = make_player_payload(platform_id="shared-id", platform_name="Shared")
+
+    connector_vlr = FakeConnector(
+        payloads=[payload],
+        source_name="vlr",
+        platform=Platform.VLR,
+    )
+    connector_liq = FakeConnector(
+        payloads=[payload],
+        source_name="liquipedia",
+        platform=Platform.LIQUIPEDIA,
+    )
+
+    stats_vlr = run_ingestion(connector_vlr, session=db_session, since=_EPOCH)
+    stats_liq = run_ingestion(connector_liq, session=db_session, since=_EPOCH)
+
+    assert stats_vlr.processed == 1
+    assert stats_vlr.duplicates == 0
+    # Second connector must not be deduped against the first.
+    assert stats_liq.processed == 1
+    assert stats_liq.duplicates == 0
+
+    raw_rows = db_session.execute(select(RawRecord)).scalars().all()
+    assert len(raw_rows) == 2
+    assert {r.source for r in raw_rows} == {"vlr", "liquipedia"}
+    # Hashes must differ — that's what makes the second insert legal under
+    # the global ``content_hash`` unique constraint.
+    assert raw_rows[0].content_hash != raw_rows[1].content_hash
+
+
+def test_same_source_still_dedups_on_repeat(db_session) -> None:
+    """Source-scoping mustn't break within-source dedup.
+
+    A single connector that yields the same payload twice should still
+    only write one raw row — that's the point of the content_hash
+    fingerprint in the first place.
+    """
+    payload = make_player_payload(platform_id="vlr-tenz", platform_name="TenZ")
+    connector = FakeConnector(payloads=[payload, payload])
+
+    stats = run_ingestion(connector, session=db_session, since=_EPOCH)
+
+    assert stats.fetched == 1
+    assert stats.duplicates == 1
+    assert len(db_session.execute(select(RawRecord)).scalars().all()) == 1
+
+
+# --- token refund on EOS (Codex P2) --------------------------------------
+
+
+def test_eos_token_is_refunded_to_bucket(db_session) -> None:
+    """The probe that yields ``StopIteration`` should not leave the bucket
+    one token poorer than necessary.
+
+    Regression for a Codex review finding: ``_rate_limited`` paid a
+    token on every ``next()``, including the final probe that ended
+    the stream. The fix calls ``refund`` from inside ``_rate_limited``
+    on ``StopIteration`` so a low-rate connector's quota utilisation
+    isn't silently halved by the bookkeeping cost of the EOS probe.
+
+    ``refill_per_second`` is set very low so that any wall-clock time
+    spent in the test contributes negligible refill. With capacity=3
+    and two consumed items, the bucket should hold exactly one token
+    after the run (the EOS probe's token, returned via ``refund``).
+    """
+    bucket = TokenBucket(capacity=3, refill_per_second=0.001)
+    connector = FakeConnector(
+        payloads=[
+            make_player_payload(platform_id="vlr-1", platform_name="Alpha"),
+            make_player_payload(platform_id="vlr-2", platform_name="Beta"),
+        ],
+    )
+
+    run_ingestion(connector, session=db_session, since=_EPOCH, rate_limiter=bucket)
+
+    # 3 acquires happened (item 1, item 2, EOS probe). Without refund,
+    # the bucket would be empty; ``try_acquire`` would return False.
+    # With refund, the EOS-probe token came back — exactly one
+    # ``try_acquire`` should succeed, then the bucket is exhausted.
+    assert bucket.try_acquire() is True
+    assert bucket.try_acquire() is False

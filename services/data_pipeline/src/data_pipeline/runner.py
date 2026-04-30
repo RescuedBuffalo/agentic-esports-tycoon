@@ -86,7 +86,13 @@ def run_ingestion(
     # iterator advance with an ``acquire`` so the bucket gates real upstream
     # traffic.
     for raw_payload in _rate_limited(connector.fetch(since), rate_limiter):
-        content_hash = _hash_payload(raw_payload)
+        # Scope the dedup hash by ``source``: two connectors emitting
+        # byte-identical JSON for the same upstream record (e.g., a
+        # primary VLR scraper plus a backup that happens to ship the
+        # same shape) must each land their own raw row, otherwise the
+        # second source is silently dropped before resolver/staging
+        # ever see it.
+        content_hash = _hash_payload(connector.source_name, raw_payload)
         log = bound.bind(content_hash=content_hash)
 
         if _content_hash_seen(session, content_hash):
@@ -260,10 +266,9 @@ def _rate_limited(
     — keeps the bucket gating actual upstream traffic, not after-the-
     fact bookkeeping.
 
-    A side effect: if the iterator is exhausted we've already paid one
-    token detecting end-of-stream. Acceptable in practice — burst
-    capacity is virtually always > 1 and the wasted token doesn't
-    introduce any extra wait.
+    On end-of-stream, we've paid for a ``next()`` that ultimately
+    returned no payload — refund that token so a low-rate connector
+    isn't charged tail latency for a request the loop never made.
     """
     iterator = iter(iterable)
     while True:
@@ -271,17 +276,29 @@ def _rate_limited(
         try:
             yield next(iterator)
         except StopIteration:
+            limiter.refund()
             return
 
 
-def _hash_payload(payload: dict[str, Any]) -> str:
-    """SHA-256 over canonical JSON. Stable across Python runs.
+def _hash_payload(source: str, payload: dict[str, Any]) -> str:
+    """SHA-256 over (source, canonical JSON). Stable across Python runs.
 
     ``sort_keys=True`` and explicit separators give us a deterministic
     byte sequence — a payload with the same content but different key
     order must hash the same, otherwise dedup is useless.
+
+    ``source`` is folded into the hash input so two connectors that
+    happen to emit byte-identical JSON each get a distinct
+    ``content_hash``. Without that, the second connector's payload
+    would be deduplicated against the first and silently dropped
+    before the resolver ran — losing the alias and staging rows it
+    would have produced.
     """
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(
+        {"source": source, "payload": payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
