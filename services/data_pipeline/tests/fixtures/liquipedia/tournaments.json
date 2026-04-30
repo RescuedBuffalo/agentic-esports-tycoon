@@ -1,0 +1,18 @@
+[
+  {
+    "slug": "vct-2026-americas-stage-1",
+    "name": "VCT 2026: Americas Stage 1",
+    "start_date": "2026-03-15",
+    "end_date": "2026-04-30",
+    "tier": "S",
+    "prize_pool_usd": 250000
+  },
+  {
+    "slug": "vct-2026-emea-stage-1",
+    "name": "VCT 2026: EMEA Stage 1",
+    "start_date": "2026-03-15",
+    "end_date": "2026-04-30",
+    "tier": "S",
+    "prize_pool_usd": 250000
+  }
+]
