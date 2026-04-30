@@ -266,18 +266,15 @@ def _rate_limited(
     — keeps the bucket gating actual upstream traffic, not after-the-
     fact bookkeeping.
 
-    On end-of-stream, we've paid for a ``next()`` that ultimately
-    returned no payload — refund that token (when supported) so a
-    low-rate connector's quota isn't silently halved by the EOS probe.
-    ``refund`` is treated as optional so duck-typed limiters that only
-    implement ``acquire`` still complete a run cleanly; only the
-    runner's default :class:`TokenBucket` opts into refunding.
-
-    The wait time spent waiting for that final acquire on an empty
-    bucket is unavoidable: detecting end-of-stream requires advancing
-    the iterator, which can only legally happen after we've gated the
-    upstream call with a token. The refund recovers the token; the
-    tail wait is a fundamental cost of acquire-before-fetch.
+    On end-of-stream, the final ``next()`` may have made an HTTP call
+    that yielded nothing (paginated connectors legitimately fetch an
+    empty page and ``return``; "is there new data?" pollers do the
+    same). We deliberately do **not** refund the token on
+    ``StopIteration`` — refunding would let repeated empty polls
+    bypass the limiter and exceed provider quotas. The cost is one
+    "wasted" token per pass for materialised-list connectors that do
+    no HTTP after the last yield; that under-utilisation is an
+    acceptable trade for never under-charging on real polls.
     """
     iterator = iter(iterable)
     while True:
@@ -285,13 +282,6 @@ def _rate_limited(
         try:
             yield next(iterator)
         except StopIteration:
-            # Optional: only refund if the limiter implements it. Wrappers
-            # used by tests / instrumentation (see ``CountingBucket`` in
-            # ``test_runner.py``) often expose ``acquire`` only — calling
-            # ``refund`` unconditionally would AttributeError there.
-            refund = getattr(limiter, "refund", None)
-            if callable(refund):
-                refund()
             return
 
 

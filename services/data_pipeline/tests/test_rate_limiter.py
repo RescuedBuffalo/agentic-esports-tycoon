@@ -193,31 +193,3 @@ def test_from_rate_limit_constructor() -> None:
     for _ in range(4):
         assert bucket.try_acquire() is True
     assert bucket.try_acquire() is False
-
-
-# --- refund (Codex P2 — token returns on EOS probe) ----------------------
-
-
-def test_refund_returns_token_to_bucket() -> None:
-    """A refunded token is immediately available for try_acquire."""
-    bucket, _ = _bucket(capacity=1, refill_per_second=1.0)
-    assert bucket.try_acquire() is True
-    assert bucket.try_acquire() is False  # exhausted
-    bucket.refund()
-    assert bucket.try_acquire() is True
-
-
-def test_refund_caps_at_capacity() -> None:
-    """Stray refund without a prior acquire can't overflow the bucket.
-
-    Without the cap, calling ``refund`` repeatedly would let the bucket
-    grow unbounded — turning rate-limiting into a no-op for any future
-    workload that depends on the declared burst size.
-    """
-    bucket, _ = _bucket(capacity=2, refill_per_second=1.0)
-    for _ in range(10):
-        bucket.refund()
-    # Only ``capacity`` tokens are ever spendable in one burst.
-    assert bucket.try_acquire() is True
-    assert bucket.try_acquire() is True
-    assert bucket.try_acquire() is False

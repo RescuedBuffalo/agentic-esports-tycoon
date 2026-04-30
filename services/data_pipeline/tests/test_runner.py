@@ -649,20 +649,21 @@ def test_same_source_still_dedups_on_repeat(db_session) -> None:
 # --- token refund on EOS (Codex P2) --------------------------------------
 
 
-def test_eos_token_is_refunded_to_bucket(db_session) -> None:
-    """The probe that yields ``StopIteration`` should not leave the bucket
-    one token poorer than necessary.
+def test_eos_probe_token_is_not_refunded(db_session) -> None:
+    """The runner must not refund the EOS-probe token.
 
-    Regression for a Codex review finding: ``_rate_limited`` paid a
-    token on every ``next()``, including the final probe that ended
-    the stream. The fix calls ``refund`` from inside ``_rate_limited``
-    on ``StopIteration`` so a low-rate connector's quota utilisation
-    isn't silently halved by the bookkeeping cost of the EOS probe.
+    Regression for a Codex P1 finding: paginated connectors legitimately
+    perform an HTTP call inside the final ``next()`` (fetching an empty
+    page, or polling for "is there new data?") and then return without
+    yielding. Refunding the token in that case would let repeated empty
+    polls bypass the limiter and exceed provider quotas. The trade-off
+    is that materialised-list connectors waste one token per pass —
+    acceptable in exchange for never under-charging real polls.
 
-    ``refill_per_second`` is set very low so that any wall-clock time
-    spent in the test contributes negligible refill. With capacity=3
-    and two consumed items, the bucket should hold exactly one token
-    after the run (the EOS probe's token, returned via ``refund``).
+    With capacity=3 and two consumed items, the bucket should hold
+    exactly zero tokens after the run (item 1, item 2, EOS probe = 3
+    acquires; refill rate is set negligibly low so wall-clock time
+    can't restore tokens during the test).
     """
     bucket = TokenBucket(capacity=3, refill_per_second=0.001)
     connector = FakeConnector(
@@ -674,30 +675,25 @@ def test_eos_token_is_refunded_to_bucket(db_session) -> None:
 
     run_ingestion(connector, session=db_session, since=_EPOCH, rate_limiter=bucket)
 
-    # 3 acquires happened (item 1, item 2, EOS probe). Without refund,
-    # the bucket would be empty; ``try_acquire`` would return False.
-    # With refund, the EOS-probe token came back — exactly one
-    # ``try_acquire`` should succeed, then the bucket is exhausted.
-    assert bucket.try_acquire() is True
+    # 3 acquires happened (item 1, item 2, EOS probe); none were refunded.
+    # The bucket is exhausted within the bounds of the slow refill.
     assert bucket.try_acquire() is False
 
 
-def test_limiter_without_refund_completes_run_cleanly(db_session) -> None:
-    """Runner must tolerate duck-typed limiters that only implement ``acquire``.
+def test_limiter_minimal_contract_is_just_acquire(db_session) -> None:
+    """The runner only requires ``acquire`` from a limiter shim.
 
-    Regression for a Codex review finding: ``_rate_limited`` used to
-    call ``limiter.refund()`` unconditionally on ``StopIteration``,
-    which AttributeErrored on instrumentation wrappers (the
-    ``CountingBucket`` pattern below) that expose only the minimal
-    contract. Ingestion would process every record successfully and
-    then crash at end-of-stream. The fix probes for ``refund`` via
-    :func:`getattr` and skips it when missing.
+    Tests, instrumentation wrappers, and alternative limiter
+    implementations should be able to implement just one method.
+    Verifying this explicitly guards against future code (e.g.,
+    additional bookkeeping calls in ``_rate_limited``) re-introducing
+    a wider implicit contract.
     """
     real_bucket = TokenBucket(capacity=10, refill_per_second=10.0)
     acquire_calls = {"n": 0}
 
     class AcquireOnlyLimiter:
-        """Deliberately exposes only ``acquire`` — no ``refund``."""
+        """Deliberately exposes only ``acquire``."""
 
         def acquire(self) -> None:
             acquire_calls["n"] += 1
@@ -710,7 +706,6 @@ def test_limiter_without_refund_completes_run_cleanly(db_session) -> None:
         ]
     )
 
-    # Without the hasattr guard this would raise AttributeError on EOS.
     stats = run_ingestion(
         connector,
         session=db_session,
@@ -719,7 +714,6 @@ def test_limiter_without_refund_completes_run_cleanly(db_session) -> None:
     )
 
     assert stats.processed == 2
-    # 2 yields + 1 EOS probe = 3 acquires. The probe still pays a
-    # token (no refund support on this limiter); that's the trade-off
-    # for exposing only the minimal contract.
+    # 2 yields + 1 EOS probe = 3 acquires. Pagination correctness
+    # demands we charge for the probe; see ``_rate_limited`` docstring.
     assert acquire_calls["n"] == 3
