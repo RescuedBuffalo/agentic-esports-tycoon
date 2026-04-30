@@ -78,6 +78,15 @@ _STRIP_TAGS = ("script", "style", "nav", "footer", "aside", "iframe", "noscript"
 _WS_RUN = re.compile(r"[ \t]+")
 _BLANK_LINES = re.compile(r"\n\s*\n\s*", re.MULTILINE)
 
+# Patch-note slugs on playvalorant.com follow ``valorant-patch-notes-X-YY``.
+# The /news/game-updates/ feed also includes trailers, dev-team posts, and
+# announcement blogs; their slugs do NOT contain ``patch-notes``. Filtering
+# at the list-card level avoids fetching every announcement and then
+# logging a SCHEMA_DRIFT when version extraction fails on it. The pattern
+# is permissive (case-insensitive, allows additional suffix tokens) so a
+# minor URL-format tweak doesn't immediately silently lose patches.
+_PATCH_NOTE_SLUG_RE = re.compile(r"valorant[-_]patch[-_]notes", re.IGNORECASE)
+
 
 class PlayValorantPatchNotesConnector(PatchNoteConnector):
     """Scrape playvalorant.com game-updates for patch notes.
@@ -211,9 +220,7 @@ class PlayValorantPatchNotesConnector(PatchNoteConnector):
 
         published_at = _extract_published_at(soup)
         if published_at is None:
-            raise SchemaDriftError(
-                "playvalorant: could not find <time datetime=...> on article"
-            )
+            raise SchemaDriftError("playvalorant: could not find <time datetime=...> on article")
 
         body_text = _clean_body_text(soup)
         if not body_text:
@@ -269,6 +276,13 @@ def _parse_article_cards(
             continue
         # Skip the list-page link itself.
         if href.rstrip("/").endswith("/game-updates"):
+            continue
+        # The /game-updates/ feed mixes patch notes with trailers, dev
+        # posts, and announcements. Filtering by slug here means
+        # ``validate`` only ever sees real patch articles — non-patch
+        # entries would otherwise fail version extraction and inflate
+        # ``SCHEMA_DRIFT`` counts on every healthy run.
+        if not _PATCH_NOTE_SLUG_RE.search(href):
             continue
         absolute = urljoin(base_url, href)
         if absolute in seen:

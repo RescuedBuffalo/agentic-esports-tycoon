@@ -196,6 +196,24 @@ def run_patch_notes_ingestion(
             raw_payload = next(iterator)
         except StopIteration:
             break
+        except TransientFetchError as exc:
+            # The connector's ``fetch`` makes its HTTP call in the body
+            # that runs *between* yields — i.e. during this very
+            # ``next()`` call. A network blip on the article-list page
+            # (or on an article body page) would otherwise escape this
+            # loop and abort the whole patch-notes pass. Catching here
+            # mirrors the post-yield handling below: count it, log it,
+            # and keep iterating so the rest of the archive still
+            # flows. The next scheduled run retries the same upstream
+            # because no raw_record was written for the failed page.
+            stats.transient_errors += 1
+            bound.warning(
+                "patch_notes.transient_error",
+                code="TRANSIENT_ERROR",
+                stage="fetch",
+                detail=str(exc),
+            )
+            continue
 
         log = bound.bind(url=raw_payload.get("url"))
 

@@ -27,6 +27,7 @@ from data_pipeline import (
     PatchNoteRecord,
     RateLimit,
     SchemaDriftError,
+    TransientFetchError,
     run_patch_notes_ingestion,
 )
 from data_pipeline.connectors.playvalorant import (
@@ -189,9 +190,7 @@ def test_transform_yields_one_record_with_all_fields_populated() -> None:
     html = _load("article_8_05.html")
     connector = PlayValorantPatchNotesConnector(http_get=_make_http_get({}))
 
-    validated = connector.validate(
-        {"url": "https://playvalorant.com/x", "html": html}
-    )
+    validated = connector.validate({"url": "https://playvalorant.com/x", "html": html})
     records = list(connector.transform(validated))
 
     assert len(records) == 1
@@ -202,6 +201,124 @@ def test_transform_yields_one_record_with_all_fields_populated() -> None:
     assert record.url == "https://playvalorant.com/x"
     assert record.raw_html == html
     assert "Clove" in record.body_text
+
+
+# --- list-card filtering --------------------------------------------------
+
+
+def test_fetch_skips_non_patch_news_articles_in_game_updates_feed() -> None:
+    """The /game-updates/ feed mixes patch notes with trailers + dev posts.
+
+    Without slug-level filtering, every non-patch entry would be
+    fetched and then rejected by ``validate`` as ``SCHEMA_DRIFT`` —
+    inflating the drift counter on a healthy run. The connector now
+    filters list-card URLs by the ``valorant-patch-notes-*`` slug
+    pattern, so only real patch articles reach ``validate``.
+    """
+    list_html = """
+    <html><body>
+      <a href="/en-us/news/game-updates/valorant-patch-notes-8-05/">
+        <time datetime="2026-03-12T17:00:00Z">Mar 12</time> Patch 8.05
+      </a>
+      <a href="/en-us/news/game-updates/episode-9-cinematic-trailer/">
+        <time datetime="2026-03-10T17:00:00Z">Mar 10</time> Trailer
+      </a>
+      <a href="/en-us/news/game-updates/dev-diaries-march/">
+        <time datetime="2026-03-08T17:00:00Z">Mar 8</time> Dev Diary
+      </a>
+    </body></html>
+    """
+    article_html = _load("article_8_05.html")
+
+    fetched_urls: list[str] = []
+
+    def http_get(url: str) -> str:
+        fetched_urls.append(url)
+        if url == LIST_URL:
+            return list_html
+        if "valorant-patch-notes-8-05" in url:
+            return article_html
+        if "page=" in url:
+            return "<html><body><main></main></body></html>"
+        raise AssertionError(f"unexpected article fetch: {url}")
+
+    connector = PlayValorantPatchNotesConnector(http_get=http_get)
+    payloads = list(connector.fetch(datetime(1970, 1, 1, tzinfo=UTC)))
+
+    # Exactly one article was emitted — the patch notes — and the two
+    # non-patch entries were never even fetched, so they can't pollute
+    # the SCHEMA_DRIFT counter.
+    assert len(payloads) == 1
+    assert "valorant-patch-notes-8-05" in payloads[0]["url"]
+    assert not any("trailer" in url for url in fetched_urls)
+    assert not any("dev-diaries" in url for url in fetched_urls)
+
+
+# --- runner: transient errors during fetch --------------------------------
+
+
+def test_runner_catches_transient_fetch_error_during_iterator_advance() -> None:
+    """A ``TransientFetchError`` raised inside ``connector.fetch`` is counted + skipped.
+
+    Connector ``fetch`` makes its HTTP call in the body that runs
+    *between* yields — i.e. during the runner's ``next(iterator)``
+    call. A network blip on the article-list page (or on an article
+    body) would otherwise escape the runner's post-yield handler and
+    abort the whole pass. The runner now catches there too: the run
+    keeps going, ``transient_errors`` increments, and the next
+    scheduled pass retries naturally because no raw_record was
+    written.
+    """
+    from data_pipeline.patch_notes_runner import (
+        PatchNotesStats,
+        run_patch_notes_ingestion,
+    )
+
+    class _BlippyConnector(PatchNoteConnector):
+        @property
+        def source_name(self) -> str:
+            return "playvalorant"
+
+        @property
+        def cadence(self) -> timedelta:
+            return timedelta(days=7)
+
+        @property
+        def rate_limit(self) -> RateLimit:
+            return RateLimit(capacity=10, refill_per_second=100.0)
+
+        def fetch(self, since: datetime) -> Iterable[dict[str, Any]]:
+            raise SchemaDriftError("this should not run — overridden below")  # pragma: no cover
+
+        def validate(self, raw_payload: dict[str, Any]) -> dict[str, Any]:
+            return raw_payload  # pragma: no cover
+
+        def transform(self, validated_payload: dict[str, Any]) -> Iterable[PatchNoteRecord]:
+            return iter(())  # pragma: no cover
+
+    connector = _BlippyConnector()
+
+    def fetcher(_since: datetime) -> Iterable[dict[str, Any]]:
+        # Mimic the real connector's contract: the HTTP call happens in
+        # the body that runs *before* the next yield. Raising here
+        # therefore lands inside ``next(iterator)`` rather than after a
+        # successful yield.
+        raise TransientFetchError("upstream 503")
+        yield  # type: ignore[unreachable]  # never reached, but keeps this a generator
+
+    connector.fetch = fetcher  # type: ignore[method-assign]
+
+    # ``session=None`` is OK — the transient path bails before any
+    # session writes. Asserting that contract is the test's whole point.
+    stats: PatchNotesStats = run_patch_notes_ingestion(
+        connector,
+        session=None,  # type: ignore[arg-type]
+        since=datetime(1970, 1, 1, tzinfo=UTC),
+    )
+
+    assert stats.transient_errors == 1
+    assert stats.fetched == 0
+    assert stats.upserted == 0
 
 
 # --- integration: idempotent re-run ---------------------------------------
