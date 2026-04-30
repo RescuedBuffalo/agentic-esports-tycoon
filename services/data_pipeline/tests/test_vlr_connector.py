@@ -1,0 +1,546 @@
+"""Tests for the BUF-10 VLR.gg connector.
+
+All tests run without network: a fake ``page_fetcher`` returns canned
+HTML from ``tests/fixtures/vlr/``. The integration test that drives the
+runner end-to-end is gated on ``TEST_DATABASE_URL`` (it inherits the
+``db_session`` fixture from ``conftest.py`` which auto-skips when unset),
+so a fresh clone with no Postgres still produces a green ``uv run pytest``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+from data_pipeline import (
+    IngestionRecord,
+    SchemaDriftError,
+    TokenBucket,
+    TransientFetchError,
+    run_ingestion,
+)
+from data_pipeline.connectors.vlr import (
+    DEFAULT_PAGE_URLS,
+    USER_AGENT,
+    VLR_BASE_URL,
+    VLRConnector,
+    VLRPageRow,
+    VLRParser,
+    _RobotsCache,
+)
+from esports_sim.db.enums import EntityType, Platform
+
+_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "vlr"
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+# --- helpers ---------------------------------------------------------------
+
+
+def _read_fixture(name: str) -> str:
+    """Load a static HTML/text fixture as a UTF-8 string."""
+    return (_FIXTURE_DIR / name).read_text(encoding="utf-8")
+
+
+def _stub_robots(allow_all: bool = True) -> _RobotsCache:
+    """A robots cache that's pre-loaded so it never reaches the network."""
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=lambda _url: "")
+    cache._loaded = True
+    cache._disallows = [] if allow_all else ["/"]
+    return cache
+
+
+def _make_fetcher(mapping: dict[str, str]) -> Callable[[str], str]:
+    """Build a ``page_fetcher`` that returns canned HTML keyed by URL.
+
+    Unknown URLs raise ``KeyError``; the connector wraps any non-
+    ``TransientFetchError`` exception, so a typo in the test surfaces
+    as a clean ``TransientFetchError`` rather than a confusing AttributeError.
+    """
+    return lambda url: mapping[url]
+
+
+def _default_url_mapping() -> dict[str, str]:
+    return {
+        f"{VLR_BASE_URL}/stats": _read_fixture("stats.html"),
+        f"{VLR_BASE_URL}/matches?completed": _read_fixture("matches.html"),
+        f"{VLR_BASE_URL}/rankings": _read_fixture("rankings.html"),
+    }
+
+
+def _build_connector(
+    *,
+    page_urls: tuple[tuple[str, str], ...] | None = None,
+    fetcher: Callable[[str], str] | None = None,
+    robots_cache: _RobotsCache | None = None,
+) -> VLRConnector:
+    return VLRConnector(
+        page_fetcher=fetcher or _make_fetcher(_default_url_mapping()),
+        page_urls=page_urls if page_urls is not None else DEFAULT_PAGE_URLS,
+        robots_cache=robots_cache or _stub_robots(),
+    )
+
+
+# --- metadata --------------------------------------------------------------
+
+
+def test_connector_metadata_matches_buf10_spec() -> None:
+    connector = _build_connector()
+    assert connector.source_name == "vlr"
+    assert connector.platform is Platform.VLR
+    assert connector.entity_types == (EntityType.PLAYER, EntityType.TEAM, EntityType.TOURNAMENT)
+    assert connector.cadence == timedelta(days=1)
+    rate = connector.rate_limit
+    assert rate.capacity == 1
+    # 20 req/min = 1/3 req/sec; allow tiny float epsilon.
+    assert abs(rate.refill_per_second - (20.0 / 60.0)) < 1e-9
+
+
+def test_user_agent_identifies_project_and_contact() -> None:
+    """BUF-10 spec: UA must name the project + a contact email."""
+    assert "agentic-esports-tycoon-data-pipeline" in USER_AGENT
+    assert "@" in USER_AGENT  # contact email present
+
+
+# --- parser ----------------------------------------------------------------
+
+
+def test_parser_stats_yields_player_rows_with_stable_vlr_ids() -> None:
+    parser = VLRParser()
+    rows = list(parser.parse_stats(_read_fixture("stats.html")))
+
+    # Three players + the team links also appear, but parse_stats only
+    # follows /player/ anchors.
+    player_rows = [row for row in rows if row.entity_type is EntityType.PLAYER]
+    assert len(player_rows) == 3
+    assert {row.vlr_id for row in player_rows} == {"9", "2329", "729"}
+    assert {row.display_name for row in player_rows} == {"TenZ", "aspas", "Zekken"}
+    # vlr_id must be the numeric id, not the slug — the resolver keys on it.
+    for row in player_rows:
+        assert row.vlr_id.isdigit(), f"expected numeric vlr_id, got {row.vlr_id!r}"
+
+
+def test_parser_matches_yields_team_rows_with_match_metadata() -> None:
+    parser = VLRParser()
+    rows = list(parser.parse_matches(_read_fixture("matches.html")))
+
+    # Six team anchors total (three matches x two teams each).
+    assert len(rows) == 6
+    assert all(row.entity_type is EntityType.TEAM for row in rows)
+    # Match metadata rides on extra (no EntityType.MATCH yet — see ticket).
+    assert all("match_id" in row.extra for row in rows)
+    assert {row.extra["match_id"] for row in rows} == {"m-300001", "m-300002", "m-300003"}
+    # Per-row timestamps parsed for the since-filter.
+    assert all(row.timestamp is not None for row in rows)
+
+
+def test_parser_rankings_yields_team_and_tournament_rows() -> None:
+    parser = VLRParser()
+    rows = list(parser.parse_rankings(_read_fixture("rankings.html")))
+
+    teams = [row for row in rows if row.entity_type is EntityType.TEAM]
+    tournaments = [row for row in rows if row.entity_type is EntityType.TOURNAMENT]
+
+    assert len(teams) == 3
+    assert len(tournaments) == 1
+    assert tournaments[0].vlr_id == "2097"
+    assert tournaments[0].display_name == "VCT 2026 Americas Stage 1"
+
+
+def test_parser_unknown_page_type_raises_drift() -> None:
+    parser = VLRParser()
+    with pytest.raises(SchemaDriftError, match="unknown VLR page_type"):
+        list(parser.parse("matchups", "<html></html>"))
+
+
+# --- transform -------------------------------------------------------------
+
+
+def test_transform_yields_well_formed_records_per_entity_type() -> None:
+    """Each row should round-trip into an IngestionRecord without losing identity."""
+    connector = _build_connector()
+    payloads = list(connector.fetch(_EPOCH))
+
+    # Build one combined record list across all three pages.
+    all_records: list[IngestionRecord] = []
+    for payload in payloads:
+        validated = connector.validate(payload)
+        all_records.extend(connector.transform(validated))
+
+    # We expect at least one of each entity type the connector advertises.
+    seen_types = {record.entity_type for record in all_records}
+    assert seen_types == {EntityType.PLAYER, EntityType.TEAM, EntityType.TOURNAMENT}
+
+    # platform_id is the VLR-stable numeric id, never a display name.
+    for record in all_records:
+        assert record.platform_id, "platform_id must be non-empty"
+        assert not record.platform_id.isspace()
+        # All seeded ids in the fixtures are numeric.
+        assert record.platform_id.isdigit()
+        # platform_name is the free-form display string.
+        assert record.platform_name
+        # Payload preserves the row blob for replay.
+        assert record.payload["vlr_id"] == record.platform_id
+
+
+def test_transform_uses_numeric_id_not_slug_or_display_name() -> None:
+    """Resolver-idempotence anchor: same vlr_id across casing variants."""
+    connector = _build_connector(
+        page_urls=(("stats", f"{VLR_BASE_URL}/stats"),),
+        fetcher=_make_fetcher({f"{VLR_BASE_URL}/stats": _read_fixture("stats_renamed_tenz.html")}),
+    )
+    payloads = list(connector.fetch(_EPOCH))
+    records = list(connector.transform(connector.validate(payloads[0])))
+    assert len(records) == 1
+    assert records[0].platform_id == "9"
+    # Display name reflects the upstream rename, but the id is stable.
+    assert records[0].platform_name == "tenz"
+
+
+# --- validate --------------------------------------------------------------
+
+
+def test_validate_passes_well_formed_payload() -> None:
+    connector = _build_connector()
+    payload = next(iter(connector.fetch(_EPOCH)))
+    # Should not raise.
+    out = connector.validate(payload)
+    assert out is payload
+
+
+def test_validate_raises_drift_on_missing_top_level_key() -> None:
+    connector = _build_connector()
+    bad: dict[str, Any] = {"page_type": "stats", "url": f"{VLR_BASE_URL}/stats"}
+    # Missing ``rows``.
+    with pytest.raises(SchemaDriftError, match="missing required key: 'rows'"):
+        connector.validate(bad)
+
+
+def test_validate_raises_drift_on_unknown_page_type() -> None:
+    connector = _build_connector()
+    with pytest.raises(SchemaDriftError, match="unknown page_type"):
+        connector.validate(
+            {
+                "page_type": "rosters",  # not a page we ship
+                "url": f"{VLR_BASE_URL}/rosters",
+                "rows": [],
+            }
+        )
+
+
+def test_validate_raises_drift_on_row_missing_required_field() -> None:
+    connector = _build_connector()
+    with pytest.raises(SchemaDriftError, match="missing required key: 'vlr_id'"):
+        connector.validate(
+            {
+                "page_type": "stats",
+                "url": f"{VLR_BASE_URL}/stats",
+                "rows": [{"entity_type": "player", "display_name": "X"}],
+            }
+        )
+
+
+def test_validate_raises_drift_on_non_dict_payload() -> None:
+    connector = _build_connector()
+    with pytest.raises(SchemaDriftError, match="must be dict"):
+        connector.validate(["not", "a", "dict"])  # type: ignore[arg-type]
+
+
+def test_validate_raises_drift_on_non_list_rows() -> None:
+    connector = _build_connector()
+    with pytest.raises(SchemaDriftError, match="'rows' must be list"):
+        connector.validate(
+            {
+                "page_type": "stats",
+                "url": f"{VLR_BASE_URL}/stats",
+                "rows": "should be a list",
+            }
+        )
+
+
+# --- since filter ----------------------------------------------------------
+
+
+def test_since_filter_excludes_older_match_rows() -> None:
+    """``matches.html`` has rows from 2025-12 and 2026-04. since=2026-01-01
+    must drop the 2025 ones; the 2026 ones must pass through."""
+    connector = _build_connector(
+        page_urls=(("matches", f"{VLR_BASE_URL}/matches?completed"),),
+        fetcher=_make_fetcher(
+            {f"{VLR_BASE_URL}/matches?completed": _read_fixture("matches.html")}
+        ),
+    )
+    since = datetime(2026, 1, 1, tzinfo=UTC)
+    payloads = list(connector.fetch(since))
+    records = list(connector.transform(connector.validate(payloads[0])))
+
+    # Six anchors total in the fixture, two from 2025-12 (Paper Rex + DRX)
+    # and four from 2026-04. Filter must drop exactly two.
+    assert len(records) == 4
+    assert "2593" not in {r.platform_id for r in records}  # Paper Rex
+    assert "8877" not in {r.platform_id for r in records}  # DRX
+
+
+def test_since_filter_passes_rows_without_timestamps() -> None:
+    """``/rankings`` rows have no per-row timestamp; spec says current state."""
+    connector = _build_connector(
+        page_urls=(("rankings", f"{VLR_BASE_URL}/rankings"),),
+        fetcher=_make_fetcher({f"{VLR_BASE_URL}/rankings": _read_fixture("rankings.html")}),
+    )
+    far_future = datetime(2099, 1, 1, tzinfo=UTC)
+    payloads = list(connector.fetch(far_future))
+    records = list(connector.transform(connector.validate(payloads[0])))
+    # Even with a since in the year 2099, ranking rows pass because
+    # they have no timestamp.
+    assert len(records) > 0
+
+
+# --- fetch + rate limiter --------------------------------------------------
+
+
+class _FakeClock:
+    """Same shape as the rate-limiter test's FakeClock — keeps the contract clear."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        if seconds > 0:
+            self.now += seconds
+
+
+def test_fetch_uses_injected_page_fetcher() -> None:
+    """No real HTTP — the injected callable is the only thing that runs."""
+    seen_urls: list[str] = []
+
+    def recording_fetch(url: str) -> str:
+        seen_urls.append(url)
+        return _default_url_mapping()[url]
+
+    connector = _build_connector(fetcher=recording_fetch)
+    payloads = list(connector.fetch(_EPOCH))
+
+    assert seen_urls == [
+        f"{VLR_BASE_URL}/stats",
+        f"{VLR_BASE_URL}/matches?completed",
+        f"{VLR_BASE_URL}/rankings",
+    ]
+    assert [payload["page_type"] for payload in payloads] == ["stats", "matches", "rankings"]
+
+
+def test_rate_limiter_paces_fetch_with_fake_clock() -> None:
+    """Drive ``fetch`` through the runner-side rate limiter, no real sleep.
+
+    With ``capacity=1`` and ``refill=20/60`` (one token per 3 seconds),
+    three sequential acquires must advance the fake clock by at least
+    ``2 * 3.0`` seconds: the first is free, the next two each wait one
+    refill interval. The runner adds a fourth acquire on EOS, but
+    that's a wall-clock no-op once we measure right after the third.
+    """
+    clock = _FakeClock()
+    bucket = TokenBucket(
+        capacity=1,
+        refill_per_second=20.0 / 60.0,
+        clock=clock.time,
+        sleeper=clock.sleep,
+    )
+    connector = _build_connector()
+
+    iterator = iter(connector.fetch(_EPOCH))
+    bucket.acquire()
+    next(iterator)  # /stats
+    assert clock.now == 0.0  # first acquire was free
+
+    bucket.acquire()
+    next(iterator)  # /matches
+    bucket.acquire()
+    next(iterator)  # /rankings
+
+    expected_floor = 2 * 3.0  # two waits at 3s each
+    assert clock.now >= expected_floor - 1e-9
+    # And we shouldn't have over-slept by more than one tick's worth.
+    assert clock.now <= expected_floor + 3.0 + 1e-9
+
+
+def test_fetch_raises_transient_error_when_underlying_fetcher_raises() -> None:
+    """Wrap-and-rethrow contract: arbitrary exceptions surface as transient."""
+
+    def boom(url: str) -> str:
+        raise RuntimeError("upstream timeout simulated")
+
+    connector = _build_connector(fetcher=boom)
+    with pytest.raises(TransientFetchError, match="upstream timeout simulated"):
+        list(connector.fetch(_EPOCH))
+
+
+def test_fetch_propagates_transient_error_unwrapped() -> None:
+    """An explicit TransientFetchError must not be re-wrapped."""
+
+    def flaky(url: str) -> str:
+        raise TransientFetchError("503 from VLR")
+
+    connector = _build_connector(fetcher=flaky)
+    with pytest.raises(TransientFetchError, match="503 from VLR"):
+        list(connector.fetch(_EPOCH))
+
+
+# --- robots.txt ------------------------------------------------------------
+
+
+def test_robots_disallow_blocks_page_url() -> None:
+    """A disallow that matches our path must skip that URL."""
+
+    def fetcher_with_robots(_url: str) -> str:
+        # Block the rankings page specifically.
+        return "User-agent: *\nDisallow: /rankings\n"
+
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=fetcher_with_robots)
+    assert cache.allows(f"{VLR_BASE_URL}/stats") is True
+    assert cache.allows(f"{VLR_BASE_URL}/rankings") is False
+
+
+def test_robots_failure_falls_through_to_allow() -> None:
+    """A robots fetch that raises must not abort the crawl."""
+
+    def fetcher_500(_url: str) -> str:
+        raise RuntimeError("upstream 500")
+
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=fetcher_500)
+    assert cache.allows(f"{VLR_BASE_URL}/stats") is True
+
+
+def test_fetch_skips_disallowed_pages() -> None:
+    """End-to-end: a disallowed page yields zero payloads for that URL."""
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=lambda _u: "")
+    cache._loaded = True
+    cache._disallows = ["/rankings"]
+
+    connector = _build_connector(robots_cache=cache)
+    payloads = list(connector.fetch(_EPOCH))
+    page_types = {payload["page_type"] for payload in payloads}
+    assert "rankings" not in page_types
+    assert page_types == {"stats", "matches"}
+
+
+# --- VLRPageRow round-trip --------------------------------------------------
+
+
+def test_vlr_page_row_to_payload_is_json_safe() -> None:
+    """Payload lands on raw_record.payload — must be JSON-safe."""
+    import json
+
+    row = VLRPageRow(
+        entity_type=EntityType.PLAYER,
+        vlr_id="9",
+        display_name="TenZ",
+        profile_url="https://www.vlr.gg/player/9/tenz",
+        timestamp=datetime(2026, 4, 25, 18, 30, tzinfo=UTC),
+        extra={"slug": "tenz"},
+    )
+    payload = row.to_payload()
+    encoded = json.dumps(payload)  # must not raise
+    decoded = json.loads(encoded)
+    assert decoded["vlr_id"] == "9"
+    assert decoded["entity_type"] == "player"
+    assert decoded["timestamp"] == "2026-04-25T18:30:00+00:00"
+
+
+# --- integration: drive through run_ingestion ------------------------------
+
+
+@pytest.mark.integration
+def test_run_ingestion_with_vlr_connector(db_session: Any) -> None:
+    """End-to-end: connector + runner + real schema.
+
+    Skipped automatically when ``TEST_DATABASE_URL`` is unset (the
+    ``db_session`` fixture in conftest.py handles the skip). When a DB
+    is wired up, this verifies staging rows land with the correct
+    ``source``, ``entity_type``, and a non-null ``canonical_id`` for
+    every record we expect to AUTO_MERGE/CREATE.
+    """
+    from esports_sim.db.models import StagingRecord
+    from sqlalchemy import select
+
+    connector = _build_connector()
+    # The connector's default rate_limit (1 token / 3 seconds) would
+    # serialise the three page fetches behind real waits if the runner
+    # auto-built its bucket. Inject a permissive limiter so the
+    # integration test runs in milliseconds, mirroring the BUF-9
+    # ``test_runner_consults_rate_limiter_per_record`` pattern.
+    bucket = TokenBucket(capacity=100, refill_per_second=1000.0)
+
+    stats = run_ingestion(connector, session=db_session, since=_EPOCH, rate_limiter=bucket)
+
+    # Three pages were fetched. The fixtures yield, after dedup of
+    # cross-page team repeats:
+    #   - 3 players (stats)
+    #   - 6 teams from /matches (4 after since=epoch passes them all)
+    #   - 3 teams + 1 tournament from /rankings
+    # The runner doesn't dedup across pages by content_hash because each
+    # whole page payload hashes uniquely; the resolver dedups at the
+    # alias level, so repeated team ids across pages produce one alias
+    # row but two staging rows (one per page). Check the floors.
+    assert stats.fetched == 3
+    assert stats.processed > 0
+    assert stats.schema_drifts == 0
+
+    rows = db_session.execute(select(StagingRecord)).scalars().all()
+    assert all(row.source == "vlr" for row in rows)
+    seen_types = {row.entity_type for row in rows}
+    assert seen_types == {EntityType.PLAYER, EntityType.TEAM, EntityType.TOURNAMENT}
+
+
+@pytest.mark.integration
+def test_tenz_to_tenz_rename_does_not_split_canonical(db_session: Any) -> None:
+    """BUF-10 acceptance: 'TenZ' -> 'tenz' must reuse the same canonical_id.
+
+    Two passes: the first seeds an alias under VLR id ``9`` with the
+    canonical-cased "TenZ"; the second hits the same id with display
+    "tenz". Because we key on the *id* (not the name), the resolver's
+    exact-alias lookup catches it as MATCHED and returns the existing
+    canonical_id.
+    """
+    from esports_sim.db.models import EntityAlias
+    from sqlalchemy import select
+
+    bucket = TokenBucket(capacity=100, refill_per_second=1000.0)
+    only_stats = (("stats", f"{VLR_BASE_URL}/stats"),)
+
+    pass_one = _build_connector(
+        page_urls=only_stats,
+        fetcher=_make_fetcher({f"{VLR_BASE_URL}/stats": _read_fixture("stats.html")}),
+    )
+    run_ingestion(pass_one, session=db_session, since=_EPOCH, rate_limiter=bucket)
+
+    aliases_after_pass_one = db_session.execute(
+        select(EntityAlias).where(
+            EntityAlias.platform == Platform.VLR, EntityAlias.platform_id == "9"
+        )
+    ).scalars().all()
+    assert len(aliases_after_pass_one) == 1
+    canonical_before = aliases_after_pass_one[0].canonical_id
+
+    pass_two = _build_connector(
+        page_urls=only_stats,
+        fetcher=_make_fetcher(
+            {f"{VLR_BASE_URL}/stats": _read_fixture("stats_renamed_tenz.html")}
+        ),
+    )
+    run_ingestion(pass_two, session=db_session, since=_EPOCH, rate_limiter=bucket)
+
+    aliases_after_pass_two = db_session.execute(
+        select(EntityAlias).where(
+            EntityAlias.platform == Platform.VLR, EntityAlias.platform_id == "9"
+        )
+    ).scalars().all()
+    # Still exactly one alias; same canonical. The rename does not split
+    # the entity.
+    assert len(aliases_after_pass_two) == 1
+    assert aliases_after_pass_two[0].canonical_id == canonical_before
