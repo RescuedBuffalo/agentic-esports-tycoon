@@ -51,6 +51,7 @@ Out of scope:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 from typing import Any
@@ -62,6 +63,12 @@ from sqlalchemy.orm import Session
 
 from data_pipeline.connector import Connector, IngestionRecord, RateLimit
 from data_pipeline.errors import SchemaDriftError, TransientFetchError
+
+# Structured-logging surface for fetch-time failures the runner can't
+# see (see ``_safe_fetch``). The runner's ``IngestionStats`` only
+# counts errors raised post-yield; logging here is the per-record
+# visibility a maintainer needs when one slug fails out of a hundred.
+_logger = logging.getLogger("data_pipeline.liquipedia")
 
 # Type alias for the injectable HTTP client. Tests pass a callable that
 # returns a canned dict; production wires the default factory below
@@ -114,15 +121,11 @@ def _default_http_get_factory() -> HttpGet:
             # log + skip and the next scheduled pass retries.
             raise TransientFetchError(f"liquipedia fetch failed: {exc}") from exc
         if response.status_code >= 500:
-            raise TransientFetchError(
-                f"liquipedia 5xx: {response.status_code} for {url}"
-            )
+            raise TransientFetchError(f"liquipedia 5xx: {response.status_code} for {url}")
         if response.status_code >= 400:
             # 4xx is a permanent miss — let it surface as a connector
             # error rather than masquerading as transient.
-            raise RuntimeError(
-                f"liquipedia {response.status_code} for {url}: {response.text!r}"
-            )
+            raise RuntimeError(f"liquipedia {response.status_code} for {url}: {response.text!r}")
         try:
             payload = response.json()
         except ValueError as exc:
@@ -199,47 +202,127 @@ class LiquipediaConnector(Connector):
         payload carries a ``record_type`` discriminator and an inline
         ``data`` blob; ``transform`` switches on the discriminator to
         decide which :class:`IngestionRecord`s to emit.
+
+        Per-slug HTTP failures (``TransientFetchError`` from a 5xx, an
+        ``httpx.HTTPError`` from a timeout, a list-endpoint envelope
+        drift) are caught here and **logged + skipped** rather than
+        propagated. ``run_ingestion`` only catches errors raised inside
+        ``validate``/``transform`` — anything thrown during iterator
+        advancement (i.e. during the next ``self._http_get`` call before
+        ``yield``) would abort the whole pass and skip every remaining
+        slug. Catching here keeps one rate-limited / timeout / drifted
+        endpoint from taking down the rest of the weekly run.
         """
         for slug in self._player_slugs:
-            yield {
-                "record_type": "player",
-                "slug": slug,
-                "data": self._http_get(f"{self._base_url}/player/{slug}"),
-            }
+            data = self._safe_fetch(
+                f"{self._base_url}/player/{slug}",
+                record_type="player",
+                identifier=slug,
+            )
+            if data is not None:
+                yield {"record_type": "player", "slug": slug, "data": data}
         for slug in self._team_slugs:
-            yield {
-                "record_type": "team",
-                "slug": slug,
-                "data": self._http_get(f"{self._base_url}/team/{slug}"),
-            }
+            data = self._safe_fetch(
+                f"{self._base_url}/team/{slug}",
+                record_type="team",
+                identifier=slug,
+            )
+            if data is not None:
+                yield {"record_type": "team", "slug": slug, "data": data}
         for slug in self._coach_slugs:
-            yield {
-                "record_type": "coach",
-                "slug": slug,
-                "data": self._http_get(f"{self._base_url}/coach/{slug}"),
-            }
+            data = self._safe_fetch(
+                f"{self._base_url}/coach/{slug}",
+                record_type="coach",
+                identifier=slug,
+            )
+            if data is not None:
+                yield {"record_type": "coach", "slug": slug, "data": data}
         if self._include_tournaments:
-            tournaments = self._http_get(f"{self._base_url}/tournaments")
-            # Tournaments may come back as a list-of-dicts or a dict with
-            # ``items``. Normalise to a list and yield one payload per
-            # entry — the resolver only sees one tournament per record.
-            for tournament in _iter_list(tournaments):
-                yield {
-                    "record_type": "tournament",
-                    "slug": tournament.get("slug", ""),
-                    "data": tournament,
-                }
+            tournaments = self._safe_fetch(
+                f"{self._base_url}/tournaments",
+                record_type="tournaments_envelope",
+                identifier="all",
+            )
+            if tournaments is not None:
+                yield from self._yield_envelope_items(
+                    tournaments, record_type="tournament", id_key="slug"
+                )
         if self._include_transfers:
             since_iso = since.date().isoformat()
-            transfers = self._http_get(
-                f"{self._base_url}/transfers?date_gte={since_iso}"
+            transfers = self._safe_fetch(
+                f"{self._base_url}/transfers?date_gte={since_iso}",
+                record_type="transfers_envelope",
+                identifier=since_iso,
             )
-            for transfer in _iter_list(transfers):
-                yield {
-                    "record_type": "transfer",
-                    "id": transfer.get("id", ""),
-                    "data": transfer,
-                }
+            if transfers is not None:
+                yield from self._yield_envelope_items(
+                    transfers, record_type="transfer", id_key="id"
+                )
+
+    def _safe_fetch(self, url: str, *, record_type: str, identifier: str) -> Any | None:
+        """Run one ``http_get`` and absorb the per-record failure modes.
+
+        Returns ``None`` when the call fails for any reason; the caller
+        treats ``None`` as "skip this record". Failures are logged with
+        enough context (record_type + identifier + url + error class)
+        for a postmortem; production wiring forwards this logger to
+        structured output via the standard ``logging`` config.
+        """
+        try:
+            return self._http_get(url)
+        except TransientFetchError as exc:
+            _logger.warning(
+                "liquipedia.transient_fetch_error url=%s record_type=%s id=%s detail=%s",
+                url,
+                record_type,
+                identifier,
+                exc,
+            )
+            return None
+        except Exception as exc:
+            # Anything else is a genuine connector/HTTP failure. We still
+            # log + skip rather than abort — the runner's post-yield
+            # error handling can't see this code path, and one bad slug
+            # shouldn't cancel the next 99.
+            _logger.warning(
+                "liquipedia.connector_error url=%s record_type=%s id=%s error=%s detail=%s",
+                url,
+                record_type,
+                identifier,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def _yield_envelope_items(
+        self,
+        envelope: Any,
+        *,
+        record_type: str,
+        id_key: str,
+    ) -> Iterable[dict[str, Any]]:
+        """Iterate a list endpoint, surfacing envelope drift cleanly.
+
+        ``_iter_list`` raises :class:`SchemaDriftError` for envelope
+        shapes other than ``list`` or ``{"items": [...]}``; we catch and
+        log here so the unknown shape is observable but the rest of the
+        pass keeps running.
+        """
+        try:
+            items = list(_iter_list(envelope))
+        except SchemaDriftError as exc:
+            _logger.warning(
+                "liquipedia.envelope_drift record_type=%s detail=%s",
+                record_type,
+                exc,
+            )
+            return
+        for item in items:
+            yield {
+                "record_type": record_type,
+                id_key: item.get(id_key, ""),
+                "data": item,
+            }
 
     def validate(self, raw_payload: dict[str, Any]) -> dict[str, Any]:
         """Shape check by ``record_type``. Raise :class:`SchemaDriftError` on miss.
@@ -263,8 +346,7 @@ class LiquipediaConnector(Connector):
         missing = required - data.keys()
         if missing:
             raise SchemaDriftError(
-                f"liquipedia {record_type} payload missing required keys: "
-                f"{sorted(missing)!r}"
+                f"liquipedia {record_type} payload missing required keys: " f"{sorted(missing)!r}"
             )
         return raw_payload
 
@@ -429,10 +511,14 @@ def _iter_list(value: Any) -> Iterable[dict[str, Any]]:
 
     Liquipedia list endpoints are not perfectly consistent: tournaments
     sometimes ship as a bare array, transfers as ``{"items": [...]}``.
-    Centralising the shape-tolerance keeps ``fetch`` linear and avoids
-    SchemaDriftError firing on a benign envelope difference. Anything
-    that doesn't fit either shape is dropped silently — the per-item
-    ``validate`` will catch entries with missing keys downstream.
+    Centralising the shape-tolerance keeps ``fetch`` linear.
+
+    Anything that doesn't fit either shape (e.g. Liquipedia silently
+    re-wraps as ``{"results": [...]}``) raises
+    :class:`SchemaDriftError` so the connector can log a structured
+    drift event rather than dropping the whole list silently. The
+    caller in ``fetch`` catches and downgrades to a per-endpoint skip
+    so the run keeps going.
     """
     if isinstance(value, list):
         for item in value:
@@ -445,6 +531,13 @@ def _iter_list(value: Any) -> Iterable[dict[str, Any]]:
             for item in items:
                 if isinstance(item, dict):
                     yield item
+            return
+        raise SchemaDriftError(
+            f"liquipedia list envelope missing 'items' (top-level keys: {sorted(value.keys())!r})"
+        )
+    raise SchemaDriftError(
+        f"liquipedia list envelope must be list or {{'items': [...]}}, got {type(value).__name__}"
+    )
 
 
 # Lookup table for ``validate``. Module-level so tests can import the

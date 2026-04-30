@@ -140,6 +140,89 @@ def test_fetch_uses_since_in_transfer_query() -> None:
     assert "date_gte=2026-01-01" in transfer_calls[0]
 
 
+def test_fetch_skips_one_failed_slug_and_continues_to_the_rest() -> None:
+    """One ``TransientFetchError`` mid-fetch must not abort the run.
+
+    The runner's per-record error handling only fires inside
+    ``validate``/``transform``; a failure raised during iterator
+    advancement (i.e. the ``http_get`` call before the next ``yield``)
+    propagates and skips every remaining slug. The connector now
+    catches and downgrades to "log + skip" so the rest of the pass
+    still completes.
+    """
+
+    def _get(url: str) -> Any:
+        if "/player/broken" in url:
+            raise TransientFetchError("upstream 502")
+        if "/player/tenz" in url:
+            return _load("player.json")
+        if "/transfers" in url:
+            return {"items": []}
+        if "/tournaments" in url:
+            return []
+        return {}
+
+    conn = LiquipediaConnector(
+        player_slugs=["broken", "tenz"],
+        http_get=_get,
+    )
+    payloads = list(conn.fetch(_EPOCH))
+    record_types = [p["record_type"] for p in payloads]
+
+    # ``broken`` was skipped; ``tenz`` still flowed through.
+    assert "player" in record_types
+    assert sum(1 for rt in record_types if rt == "player") == 1
+
+
+def test_fetch_skips_envelope_drift_without_aborting_run() -> None:
+    """An unknown list-envelope shape downgrades to a per-endpoint skip.
+
+    When Liquipedia changes a tournaments envelope from ``[...]`` to,
+    say, ``{"results": [...]}``, ``_iter_list`` raises
+    :class:`SchemaDriftError`. The connector logs that as envelope
+    drift and skips just that endpoint — the per-slug pulls and the
+    transfer envelope still complete.
+    """
+
+    def _get(url: str) -> Any:
+        if "/tournaments" in url:
+            # Drifted envelope: not list, not {"items": [...]}
+            return {"results": [{"slug": "ignored", "name": "ignored"}]}
+        if "/transfers" in url:
+            return {"items": []}
+        if "/player/tenz" in url:
+            return _load("player.json")
+        return {}
+
+    conn = LiquipediaConnector(
+        player_slugs=["tenz"],
+        http_get=_get,
+    )
+    payloads = list(conn.fetch(_EPOCH))
+    record_types = [p["record_type"] for p in payloads]
+
+    # Tournament envelope drifted -> 0 tournament payloads.
+    # Player still flows; transfers envelope is well-formed (empty).
+    assert record_types.count("tournament") == 0
+    assert record_types.count("player") == 1
+
+
+def test_iter_list_raises_schema_drift_on_unknown_envelope() -> None:
+    """``_iter_list`` is the canonical envelope-shape gate.
+
+    Two drifted shapes the regression test covers:
+
+    * a dict without ``items`` (e.g. Liquipedia rewraps as ``results``);
+    * a non-list, non-dict scalar.
+    """
+    from data_pipeline.connectors.liquipedia import _iter_list
+
+    with pytest.raises(SchemaDriftError):
+        list(_iter_list({"results": [{"slug": "x"}]}))
+    with pytest.raises(SchemaDriftError):
+        list(_iter_list("not a list"))
+
+
 # --- validate -------------------------------------------------------------
 
 
@@ -451,9 +534,7 @@ def test_rebrand_reuses_canonical_id_and_does_not_create_new_entity(db_session) 
     assert seed_canonical is not None
     db_session.flush()
 
-    entity_count_before = db_session.execute(
-        select(func.count()).select_from(Entity)
-    ).scalar_one()
+    entity_count_before = db_session.execute(select(func.count()).select_from(Entity)).scalar_one()
 
     # Pre-flight: the helper finds the existing alias for the previous slug.
     found = _extend_alias_for_rebrand(
@@ -480,9 +561,7 @@ def test_rebrand_reuses_canonical_id_and_does_not_create_new_entity(db_session) 
     assert stats.by_status.get("matched") == 1
 
     # 3. Same canonical_id reused; entity table did not grow.
-    entity_count_after = db_session.execute(
-        select(func.count()).select_from(Entity)
-    ).scalar_one()
+    entity_count_after = db_session.execute(select(func.count()).select_from(Entity)).scalar_one()
     assert entity_count_after == entity_count_before
 
     # The alias under (LIQUIPEDIA, sentinels) still maps to the original
