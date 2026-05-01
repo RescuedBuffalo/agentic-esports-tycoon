@@ -247,6 +247,46 @@ def test_validate_treats_naive_datetime_as_drift_rather_than_typeerror() -> None
         connector.validate({"url": "https://playvalorant.com/x", "html": html})
 
 
+def test_fetch_list_page_transient_propagates_rather_than_skipping_ahead() -> None:
+    """A transient on a list page must NOT be skipped to the next page.
+
+    The feed is reverse-chronological: a page-1 blip followed by a
+    healthy page-2 (whose articles are older than ``since``) would
+    silently early-stop the pass via the no-new-cards branch and drop
+    every newer article that lived on page 1. Re-raising lets the
+    runner count it and the next scheduled pass retries from page 1.
+    """
+    article_html = _load("article_8_05.html")
+    page_2_html = """
+    <html><body>
+      <a href="/en-us/news/game-updates/valorant-patch-notes-7-12/">
+        <time datetime="2024-01-09T17:00:00Z">Jan 9</time> Patch 7.12
+      </a>
+    </body></html>
+    """
+
+    def http_get(url: str) -> str:
+        if url == LIST_URL:
+            # Page 1 is having a Cloudflare moment.
+            raise TransientFetchError("503 on list page 1")
+        if "page=2" in url:
+            return page_2_html
+        if "valorant-patch-notes" in url:
+            return article_html
+        raise AssertionError(f"unexpected fetch: {url}")
+
+    connector = PlayValorantPatchNotesConnector(http_get=http_get)
+    since = datetime(2025, 6, 1, tzinfo=UTC)
+
+    # The transient propagates — the runner's post-yield handler will
+    # count it and retry next pass. The previous behaviour silently
+    # advanced to page 2, found everything older than ``since``, and
+    # returned cleanly with zero payloads — turning a transient edge
+    # blip into a permanent data gap.
+    with pytest.raises(TransientFetchError, match="503"):
+        list(connector.fetch(since))
+
+
 def test_fetch_skips_one_transient_article_and_continues_to_the_rest() -> None:
     """A transient failure on one article must not truncate the rest of the pass.
 

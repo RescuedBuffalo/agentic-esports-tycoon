@@ -160,34 +160,38 @@ class PlayValorantPatchNotesConnector(PatchNoteConnector):
         list is reverse-chronological; once we've passed ``since`` the
         rest of the archive is older still.
 
-        Per-article and per-list-page transient failures are caught
-        and skipped *here*, inside the generator body. A naïve "raise
-        and let the runner catch it" doesn't work for generators:
-        Python closes a generator the moment it raises an unhandled
-        exception, so subsequent ``next()`` calls return
-        ``StopIteration`` rather than continuing where we left off.
-        That meant one bad article aborted the whole pass and silently
-        skipped every later card. Catching here keeps the generator
-        live; the runner still sees structured ``transient_errors``
-        events because the connector logs them via
-        ``data_pipeline.connectors.playvalorant``.
+        Per-article transient failures are absorbed inside the
+        generator (log + skip + continue): we know exactly what we
+        missed (one article body) and the rest of the page's articles
+        are still discoverable from the same already-loaded list HTML.
+        Generator-close semantics make a "raise and let the runner
+        catch it" approach truncate the rest of the pass, so per-
+        article skipping has to happen here.
+
+        Per-list-page transient failures **propagate**. Skipping a
+        failed list page and continuing to the next was tempting but
+        wrong: the feed is reverse-chronological, so a transient blip
+        on page 1 followed by a healthy page 2 (whose articles are
+        already older than ``since``) would trigger the early-stop
+        below and silently drop every newer article that lived on the
+        failed page. We re-raise instead so the runner increments
+        ``transient_errors`` and the next scheduled pass retries from
+        page 1 — the only safe outcome when we can't tell whether
+        we've crossed the ``since`` watermark yet.
         """
         for page in range(1, self._max_list_pages + 1):
             page_url = self._list_url if page == 1 else f"{self._list_url}?page={page}"
             try:
                 list_html = self._http_get(page_url)
-            except TransientFetchError as exc:
-                # A transient failure on the list page means we don't
-                # know what articles live on this page. We log + skip
-                # to the next page rather than abort: the next page
-                # may succeed (Cloudflare hiccups are often per-edge),
-                # and even if it doesn't, ``return``-ing here would
-                # close the generator and skip *every* later page too.
+            except TransientFetchError:
+                # See docstring: skip-ahead would silently drop newer
+                # articles when a healthy older page early-stops the
+                # pass. Re-raise so the runner counts + retries.
                 _logger.warning(
                     "playvalorant.list_page_transient_error",
-                    extra={"page_url": page_url, "detail": str(exc)},
+                    extra={"page_url": page_url},
                 )
-                continue
+                raise
             except Exception as exc:  # pragma: no cover - safety net
                 # Anything else is fatal-by-default; wrap the URL in for
                 # operator context.
