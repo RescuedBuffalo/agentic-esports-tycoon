@@ -223,6 +223,44 @@ def test_iter_list_raises_schema_drift_on_unknown_envelope() -> None:
         list(_iter_list("not a list"))
 
 
+def test_iter_list_raises_schema_drift_on_non_dict_entries() -> None:
+    """A list with a non-dict element is drift, not silently filtered.
+
+    Round 4 used ``if isinstance(item, dict): yield item`` which dropped
+    unknown shapes without any ``SchemaDriftError`` — partial data loss
+    with no observable signal. The fix raises so the upstream change is
+    visible on the SCHEMA_DRIFT path.
+    """
+    from data_pipeline.connectors.liquipedia import _iter_list
+
+    # Bare list with one non-dict entry.
+    with pytest.raises(SchemaDriftError, match="must be dict"):
+        list(_iter_list([{"slug": "ok"}, "free-form-tag", {"slug": "also-ok"}]))
+
+    # ``items`` envelope with a non-dict entry.
+    with pytest.raises(SchemaDriftError, match="must be dict"):
+        list(_iter_list({"items": [{"slug": "ok"}, 42]}))
+
+
+def test_safe_fetch_propagates_non_transient_errors() -> None:
+    """A 4xx (or any non-transient) failure must fail the run loudly.
+
+    Round 1 caught every ``Exception`` and turned it into a per-record
+    skip; that masked permanent failures (401/403/404 from the default
+    factory's ``RuntimeError``) and let the run finish with no ingested
+    data. The fix narrows the catch to ``TransientFetchError``;
+    everything else propagates so the runner's ``CONNECTOR_ERROR`` path
+    surfaces the real failure.
+    """
+
+    def _bad_get(url: str) -> Any:
+        raise RuntimeError(f"liquipedia 401 Unauthorized for {url}")
+
+    conn = LiquipediaConnector(player_slugs=["tenz"], http_get=_bad_get)
+    with pytest.raises(RuntimeError, match="401"):
+        list(conn.fetch(_EPOCH))
+
+
 # --- validate -------------------------------------------------------------
 
 

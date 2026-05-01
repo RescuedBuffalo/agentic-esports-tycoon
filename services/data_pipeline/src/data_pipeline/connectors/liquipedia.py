@@ -260,13 +260,24 @@ class LiquipediaConnector(Connector):
                 )
 
     def _safe_fetch(self, url: str, *, record_type: str, identifier: str) -> Any | None:
-        """Run one ``http_get`` and absorb the per-record failure modes.
+        """Run one ``http_get`` and absorb genuinely transient failures.
 
-        Returns ``None`` when the call fails for any reason; the caller
+        Returns ``None`` when the call fails transiently; the caller
         treats ``None`` as "skip this record". Failures are logged with
-        enough context (record_type + identifier + url + error class)
-        for a postmortem; production wiring forwards this logger to
-        structured output via the standard ``logging`` config.
+        enough context (record_type + identifier + url) for a
+        postmortem.
+
+        Only ``TransientFetchError`` is caught here. Anything else —
+        ``RuntimeError`` from a 4xx in :func:`_default_http_get_factory`
+        (bad base URL, expired key, deleted slug returning 404), an
+        ``ImportError`` from a broken ``httpx`` install, an
+        ``AttributeError`` from a code regression — is treated as a
+        permanent / programming failure that must surface loudly. Round 1
+        caught ``Exception`` here, which silently turned 401/403/404s
+        into per-record skips and let the run finish with no ingested
+        data — exactly the kind of production outage we want to fail
+        fast on. Permanent errors propagate out of the generator and the
+        runner's ``CONNECTOR_ERROR`` path takes over.
         """
         try:
             return self._http_get(url)
@@ -276,20 +287,6 @@ class LiquipediaConnector(Connector):
                 url,
                 record_type,
                 identifier,
-                exc,
-            )
-            return None
-        except Exception as exc:
-            # Anything else is a genuine connector/HTTP failure. We still
-            # log + skip rather than abort — the runner's post-yield
-            # error handling can't see this code path, and one bad slug
-            # shouldn't cancel the next 99.
-            _logger.warning(
-                "liquipedia.connector_error url=%s record_type=%s id=%s error=%s detail=%s",
-                url,
-                record_type,
-                identifier,
-                type(exc).__name__,
                 exc,
             )
             return None
@@ -519,18 +516,32 @@ def _iter_list(value: Any) -> Iterable[dict[str, Any]]:
     drift event rather than dropping the whole list silently. The
     caller in ``fetch`` catches and downgrades to a per-endpoint skip
     so the run keeps going.
+
+    Element-shape drift is treated the same way: list entries that
+    aren't dicts (e.g. an upstream change that ships ``[{"slug": ...},
+    "free-form-tag", {"slug": ...}]``) raise drift instead of being
+    silently filtered out. Filtering would let partial data loss
+    happen with no observable signal — the explicit raise keeps it on
+    the SCHEMA_DRIFT path where ``nexus validate`` and an operator
+    will see it.
     """
     if isinstance(value, list):
         for item in value:
-            if isinstance(item, dict):
-                yield item
+            if not isinstance(item, dict):
+                raise SchemaDriftError(
+                    "liquipedia list entry must be dict, got " f"{type(item).__name__}"
+                )
+            yield item
         return
     if isinstance(value, dict):
         items = value.get("items")
         if isinstance(items, list):
             for item in items:
-                if isinstance(item, dict):
-                    yield item
+                if not isinstance(item, dict):
+                    raise SchemaDriftError(
+                        "liquipedia list entry must be dict, got " f"{type(item).__name__}"
+                    )
+                yield item
             return
         raise SchemaDriftError(
             f"liquipedia list envelope missing 'items' (top-level keys: {sorted(value.keys())!r})"
