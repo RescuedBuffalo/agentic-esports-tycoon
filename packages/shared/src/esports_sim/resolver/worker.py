@@ -384,6 +384,15 @@ def handle_rebrand(
         # alias so the caller's bookkeeping stays consistent.
         return existing_new
 
+    # Wrap the insert in a savepoint so the (platform, platform_id) race
+    # recovers cleanly without trashing the caller's outer transaction.
+    # Round 1 used ``session.rollback()`` here, which rolls back EVERY
+    # uncommitted write in the session — fine in isolation, catastrophic
+    # when ``handle_rebrand`` is one step inside a multi-step batch
+    # (e.g. a worker pass that's already handled ten other rows). The
+    # savepoint scopes the rollback to just the failed alias insert,
+    # mirroring the pattern in :func:`resolve_entity`'s alias-race
+    # recoveries.
     new_alias = EntityAlias(
         canonical_id=canonical_id,
         platform=platform,
@@ -393,8 +402,9 @@ def handle_rebrand(
         valid_from=effective_date,
     )
     try:
-        session.add(new_alias)
-        session.flush()
+        with session.begin_nested():
+            session.add(new_alias)
+            session.flush()
     except IntegrityError as exc:
         # The unique key is on (platform, platform_id) — the only race
         # we know how to recover from. Re-fetch and verify the winner
@@ -402,7 +412,6 @@ def handle_rebrand(
         # the conflict.
         if "uq_entity_alias_platform_platform_id" not in str(exc):
             raise
-        session.rollback()
         winner = session.execute(
             select(EntityAlias).where(
                 EntityAlias.platform == platform,
@@ -509,22 +518,30 @@ def process_staging_queue(
     stats = WorkerStats()
     started = time.monotonic()
 
+    # Extractor-miss rows stay PENDING (so a fix to the extractor can
+    # pick them up on the next worker pass) but MUST be excluded from
+    # subsequent batch SELECTs in the *current* run — otherwise the
+    # same rows come back every iteration and the loop never reaches
+    # ``if not rows: break``. The set is bounded by the queue size in
+    # one run, so it's cheap. UUIDs round-trip through psycopg as
+    # native uuid.UUID objects, no string coercion needed.
+    skipped_in_run: set[uuid.UUID] = set()
+
     batches_done = 0
     while True:
         if max_batches is not None and batches_done >= max_batches:
             break
 
-        rows = (
-            session.execute(
-                select(StagingRecord)
-                .where(StagingRecord.status == StagingStatus.PENDING)
-                .order_by(StagingRecord.created_at)
-                .limit(batch_size)
-                .with_for_update(skip_locked=True)
-            )
-            .scalars()
-            .all()
+        stmt = (
+            select(StagingRecord)
+            .where(StagingRecord.status == StagingStatus.PENDING)
+            .order_by(StagingRecord.created_at)
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
         )
+        if skipped_in_run:
+            stmt = stmt.where(StagingRecord.id.notin_(skipped_in_run))
+        rows = session.execute(stmt).scalars().all()
         if not rows:
             break
         batches_done += 1
@@ -534,6 +551,7 @@ def process_staging_queue(
             handle = extractor(row.source, row.entity_type, row.payload)
             if handle is None:
                 stats.extractor_misses += 1
+                skipped_in_run.add(row.id)
                 _logger.warning(
                     "resolver.worker.extractor_miss source=%s entity_type=%s id=%s",
                     row.source,
@@ -598,9 +616,3 @@ __all__ = [
     "merge_records",
     "process_staging_queue",
 ]
-
-
-# Silence the unused-import lint for a uuid type hint we keep available
-# for downstream callers writing extractors that need to read
-# ``staging_record.id`` as a uuid.UUID.
-_ = uuid

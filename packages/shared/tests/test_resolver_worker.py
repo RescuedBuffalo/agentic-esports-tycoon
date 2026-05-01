@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from esports_sim.db.enums import EntityType, Platform, StagingStatus
@@ -585,3 +586,142 @@ def test_process_staging_queue_routes_pending_resolver_outcome_to_review(
         # the routing rule, so just assert the status is one of the
         # legal terminal states.
         assert row.status in {StagingStatus.PROCESSED, StagingStatus.REVIEW}
+
+
+@pytestmark_integration
+def test_process_staging_queue_does_not_loop_on_extractor_misses(
+    db_session,
+) -> None:
+    """Round 1 regression: pure-miss queue must terminate in one pass.
+
+    When every PENDING row is an extractor miss, ``continue`` leaves
+    the row PENDING — but the next batch SELECT would re-match the
+    same rows and loop forever (the row is never re-resolved within a
+    single ``process_staging_queue`` call). The fix tracks miss IDs
+    in-run and excludes them from subsequent batch SELECTs; this test
+    pegs ``max_batches=None`` so a regression deadlocks the test
+    rather than hiding behind the cap.
+    """
+    rows: list[StagingRecord] = [
+        StagingRecord(
+            source="liquipedia",
+            entity_type=EntityType.PLAYER,
+            canonical_id=None,
+            payload={"unrecognised": f"shape_{i}"},
+            status=StagingStatus.PENDING,
+        )
+        for i in range(5)
+    ]
+    db_session.add_all(rows)
+    db_session.flush()
+
+    # max_batches=None — the regression would never hit ``not rows``.
+    # If this test hangs, the fix isn't in place.
+    stats = process_staging_queue(db_session, batch_size=2, max_batches=None)
+
+    assert stats.seen == 5
+    assert stats.extractor_misses == 5
+    assert stats.processed == 0
+    for row in rows:
+        db_session.refresh(row)
+        assert row.status is StagingStatus.PENDING
+
+
+@pytestmark_integration
+def test_handle_rebrand_race_recovery_uses_savepoint_not_outer_rollback(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 1 regression: the IntegrityError recovery path must not call
+    ``session.rollback()`` on the outer session.
+
+    Round 1 used ``session.rollback()`` after a unique-key collision,
+    which threw away every uncommitted write in the caller's
+    transaction (this function is documented as caller-transaction-
+    owned). The fixed version wraps the insert in a
+    ``begin_nested()`` savepoint, mirroring the pattern in
+    :func:`_try_insert_alias_or_recover`.
+
+    True concurrency is hard to drive in a single-process test, so we
+    sentinel the fix structurally: monkey-patch ``session.rollback``
+    to record any call. With the savepoint fix in place, the recovery
+    path never touches outer rollback even on a forced IntegrityError.
+    """
+    from esports_sim.resolver import worker as worker_mod
+    from sqlalchemy import select
+
+    seed = resolve_entity(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="oldhandle",
+        platform_name="OldHandle",
+        entity_type=EntityType.PLAYER,
+    )
+    db_session.flush()
+    assert seed.canonical_id is not None
+
+    # An unrelated canonical row in the same outer transaction — the
+    # write that round-1 rollback would have nuked.
+    unrelated = Entity(entity_type=EntityType.TEAM)
+    db_session.add(unrelated)
+    db_session.flush()
+
+    # Force ``handle_rebrand`` into its IntegrityError branch by
+    # stubbing the second SELECT (the destination-alias pre-flight) to
+    # return None, then planting a real row at the destination handle
+    # that the subsequent insert will collide against.
+    db_session.add(
+        EntityAlias(
+            canonical_id=seed.canonical_id,
+            platform=Platform.LIQUIPEDIA,
+            platform_id="newhandle",
+            platform_name="NewHandle",
+            confidence=1.0,
+        )
+    )
+    db_session.flush()
+
+    real_execute = db_session.execute
+    call_n = {"n": 0}
+
+    def fake_execute(stmt: Any, *a: Any, **kw: Any) -> Any:
+        # The second SELECT inside handle_rebrand looks up the
+        # destination alias by (platform, new_platform_id). Stub it to
+        # return a no-row result so the function falls through to the
+        # insert and trips the unique constraint we already populated.
+        call_n["n"] += 1
+        if call_n["n"] == 2:
+
+            class _Empty:
+                def scalar_one_or_none(self) -> None:
+                    return None
+
+            return _Empty()
+        return real_execute(stmt, *a, **kw)
+
+    rollback_calls: list[None] = []
+    monkeypatch.setattr(db_session, "rollback", lambda: rollback_calls.append(None))
+    monkeypatch.setattr(db_session, "execute", fake_execute)
+
+    handle_rebrand(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        old_platform_id="oldhandle",
+        new_platform_id="newhandle",
+        new_platform_name="NewHandle",
+        effective_date=_EFFECTIVE,
+    )
+
+    # The fix's invariant: the savepoint absorbs the rollback; the
+    # outer session.rollback is NEVER called. Round-1 code would have
+    # tripped this list with one entry.
+    assert rollback_calls == []
+    # And the unrelated entity must still be present (it would have
+    # been dropped if round-1 rollback had fired).
+    assert worker_mod is not None  # silence unused-import lint
+    assert (
+        real_execute(
+            select(Entity).where(Entity.canonical_id == unrelated.canonical_id)
+        ).scalar_one_or_none()
+        is not None
+    )
