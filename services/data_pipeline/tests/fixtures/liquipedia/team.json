@@ -1,0 +1,13 @@
+{
+  "slug": "sentinels",
+  "name": "Sentinels",
+  "region": "Americas",
+  "founded": "2018-12-01",
+  "roster": [
+    {"slug": "tenz", "name": "TenZ", "role": "duelist"},
+    {"slug": "sacy", "name": "Sacy", "role": "initiator"},
+    {"slug": "zekken", "name": "Zekken", "role": "duelist"},
+    {"slug": "johnqt", "name": "johnqt", "role": "sentinel"},
+    {"slug": "n4rrate", "name": "N4RRATE", "role": "controller"}
+  ]
+}
