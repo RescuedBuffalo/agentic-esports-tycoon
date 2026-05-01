@@ -6,9 +6,13 @@ their own table rather than abusing ``raw_record`` (which would lose
 forced through the alias graph (no fuzzy match makes sense for a
 versioned release-notes blob).
 
-``patch_version`` is unique so the patch-notes runner can UPSERT on it
-— a re-scrape of the same article updates the body in place rather than
-inserting a duplicate row, satisfying the BUF-83 idempotency acceptance.
+The dedup key is ``(source, patch_version)``. The generic
+``PatchNoteConnector`` abstraction lets multiple games' scrapers share
+this table; if uniqueness were on ``patch_version`` alone, two
+connectors emitting the same string (e.g. "8.05") would collide and
+silently overwrite each other. Persisting ``source`` (the connector's
+``source_name``) makes per-source histories independent while still
+letting the runner UPSERT re-scrapes within a single source.
 
 Revision ID: 0003
 Revises: 0002
@@ -34,6 +38,10 @@ def upgrade() -> None:
     op.create_table(
         "patch_note",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        # ``source`` matches the connector's ``source_name`` (max 64
+        # chars, same as the rest of the pipeline). Part of the
+        # composite uniqueness key — see module docstring.
+        sa.Column("source", sa.String(64), nullable=False),
         # 32 chars is plenty for "Major.Minor[.Hotfix]" version strings;
         # narrowing the column keeps the unique-index footprint small.
         sa.Column("patch_version", sa.String(32), nullable=False),
@@ -49,7 +57,11 @@ def upgrade() -> None:
             server_default=sa.func.now(),
             nullable=False,
         ),
-        sa.UniqueConstraint("patch_version", name="uq_patch_note_patch_version"),
+        sa.UniqueConstraint(
+            "source",
+            "patch_version",
+            name="uq_patch_note_source_patch_version",
+        ),
     )
     # Freshness check (``nexus validate``) reads the most recent
     # ``published_at`` per source; the index keeps that O(log n).

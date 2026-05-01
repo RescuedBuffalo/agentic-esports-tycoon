@@ -300,13 +300,22 @@ class PatchNote(Base):
     Patch notes don't fit the ``(platform, platform_id)`` alias model the
     rest of the schema is built around: there is no fuzzy matching, no
     canonical merging, no per-platform handle. They are versioned
-    documents keyed by ``patch_version`` (e.g. ``"8.05"``), fed into BUF-24
+    documents keyed by ``(source, patch_version)``, fed into BUF-24
     patch-intent extraction downstream. Storing them here rather than in
     ``raw_record`` makes ``patch_version`` and ``published_at`` first-class
     queryable columns.
 
-    Idempotency: ``patch_version`` is unique, so the patch-notes runner can
-    UPSERT on it. A re-scrape of the same article updates ``raw_html`` /
+    Source scoping: the uniqueness key is ``(source, patch_version)``,
+    not ``patch_version`` alone. The generic ``PatchNoteConnector``
+    abstraction lets multiple games' patch-notes connectors live in
+    one process; if uniqueness were on ``patch_version`` alone, two
+    connectors emitting the same string (e.g. "8.05") would collide
+    and silently overwrite each other. Persisting ``source`` (the
+    connector's ``source_name``) and using a composite key lets each
+    game's history live independently while still UPSERT-deduping
+    re-scrapes within a source.
+
+    Idempotency: a re-scrape of the same article updates ``raw_html`` /
     ``body_text`` / ``fetched_at`` in place rather than inserting a
     duplicate row — safe to re-run on the weekly cadence.
     """
@@ -318,9 +327,12 @@ class PatchNote(Base):
         primary_key=True,
         default=uuid.uuid4,
     )
+    # The connector's ``source_name`` (e.g. ``"playvalorant"``).
+    # Part of the composite uniqueness key; see class docstring.
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
     # 32 chars is more than enough for ``"Major.Minor"`` or ``"Major.Minor.Hotfix"``;
     # narrowing the column makes the unique-index footprint tiny.
-    patch_version: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    patch_version: Mapped[str] = mapped_column(String(32), nullable=False)
     # Indexed for the freshness check the validator runs against the most
     # recent ``published_at`` per source — see ``nexus validate``.
     published_at: Mapped[datetime] = mapped_column(
@@ -335,6 +347,14 @@ class PatchNote(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source",
+            "patch_version",
+            name="uq_patch_note_source_patch_version",
+        ),
     )
 
 

@@ -247,13 +247,14 @@ def run_patch_notes_ingestion(
         stats.fetched += 1
 
         for record in records:
-            _upsert_patch_note(session, record=record)
+            _upsert_patch_note(session, source=connector.source_name, record=record)
             stats.upserted += 1
             stats.by_version[record.patch_version] = (
                 stats.by_version.get(record.patch_version, 0) + 1
             )
             log.info(
                 "patch_notes.upserted",
+                source=connector.source_name,
                 patch_version=record.patch_version,
                 published_at=record.published_at.isoformat(),
             )
@@ -268,25 +269,38 @@ def run_patch_notes_ingestion(
     return stats
 
 
-def _upsert_patch_note(session: Session, *, record: PatchNoteRecord) -> PatchNote:
-    """UPSERT semantics on ``patch_version``.
+def _upsert_patch_note(
+    session: Session,
+    *,
+    source: str,
+    record: PatchNoteRecord,
+) -> PatchNote:
+    """UPSERT semantics on ``(source, patch_version)``.
 
     SELECT-then-INSERT-or-UPDATE rather than ``INSERT ... ON CONFLICT``
     because the latter would skip the SQLAlchemy ORM event hooks (none
     today on ``PatchNote``, but cheap insurance for the day there are).
-    Two patches with the same ``patch_version`` are by definition the
-    same upstream document, so the version-only key is correct.
+
+    The dedup key is composite: two patch-note connectors (e.g. one
+    per game) can legitimately emit the same ``patch_version`` string
+    without colliding. The ``source`` argument comes from the calling
+    connector's ``source_name``; the runner threads it through so the
+    DTO (:class:`PatchNoteRecord`) stays connector-agnostic.
 
     ``fetched_at`` is server-default ``now()`` on insert and explicitly
-    bumped to ``func.now()`` on update so operators can tell when each
-    row was last touched.
+    bumped to ``datetime.now(UTC)`` on update so operators can tell
+    when each row was last touched.
     """
     existing: PatchNote | None = session.execute(
-        select(PatchNote).where(PatchNote.patch_version == record.patch_version)
+        select(PatchNote).where(
+            PatchNote.source == source,
+            PatchNote.patch_version == record.patch_version,
+        )
     ).scalar_one_or_none()
 
     if existing is None:
         new = PatchNote(
+            source=source,
             patch_version=record.patch_version,
             published_at=record.published_at,
             raw_html=record.raw_html,

@@ -247,6 +247,59 @@ def test_validate_treats_naive_datetime_as_drift_rather_than_typeerror() -> None
         connector.validate({"url": "https://playvalorant.com/x", "html": html})
 
 
+def test_fetch_skips_one_transient_article_and_continues_to_the_rest() -> None:
+    """A transient failure on one article must not truncate the rest of the pass.
+
+    Generators close after raising any uncaught exception, which means a
+    runner-side ``except TransientFetchError`` around ``next(iterator)``
+    can't keep iteration going — the next ``next()`` call on a closed
+    generator returns ``StopIteration``, silently skipping every later
+    article on the page. The fix is to absorb the transient inside the
+    connector's ``fetch`` loop. This test pins that contract: three
+    articles in a row, the middle one fails, the other two flow.
+    """
+    list_html = """
+    <html><body>
+      <a href="/en-us/news/game-updates/valorant-patch-notes-8-05/">
+        <time datetime="2026-03-12T17:00:00Z">Mar 12</time> Patch 8.05
+      </a>
+      <a href="/en-us/news/game-updates/valorant-patch-notes-8-04/">
+        <time datetime="2026-02-26T17:00:00Z">Feb 26</time> Patch 8.04
+      </a>
+      <a href="/en-us/news/game-updates/valorant-patch-notes-8-03/">
+        <time datetime="2026-02-12T17:00:00Z">Feb 12</time> Patch 8.03
+      </a>
+    </body></html>
+    """
+    article_8_05 = _load("article_8_05.html")
+    article_8_03 = article_8_05.replace("8.05", "8.03").replace(
+        "2026-03-12T17:00:00Z", "2026-02-12T17:00:00Z"
+    )
+
+    def http_get(url: str) -> str:
+        if url == LIST_URL:
+            return list_html
+        if "8-05" in url:
+            return article_8_05
+        if "8-04" in url:
+            # The middle article hits a transient blip.
+            raise TransientFetchError("upstream 502 on article body")
+        if "8-03" in url:
+            return article_8_03
+        if "page=" in url:
+            return "<html><body><main></main></body></html>"
+        raise AssertionError(f"unexpected article fetch: {url}")
+
+    connector = PlayValorantPatchNotesConnector(http_get=http_get)
+    payloads = list(connector.fetch(datetime(1970, 1, 1, tzinfo=UTC)))
+
+    # Two articles flowed; the failing one was logged and skipped.
+    urls = [p["url"] for p in payloads]
+    assert any("8-05" in url for url in urls)
+    assert any("8-03" in url for url in urls)
+    assert not any("8-04" in url for url in urls)
+
+
 # --- list-card filtering --------------------------------------------------
 
 
@@ -443,5 +496,53 @@ def test_rerun_is_idempotent_on_patch_version(db_session) -> None:
     db_session.flush()
 
     rows = list(db_session.execute(select(PatchNote)).scalars())
-    assert len(rows) == 1, "re-run must UPSERT on patch_version, not insert a duplicate"
+    assert len(rows) == 1, "re-run must UPSERT on (source, patch_version), not insert a duplicate"
     assert rows[0].fetched_at >= first_fetched_at
+    assert rows[0].source == "playvalorant"
+
+
+@pytest.mark.integration
+def test_two_sources_with_same_patch_version_do_not_collide(db_session) -> None:
+    """Two connectors with different ``source_name`` and the same patch
+    version must coexist as distinct rows.
+
+    The BUF-83 schema's uniqueness key is ``(source, patch_version)``,
+    not ``patch_version`` alone. Without that scope, a future
+    second-game patch-notes connector emitting (e.g.) ``"8.05"`` would
+    overwrite the playvalorant row of the same version. This test
+    runs the same article through two stub connectors with different
+    ``source_name`` and asserts both rows persist.
+    """
+    from esports_sim.db.models import PatchNote
+    from sqlalchemy import select
+
+    class _OtherSourceStub(_StubPatchNoteConnector):
+        @property
+        def source_name(self) -> str:
+            return "another-game"
+
+    html = _load("article_8_05.html")
+    payload = [{"url": "https://playvalorant.com/x", "html": html}]
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+
+    run_patch_notes_ingestion(
+        _StubPatchNoteConnector(payloads=payload),
+        session=db_session,
+        since=epoch,
+    )
+    run_patch_notes_ingestion(
+        _OtherSourceStub(payloads=payload),
+        session=db_session,
+        since=epoch,
+    )
+    db_session.flush()
+
+    rows = sorted(
+        db_session.execute(select(PatchNote)).scalars().all(),
+        key=lambda row: row.source,
+    )
+    assert len(rows) == 2
+    assert {row.source for row in rows} == {"another-game", "playvalorant"}
+    # Both rows are 8.05 — they coexist because the unique constraint
+    # is on the composite key.
+    assert all(row.patch_version == "8.05" for row in rows)

@@ -28,6 +28,7 @@ Out of scope (per the BUF-83 ticket):
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
@@ -39,6 +40,13 @@ from bs4 import BeautifulSoup, Tag
 from data_pipeline.connector import RateLimit
 from data_pipeline.errors import SchemaDriftError, TransientFetchError
 from data_pipeline.patch_notes_runner import PatchNoteConnector, PatchNoteRecord
+
+# Per-article / per-list-page transient failures are caught inside
+# ``fetch`` (generator-close semantics — see ``fetch`` docstring); we
+# log them here so an operator can correlate the skip with the
+# upstream blip without having to inspect ``stats.transient_errors``
+# alone.
+_logger = logging.getLogger("data_pipeline.connectors.playvalorant")
 
 # The article-list page; ``?page=N`` paginates further back. Older pages
 # eventually 404 — the connector treats that as end-of-list rather than
@@ -151,15 +159,35 @@ class PlayValorantPatchNotesConnector(PatchNoteConnector):
         (everything is at-or-before ``since``). That works because the
         list is reverse-chronological; once we've passed ``since`` the
         rest of the archive is older still.
+
+        Per-article and per-list-page transient failures are caught
+        and skipped *here*, inside the generator body. A naïve "raise
+        and let the runner catch it" doesn't work for generators:
+        Python closes a generator the moment it raises an unhandled
+        exception, so subsequent ``next()`` calls return
+        ``StopIteration`` rather than continuing where we left off.
+        That meant one bad article aborted the whole pass and silently
+        skipped every later card. Catching here keeps the generator
+        live; the runner still sees structured ``transient_errors``
+        events because the connector logs them via
+        ``data_pipeline.connectors.playvalorant``.
         """
         for page in range(1, self._max_list_pages + 1):
             page_url = self._list_url if page == 1 else f"{self._list_url}?page={page}"
             try:
                 list_html = self._http_get(page_url)
-            except TransientFetchError:
-                # Surface so the runner counts this as a transient error
-                # against the *list page*; the next scheduled run retries.
-                raise
+            except TransientFetchError as exc:
+                # A transient failure on the list page means we don't
+                # know what articles live on this page. We log + skip
+                # to the next page rather than abort: the next page
+                # may succeed (Cloudflare hiccups are often per-edge),
+                # and even if it doesn't, ``return``-ing here would
+                # close the generator and skip *every* later page too.
+                _logger.warning(
+                    "playvalorant.list_page_transient_error",
+                    extra={"page_url": page_url, "detail": str(exc)},
+                )
+                continue
             except Exception as exc:  # pragma: no cover - safety net
                 # Anything else is fatal-by-default; wrap the URL in for
                 # operator context.
@@ -184,7 +212,18 @@ class PlayValorantPatchNotesConnector(PatchNoteConnector):
 
             for card in new_cards:
                 article_url = card["url"]
-                article_html = self._http_get(article_url)
+                try:
+                    article_html = self._http_get(article_url)
+                except TransientFetchError as exc:
+                    # Per-article transient: log + skip + continue. Do
+                    # NOT propagate — see the docstring for why
+                    # generator-close semantics make that fatal for
+                    # the rest of the pass.
+                    _logger.warning(
+                        "playvalorant.article_transient_error",
+                        extra={"article_url": article_url, "detail": str(exc)},
+                    )
+                    continue
                 yield {
                     "url": article_url,
                     "html": article_html,
