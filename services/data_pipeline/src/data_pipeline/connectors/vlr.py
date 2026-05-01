@@ -316,15 +316,41 @@ class _AnchorCollector(HTMLParser):
     # extra key inflates per-tag bookkeeping for every page.
     _INHERITED_DATA_ATTRS = ("data-utc-ts", "data-match-id")
 
+    # HTML void elements (no closing tag). We never push frames for
+    # these — they'd accumulate forever because there's no
+    # ``handle_endtag`` call to pop them. Source: WHATWG spec.
+    _VOID_ELEMENTS = frozenset(
+        {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "source",
+            "track",
+            "wbr",
+        }
+    )
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.anchors: list[dict[str, Any]] = []
         self._current: dict[str, Any] | None = None
-        # One frame per currently-open ancestor element that introduced
-        # one of the inherited data-attrs. Pushed on ``handle_starttag``
-        # for non-anchor tags carrying any tracked attr; popped on the
-        # matching ``handle_endtag``. The stack lets us correctly scope
-        # inheritance even when sibling rows reuse different ids.
+        # One frame per currently-open non-anchor, non-void element.
+        # Pushed unconditionally on ``handle_starttag`` (even when the
+        # element carries no inherited attrs) so the stack mirrors the
+        # actual open-tag depth — essential to correctly handle nested
+        # same-tag elements like ``<div data-utc-ts="X"><div>...</div>
+        # <a>row</a></div>``. Without per-open-tag bookkeeping, the
+        # inner ``</div>`` would pop the outer frame and the trailing
+        # anchor would lose its inherited timestamp. Each frame stores
+        # the inherited attrs it contributes (empty dict when the
+        # element carried no tracked attrs).
         self._inherited_stack: list[tuple[str, dict[str, str]]] = []
 
     def _current_inherited(self) -> dict[str, str]:
@@ -342,11 +368,22 @@ class _AnchorCollector(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = {k: v for k, v in attrs if v is not None}
         if tag != "a":
+            # Void elements have no end tag — pushing a frame for them
+            # would leak onto the stack indefinitely. Skip them entirely
+            # since they can't carry our two tracked attrs in any
+            # meaningful structural position anyway.
+            if tag in self._VOID_ELEMENTS:
+                return
             inherited = {
                 key: attr_map[key] for key in self._INHERITED_DATA_ATTRS if key in attr_map
             }
-            if inherited:
-                self._inherited_stack.append((tag, inherited))
+            # Push unconditionally (even with an empty ``inherited`` dict).
+            # The stack frame represents "this element is currently open"
+            # so its closing tag pops the right frame. Without this, an
+            # inner ``<div>`` with no tracked attrs and an outer
+            # ``<div data-utc-ts="X">`` would share one stack frame and
+            # the inner close would discard the outer's inherited attrs.
+            self._inherited_stack.append((tag, inherited))
             return
         href = attr_map.get("href")
         if not href:
@@ -357,6 +394,12 @@ class _AnchorCollector(HTMLParser):
         for key, value in self._current_inherited().items():
             attr_map.setdefault(key, value)
         self._current = {"href": href, "attrs": attr_map, "text_parts": []}
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        # XHTML self-closing form ``<tag/>``. Don't push — there's no
+        # corresponding end tag, and treating the element as if it had
+        # children would shift the whole inheritance stack.
+        return
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "a":
@@ -371,12 +414,25 @@ class _AnchorCollector(HTMLParser):
             self.anchors.append(anchor)
             self._current = None
             return
-        # Pop the deepest matching frame for this tag, if any. The check
-        # tolerates malformed HTML (missing close tag) by leaving frames
-        # for outer tags untouched.
+        if tag in self._VOID_ELEMENTS:
+            # Defensive: void elements shouldn't reach ``handle_endtag``
+            # at all (they have no closing form), but if a malformed
+            # document includes one, ignore it rather than corrupting
+            # the stack.
+            return
+        # Well-formed HTML: the topmost frame matches this closing tag.
+        # Pop it.
+        if self._inherited_stack and self._inherited_stack[-1][0] == tag:
+            self._inherited_stack.pop()
+            return
+        # Misnested HTML (e.g. ``<div><span></div></span>``): walk down
+        # to find the most recent matching open tag and pop it together
+        # with everything above it (treating the intervening elements
+        # as implicitly closed). This mirrors browsers' lenient parsing
+        # without leaving phantom frames on the stack.
         for index in range(len(self._inherited_stack) - 1, -1, -1):
             if self._inherited_stack[index][0] == tag:
-                del self._inherited_stack[index]
+                del self._inherited_stack[index:]
                 return
 
     def handle_data(self, data: str) -> None:
@@ -579,11 +635,15 @@ class VLRConnector(Connector):
         keep one HTTP roundtrip per yield — splitting a page across
         multiple yields would over-consume the bucket.
 
-        :class:`TransientFetchError` is raised here only for symmetry
-        with the framework error taxonomy; the default
-        :class:`PageFetcher` (Playwright) does its own retries before
-        surfacing a hard failure. A test injecting a fetcher that
-        raises ``TransientFetchError`` exercises the retry path.
+        Per-page fetch failures are caught here and **logged + skipped**
+        rather than propagated. ``run_ingestion``'s post-yield error
+        handling can't see exceptions raised during iterator advancement
+        (the fetcher call runs *before* the next ``yield``), so a
+        timeout on one VLR page would otherwise abort the whole daily
+        crawl and skip every later page. We log a structured warning
+        so the failure stays observable, then continue with the next
+        URL. Subsequent runs retry naturally because no ``raw_record``
+        is written for a failed fetch.
         """
         fetcher = self._get_fetcher()
         for page_type, url in self._page_urls:
@@ -592,17 +652,35 @@ class VLRConnector(Connector):
                 continue
             try:
                 rendered = fetcher(url)
-            except TransientFetchError:
-                # Per-record retry — surfaces in IngestionStats.transient_errors.
-                raise
+            except TransientFetchError as exc:
+                # Recoverable upstream miss — log and move on. The next
+                # scheduled run will retry; nothing was persisted.
+                logger.warning(
+                    "vlr.transient_fetch_error",
+                    extra={
+                        "url": url,
+                        "page_type": page_type,
+                        "detail": str(exc),
+                    },
+                )
+                continue
             except Exception as exc:
-                # Wrap unrecognised fetch failures in TransientFetchError so
-                # the runner skips this page rather than aborting the daily
-                # crawl. The detail string keeps the original exception type
-                # visible for triage.
-                raise TransientFetchError(
-                    f"vlr fetch failed for {url}: {type(exc).__name__}: {exc}"
-                ) from exc
+                # Unknown fetch failure (parser regression, browser
+                # crash, etc.). We deliberately keep the run alive —
+                # log enough context for triage and continue. A
+                # systematic failure will show up across many URLs in
+                # the same run, which is the signal a maintainer
+                # actually needs.
+                logger.warning(
+                    "vlr.connector_error",
+                    extra={
+                        "url": url,
+                        "page_type": page_type,
+                        "error_type": type(exc).__name__,
+                        "detail": str(exc),
+                    },
+                )
+                continue
             rows = list(self._parser.parse(page_type, rendered))
             # Apply the since-filter here, before emitting the payload.
             # We deliberately do NOT stash ``fetched_at`` / ``since`` on

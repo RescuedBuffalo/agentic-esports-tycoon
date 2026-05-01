@@ -29,6 +29,7 @@ from data_pipeline.connectors.vlr import (
     VLRConnector,
     VLRPageRow,
     VLRParser,
+    _iter_anchors,
     _RobotsCache,
 )
 from esports_sim.db.enums import EntityType, Platform
@@ -447,26 +448,99 @@ def test_rate_limiter_paces_fetch_with_fake_clock() -> None:
     assert clock.now <= expected_floor + 3.0 + 1e-9
 
 
-def test_fetch_raises_transient_error_when_underlying_fetcher_raises() -> None:
-    """Wrap-and-rethrow contract: arbitrary exceptions surface as transient."""
+def test_fetch_skips_page_on_arbitrary_fetcher_exception() -> None:
+    """Per-page failures log + skip instead of aborting the run.
+
+    ``run_ingestion``'s post-yield error handling can't see exceptions
+    raised during iterator advancement (the fetcher call runs *before*
+    the next ``yield``), so re-raising would skip every later URL too.
+    The connector now catches and continues; with all pages failing,
+    ``fetch`` simply yields nothing.
+    """
 
     def boom(url: str) -> str:
         raise RuntimeError("upstream timeout simulated")
 
     connector = _build_connector(fetcher=boom)
-    with pytest.raises(TransientFetchError, match="upstream timeout simulated"):
-        list(connector.fetch(_EPOCH))
+    payloads = list(connector.fetch(_EPOCH))
+    # Every URL hit the same exception; nothing was yielded but the
+    # generator still terminated cleanly rather than propagating.
+    assert payloads == []
 
 
-def test_fetch_propagates_transient_error_unwrapped() -> None:
-    """An explicit TransientFetchError must not be re-wrapped."""
+def test_fetch_skips_one_failed_page_and_continues_to_the_rest() -> None:
+    """One failing URL doesn't take down the surrounding pages.
+
+    The first URL in the configured page list fails; the second
+    succeeds. The connector must yield exactly one payload — for the
+    succeeding URL — proving that the failure did not short-circuit
+    iteration.
+    """
+    bad_url = f"{VLR_BASE_URL}/stats"
+    good_url = f"{VLR_BASE_URL}/rankings"
+
+    def selective_fetcher(url: str) -> str:
+        if url == bad_url:
+            raise TransientFetchError("503 simulated")
+        return _read_fixture("rankings.html")
+
+    connector = _build_connector(
+        page_urls=(("stats", bad_url), ("rankings", good_url)),
+        fetcher=selective_fetcher,
+    )
+    payloads = list(connector.fetch(_EPOCH))
+
+    assert len(payloads) == 1
+    assert payloads[0]["page_type"] == "rankings"
+
+
+def test_fetch_skips_page_on_explicit_transient_fetch_error() -> None:
+    """An explicit ``TransientFetchError`` is caught + logged, not re-raised."""
 
     def flaky(url: str) -> str:
         raise TransientFetchError("503 from VLR")
 
     connector = _build_connector(fetcher=flaky)
-    with pytest.raises(TransientFetchError, match="503 from VLR"):
-        list(connector.fetch(_EPOCH))
+    payloads = list(connector.fetch(_EPOCH))
+    assert payloads == []
+
+
+def test_anchor_collector_handles_nested_same_tag_open_close() -> None:
+    """Inner same-tag elements must not pop the outer ancestor's frame.
+
+    VLR's match-card markup looks like::
+
+        <div class="match-item" data-utc-ts="..." data-match-id="...">
+          <div class="match-item-meta">...</div>   <!-- inner div -->
+          <a href="/team/X/foo">Team X</a>          <!-- still inside outer -->
+        </div>
+
+    With a tag-name-only stack pop, the inner ``</div>`` would discard
+    the outer frame and the trailing anchor would lose its inherited
+    timestamp. The fix tracks one stack frame per *open* non-anchor
+    tag, regardless of whether the element carries any tracked
+    attribute, so closes pop the right depth.
+    """
+    nested_html = """
+    <html><body>
+      <div class="match-item" data-utc-ts="2026-04-26T22:00:00Z" data-match-id="m-new">
+        <div class="match-item-meta">scoreboard</div>
+        <a href="/team/188/leviatan">LEVIATAN</a>
+        <a href="/team/4915/loud">LOUD</a>
+      </div>
+    </body></html>
+    """
+    anchors = list(_iter_anchors(nested_html))
+    # Both anchors land — and both inherited the outer div's
+    # timestamp/match-id even though an inner ``</div>`` closed before
+    # them.
+    assert {a["href"] for a in anchors} == {
+        "/team/188/leviatan",
+        "/team/4915/loud",
+    }
+    for anchor in anchors:
+        assert anchor["attrs"]["data-utc-ts"] == "2026-04-26T22:00:00Z"
+        assert anchor["attrs"]["data-match-id"] == "m-new"
 
 
 # --- robots.txt ------------------------------------------------------------
