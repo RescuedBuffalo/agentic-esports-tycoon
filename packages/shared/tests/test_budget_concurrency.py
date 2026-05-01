@@ -14,12 +14,25 @@ Two scenarios that the original PR didn't cover:
    ``NEXUS_BUDGET_DISABLE_CAPS`` from the process environment. The
    original review caught a constructor that called the static
    ``default_caps()`` instead of ``BudgetCaps.from_env()``.
+
+Concurrency-driver note (issue #15): the atomicity tests ran for a long
+time — and on Windows / GitHub-hosted Linux runners hung the CI job
+indefinitely — when the workers were spawned via ``multiprocessing``.
+Spawned children re-import the test module and pickle the worker
+callable, both of which are flaky enough on the GH Actions runner to
+deadlock at ``Pool.map``. Threads are sufficient for the property we
+actually want to assert: BEGIN IMMEDIATE on a shared SQLite ledger
+serialises writes. The lock is enforced at the OS file-lock layer (not
+inside the Python interpreter), and the ``sqlite3`` C extension releases
+the GIL across BEGIN / COMMIT, so two threads racing the same ledger
+exercise the same critical section a process pool did — without the
+spawn-time hang. See issue #15 for the failure mode this swap removes.
 """
 
 from __future__ import annotations
 
-import multiprocessing as mp
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -36,7 +49,7 @@ def shared_db(tmp_path: Path) -> Path:
 
 
 def _try_preflight(args: tuple[Path, str]) -> str:
-    """Run a single preflight in a worker process.
+    """Run a single preflight in a worker thread.
 
     Returns ``"ok"`` if the call passed the gate (a pre row landed), or the
     BudgetExhausted scope (``"weekly"``) if the call was blocked. Anything
@@ -79,12 +92,15 @@ def test_concurrent_preflight_serialises_at_the_cap_edge(shared_db: Path) -> Non
         usd_cost=29.95,
     )
 
-    # Use a process pool so we get real OS-level concurrency through
-    # SQLite's file lock, not just GIL-serialised threads.
+    # ThreadPoolExecutor (rather than ``mp.Pool``) — the property under
+    # test is "BEGIN IMMEDIATE serialises two governors hitting the same
+    # SQLite file." That lock is enforced at the OS file-lock layer, and
+    # the ``sqlite3`` C extension releases the GIL across BEGIN/COMMIT,
+    # so threads exercise the same critical section a process pool did
+    # without the GH Actions spawn-time hang documented in issue #15.
     args = [(shared_db, f"worker-{i}") for i in range(8)]
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=4) as pool:
-        results = pool.map(_try_preflight, args)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_try_preflight, args))
 
     n_ok = results.count("ok")
     n_blocked = results.count("weekly")
@@ -126,9 +142,8 @@ def test_concurrent_preflight_with_room_below_cap_lets_some_pass(
     )
 
     args = [(shared_db, f"worker-{i}") for i in range(8)]
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=4) as pool:
-        results = pool.map(_try_preflight, args)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_try_preflight, args))
 
     n_ok = results.count("ok")
     n_blocked = results.count("weekly")
