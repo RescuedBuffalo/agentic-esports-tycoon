@@ -56,8 +56,15 @@ _MAX_LIST_PAGES = 200
 # reads "VALORANT Patch Notes 8.05" — so we allow an optional " Notes"
 # token between the literal "Patch" and the version. The regex is also
 # tolerant of leading/trailing whitespace and case differences.
+#
+# Hotfix suffixes: Riot occasionally ships a letter-suffixed patch
+# (e.g. "Patch 11.07b") between numbered drops to deliver a quick
+# balance hotfix. The trailing ``[a-z]?`` captures that letter so the
+# suffixed article gets its own ``patch_version`` row instead of
+# UPSERT-overwriting the base ``11.07`` patch — the BUF-83 schema's
+# ``patch_version`` column is the dedup key.
 _PATCH_VERSION_RE = re.compile(
-    r"\bPatch(?:\s+Notes)?\s+(\d+\.\d+(?:\.\d+)?)",
+    r"\bPatch(?:\s+Notes)?\s+(\d+\.\d+(?:\.\d+)?[a-z]?)",
     re.IGNORECASE,
 )
 
@@ -359,9 +366,22 @@ def _parse_iso8601(value: str) -> datetime | None:
     if cleaned.endswith("Z"):
         cleaned = cleaned[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(cleaned)
+        parsed = datetime.fromisoformat(cleaned)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        # ``datetime.fromisoformat`` returns a naive value when the
+        # source string had no offset (e.g. ``"2026-03-12T17:00:00"``).
+        # We later compare these against a timezone-aware ``since`` in
+        # ``fetch`` (``card["published_at"] > since``); mixing naive
+        # and aware datetimes raises ``TypeError`` and would abort the
+        # whole pass. Treat a missing offset as "we don't know" and
+        # return ``None`` so the caller's drift / since-filter paths
+        # decide deterministically. Riot's templates always include
+        # an offset on the ``<time datetime>`` attribute, so this is
+        # genuinely a drift-shaped event rather than a normal value.
+        return None
+    return parsed
 
 
 def _clean_body_text(soup: BeautifulSoup) -> str:

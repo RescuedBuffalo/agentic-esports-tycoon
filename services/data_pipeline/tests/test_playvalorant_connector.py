@@ -203,6 +203,50 @@ def test_transform_yields_one_record_with_all_fields_populated() -> None:
     assert "Clove" in record.body_text
 
 
+def test_validate_preserves_hotfix_letter_suffix_in_patch_version() -> None:
+    """``Patch 11.07b`` parses to version ``11.07b``, not ``11.07``.
+
+    Riot occasionally ships a letter-suffixed hotfix (a quick balance
+    pass between numbered patches). ``patch_version`` is the UPSERT
+    key in BUF-83's schema; if the suffix were dropped, the hotfix
+    would overwrite the base patch's row instead of getting its own.
+    """
+    html = """
+    <html><head><title>VALORANT Patch Notes 11.07b</title></head>
+    <body>
+      <h1>VALORANT Patch Notes 11.07b</h1>
+      <time datetime="2026-05-14T17:00:00Z"></time>
+      <main><article><p>Quick hotfix for Patch 11.07.</p></article></main>
+    </body></html>
+    """
+    connector = PlayValorantPatchNotesConnector(http_get=_make_http_get({}))
+    validated = connector.validate({"url": "https://playvalorant.com/x", "html": html})
+    assert validated["patch_version"] == "11.07b"
+
+
+def test_validate_treats_naive_datetime_as_drift_rather_than_typeerror() -> None:
+    """An offsetless ``<time datetime>`` becomes drift, not a runtime crash.
+
+    ``datetime.fromisoformat`` returns a naive datetime when the
+    string lacks an offset. Comparing that against a timezone-aware
+    ``since`` (which the runner always passes) raises ``TypeError``
+    and would abort the whole pass. The parser now returns ``None``
+    on a naive value, and validate surfaces that as a clean
+    ``SchemaDriftError`` so the runner logs it and moves on.
+    """
+    html = """
+    <html><head><title>VALORANT Patch Notes 9.10</title></head>
+    <body>
+      <h1>VALORANT Patch Notes 9.10</h1>
+      <time datetime="2026-05-14T17:00:00"></time>  <!-- naive, no offset -->
+      <main><article><p>Body.</p></article></main>
+    </body></html>
+    """
+    connector = PlayValorantPatchNotesConnector(http_get=_make_http_get({}))
+    with pytest.raises(SchemaDriftError):
+        connector.validate({"url": "https://playvalorant.com/x", "html": html})
+
+
 # --- list-card filtering --------------------------------------------------
 
 
