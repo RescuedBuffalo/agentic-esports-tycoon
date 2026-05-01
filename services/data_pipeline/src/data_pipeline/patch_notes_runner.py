@@ -143,17 +143,32 @@ class PatchNoteConnector(ABC):
 class PatchNotesStats:
     """Counters returned from :func:`run_patch_notes_ingestion`.
 
-    ``upserted`` covers both inserts and updates — distinguishing them
-    cleanly from one statement requires a ``RETURNING`` round-trip per
-    row, which isn't worth the chattiness for a weekly-cadence connector.
-    Operators who need the split can derive it from the row's
-    ``fetched_at`` vs the current run's start timestamp.
+    Per-row outcomes split three ways so an operator can answer the
+    "did anything actually change?" question without joining ``fetched_at``
+    against the run start timestamp:
+
+    * ``inserted``  — the row was new on this pass.
+    * ``updated``   — a row already existed and a column visibly changed
+                      (``raw_html`` / ``body_text`` / ``url`` /
+                      ``published_at``).
+    * ``unchanged`` — the row already existed and its content matched.
+                      ``fetched_at`` is still bumped (the freshness check
+                      relies on it), but no other column was touched.
+
+    ``upserted`` is retained as the inserts + updates total for callers
+    that just want "did we write anything that mattered." The
+    ``unchanged`` count is excluded from ``upserted`` deliberately —
+    re-running on a quiet week should report zero "upserts" so the
+    on-call dashboard doesn't false-positive a healthy idle pass.
     """
 
     fetched: int = 0
     schema_drifts: int = 0
     transient_errors: int = 0
     upserted: int = 0
+    inserted: int = 0
+    updated: int = 0
+    unchanged: int = 0
     by_version: dict[str, int] = field(default_factory=dict)
 
 
@@ -247,22 +262,36 @@ def run_patch_notes_ingestion(
         stats.fetched += 1
 
         for record in records:
-            _upsert_patch_note(session, source=connector.source_name, record=record)
-            stats.upserted += 1
+            _, outcome = _upsert_patch_note(session, source=connector.source_name, record=record)
+            if outcome == "inserted":
+                stats.inserted += 1
+                stats.upserted += 1
+            elif outcome == "updated":
+                stats.updated += 1
+                stats.upserted += 1
+            else:
+                # "unchanged" — fetched_at still bumped, but no column
+                # changed. Excluded from ``upserted`` so a quiet weekly
+                # pass reports a clean zero on the on-call dashboard.
+                stats.unchanged += 1
             stats.by_version[record.patch_version] = (
                 stats.by_version.get(record.patch_version, 0) + 1
             )
             log.info(
-                "patch_notes.upserted",
+                "patch_notes.upsert",
                 source=connector.source_name,
                 patch_version=record.patch_version,
                 published_at=record.published_at.isoformat(),
+                outcome=outcome,
             )
 
     bound.info(
         "patch_notes.done",
         fetched=stats.fetched,
         upserted=stats.upserted,
+        inserted=stats.inserted,
+        updated=stats.updated,
+        unchanged=stats.unchanged,
         schema_drifts=stats.schema_drifts,
         transient_errors=stats.transient_errors,
     )
@@ -274,7 +303,7 @@ def _upsert_patch_note(
     *,
     source: str,
     record: PatchNoteRecord,
-) -> PatchNote:
+) -> tuple[PatchNote, str]:
     """UPSERT semantics on ``(source, patch_version)``.
 
     SELECT-then-INSERT-or-UPDATE rather than ``INSERT ... ON CONFLICT``
@@ -288,8 +317,17 @@ def _upsert_patch_note(
     DTO (:class:`PatchNoteRecord`) stays connector-agnostic.
 
     ``fetched_at`` is server-default ``now()`` on insert and explicitly
-    bumped to ``datetime.now(UTC)`` on update so operators can tell
-    when each row was last touched.
+    bumped to ``datetime.now(UTC)`` on every update — including the
+    ``"unchanged"`` path — so the freshness check observes the
+    re-scrape regardless of whether the body actually moved.
+
+    Returns the row plus an outcome tag of ``"inserted"`` / ``"updated"``
+    / ``"unchanged"`` so the caller can attribute counters granularly.
+    The distinction between ``"updated"`` and ``"unchanged"`` is
+    field-by-field equality on the columns the connector actually
+    populates (``published_at`` / ``raw_html`` / ``body_text`` / ``url``)
+    — a re-fetch that returns byte-identical HTML takes the
+    ``"unchanged"`` branch.
     """
     existing: PatchNote | None = session.execute(
         select(PatchNote).where(
@@ -309,20 +347,36 @@ def _upsert_patch_note(
         )
         session.add(new)
         session.flush()
-        return new
+        return new, "inserted"
 
-    existing.published_at = record.published_at
-    existing.raw_html = record.raw_html
-    existing.body_text = record.body_text
-    existing.url = record.url
-    # Bump ``fetched_at`` on update so the freshness check observes the
-    # re-scrape, even if the upstream content hasn't changed. We use the
-    # process clock (UTC) rather than ``func.now()`` so the assignment is
-    # visible on the in-memory ORM object before flush — the entity-runner
-    # tests rely on this pattern too.
+    # Detect a meaningful change before deciding insert/update vs
+    # unchanged. Comparing ``published_at`` is timezone-safe — both
+    # sides are TIMESTAMPTZ-backed by SQLAlchemy's ``DateTime(timezone=
+    # True)``. The body / html / url comparisons are byte-exact so a
+    # reformatted-but-equivalent re-fetch lands in ``"updated"`` rather
+    # than ``"unchanged"``; that's the conservative direction (over-
+    # report churn rather than miss real edits).
+    changed = (
+        existing.published_at != record.published_at
+        or existing.raw_html != record.raw_html
+        or existing.body_text != record.body_text
+        or existing.url != record.url
+    )
+
+    if changed:
+        existing.published_at = record.published_at
+        existing.raw_html = record.raw_html
+        existing.body_text = record.body_text
+        existing.url = record.url
+
+    # Bump ``fetched_at`` on every re-scrape so the freshness check
+    # observes the pass even on an idle week. We use the process clock
+    # (UTC) rather than ``func.now()`` so the assignment is visible on
+    # the in-memory ORM object before flush — the entity-runner tests
+    # rely on this pattern too.
     existing.fetched_at = datetime.now(tz=UTC)
     session.flush()
-    return existing
+    return existing, ("updated" if changed else "unchanged")
 
 
 __all__ = [

@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Iterable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urljoin
 
@@ -58,6 +58,15 @@ LIST_URL = "https://playvalorant.com/en-us/news/game-updates/"
 # 200 pages comfortably covers everything from Episode 1 Act 1 (2020-06-02)
 # forward with several years of headroom.
 _MAX_LIST_PAGES = 200
+
+# Default historical floor: VALORANT's E1A1 launch (2020-06-02). The
+# connector's ``fetch`` filters articles published on-or-before
+# ``max(since, min_published_at)`` so a fresh backfill can pass
+# ``since=epoch`` without grinding through pre-launch garbage that
+# would otherwise SCHEMA_DRIFT (older news section, unrelated formats).
+# Operators can tighten this floor (e.g. to "from patch 5.0 onward")
+# via the constructor without touching code.
+_DEFAULT_MIN_PUBLISHED_AT = datetime(2020, 6, 2, tzinfo=UTC)
 
 # ``Patch X.YY`` (with optional patch-letter, e.g. "Patch 5.04 ") is the
 # title format Riot has used since Episode 1. Riot's <title> tag actually
@@ -119,10 +128,39 @@ class PlayValorantPatchNotesConnector(PatchNoteConnector):
         http_get: HttpGet,
         list_url: str = LIST_URL,
         max_list_pages: int = _MAX_LIST_PAGES,
+        min_published_at: datetime = _DEFAULT_MIN_PUBLISHED_AT,
     ) -> None:
+        """Construct a playvalorant patch-notes connector.
+
+        ``min_published_at`` is a hard archival floor evaluated as
+        ``max(since, min_published_at)`` inside ``fetch``. The default
+        is VALORANT's E1A1 launch (2020-06-02), the earliest date we
+        could plausibly find a real patch article on. Operators
+        tighten this when they only want a sub-window — e.g. setting
+        it to 2022-06-22 to align with the BUF-3 acceptance criterion
+        ("from patch 5.0 onward") for a downstream BUF-24 backfill
+        that doesn't need the full pre-5.0 history.
+
+        Why a floor on top of the runner's ``since`` watermark: the
+        watermark moves forward as runs complete and is the right
+        knob for *incremental* polling. The floor is a static
+        configuration that survives a watermark reset (e.g. someone
+        runs ``since=EPOCH`` to rebuild from scratch); without it a
+        backfill would drill into every ``/news/game-updates/``
+        article all the way back to whenever Riot first published
+        non-patch news under that path.
+        """
+        if min_published_at.tzinfo is None:
+            # Naive ``min_published_at`` would compare unequally
+            # against the timezone-aware list-card timestamps and
+            # raise ``TypeError`` mid-fetch. Reject at construction
+            # time so the failure mode is "test/config error", not
+            # "scheduler crashed at 03:00 UTC".
+            raise ValueError("min_published_at must be timezone-aware")
         self._http_get = http_get
         self._list_url = list_url
         self._max_list_pages = max_list_pages
+        self._min_published_at = min_published_at
 
     # -- metadata -----------------------------------------------------------
 
@@ -178,7 +216,13 @@ class PlayValorantPatchNotesConnector(PatchNoteConnector):
         ``transient_errors`` and the next scheduled pass retries from
         page 1 — the only safe outcome when we can't tell whether
         we've crossed the ``since`` watermark yet.
+
+        ``min_published_at`` is layered on top of ``since`` as
+        ``floor = max(since, self._min_published_at)``. This protects
+        a fresh-from-scratch backfill (``since=EPOCH``) from grinding
+        the pre-launch / non-patch tail of the feed.
         """
+        floor = max(since, self._min_published_at)
         for page in range(1, self._max_list_pages + 1):
             page_url = self._list_url if page == 1 else f"{self._list_url}?page={page}"
             try:
@@ -206,7 +250,7 @@ class PlayValorantPatchNotesConnector(PatchNoteConnector):
             new_cards = [
                 card
                 for card in cards
-                if card["published_at"] is None or card["published_at"] > since
+                if card["published_at"] is None or card["published_at"] > floor
             ]
             if not new_cards:
                 # All articles on this page are at-or-before ``since`` —
@@ -380,11 +424,29 @@ def _extract_title(soup: BeautifulSoup) -> str | None:
 
 
 def _extract_published_at(soup: BeautifulSoup) -> datetime | None:
-    """Find the first ``<time datetime=...>`` on the page and parse it.
+    """Find the article's publish timestamp via a layered selector chain.
 
-    Riot templates wrap the article date in a ``<time>`` element with a
-    machine-readable ISO-8601 ``datetime`` attribute. We trust the
-    attribute over the human-readable text content.
+    Strategies tried in order; first parseable hit wins:
+
+    1. ``<time datetime="...">`` — Riot's current semantic-HTML template.
+       Trust the attribute over the human-readable text content.
+    2. ``<meta property="article:published_time" content="...">`` —
+       OpenGraph metadata. Survives template churn because Riot's
+       social-share head block is regenerated independently of the
+       article-body markup.
+    3. ``<meta name="parsely-pub-date" content="...">`` — Parse.ly
+       analytics tag still present on older articles; cheap belt-and-
+       braces against a future redesign that drops both of the above.
+
+    Returning ``None`` (rather than raising) keeps this helper composable
+    — ``validate`` is the single place that turns "no timestamp" into a
+    :class:`SchemaDriftError`. Naive datetimes (no offset) also degrade
+    to ``None`` per :func:`_parse_iso8601` so the runner's offset-aware
+    ``since`` comparison can't trip a ``TypeError``.
+
+    The OpenGraph + Parse.ly fallbacks are layered fallbacks for layout
+    drift, not new acceptance criteria — the primary contract is still
+    ``<time datetime>``.
     """
     for time_tag in soup.find_all("time"):
         if not isinstance(time_tag, Tag):
@@ -394,6 +456,23 @@ def _extract_published_at(soup: BeautifulSoup) -> datetime | None:
             parsed = _parse_iso8601(attr)
             if parsed is not None:
                 return parsed
+
+    # CSS attribute selectors with ``:`` in the value (e.g.
+    # ``article:published_time``) must be quoted — soupsieve treats the
+    # bare colon as a pseudo-class boundary otherwise. The other selectors
+    # are quoted for consistency.
+    for selector, attr_name in (
+        ('meta[property="article:published_time"]', "content"),
+        ('meta[name="parsely-pub-date"]', "content"),
+    ):
+        meta = soup.select_one(selector)
+        if isinstance(meta, Tag):
+            value = meta.get(attr_name)
+            if isinstance(value, str):
+                parsed = _parse_iso8601(value)
+                if parsed is not None:
+                    return parsed
+
     return None
 
 
@@ -451,13 +530,23 @@ def _clean_body_text(soup: BeautifulSoup) -> str:
             if isinstance(el, Tag):
                 el.decompose()
 
-    # Prefer the article body if it's marked up; otherwise fall back to
-    # ``<main>`` and finally to the document root.
+    # Prefer the article body if it's marked up; otherwise try the
+    # front-end team's stable QA hook (``data-testid="article-body"`` —
+    # often outlives a visual-template redesign because Cypress / RTL
+    # selectors are coupled to it), then ``<main>``, and finally fall
+    # back to the document root. The QA-hook fallback is a layered
+    # defence against a redesign that retires ``<article>`` for a
+    # styled ``<div>`` — without it we'd silently get the whole page
+    # body wrapped in chrome-stripping (which usually still works, but
+    # produces noisier ``body_text`` until a parser update lands).
     container: Tag | BeautifulSoup
     article = soup.find("article")
+    testid_body = soup.select_one('[data-testid="article-body"]')
     main = soup.find("main")
     if isinstance(article, Tag):
         container = article
+    elif isinstance(testid_body, Tag):
+        container = testid_body
     elif isinstance(main, Tag):
         container = main
     else:
