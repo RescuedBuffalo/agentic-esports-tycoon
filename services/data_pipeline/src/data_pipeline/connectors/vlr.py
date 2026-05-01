@@ -178,17 +178,42 @@ def _parse_disallows(body: str, *, user_agent: str) -> Iterable[str]:
     Comments, blank lines, and unsupported directives (Crawl-delay,
     Sitemap, etc.) are dropped — :mod:`urllib.robotparser` overcomplicates
     this for what's effectively a 50-line file.
+
+    Group semantics (RFC 9309 §2.1): one or more *consecutive*
+    ``User-agent:`` lines define a single group; rules that follow apply
+    to every UA in the group. The previous implementation treated each
+    ``User-agent:`` line independently and would clear ``in_block_for_us``
+    on a non-matching UA even when the immediately-preceding UA in the
+    same group matched us — silently ignoring rules meant to apply to
+    us. The state machine below tracks ``state_after_rule``: a UA line
+    seen *after* a rule line starts a new group; consecutive UA lines
+    accumulate match status into the current group.
     """
     ua_lower = user_agent.lower()
-    in_block_for_us = False
-    seen_specific = False
-    pending_disallows: list[str] = []
+
+    # Per-group: did at least one UA in this group match us, and was the
+    # match a specific UA (not ``*``)? We use these to attribute rules
+    # to the right bucket below.
+    group_matches_specific = False
+    group_matches_star = False
+    state_after_rule = False  # last meaningful line was a rule directive
+
+    specific_disallows: list[str] = []
     star_disallows: list[str] = []
+
+    def _reset_group() -> None:
+        # Local helper so the resets stay in sync everywhere.
+        nonlocal group_matches_specific, group_matches_star, state_after_rule
+        group_matches_specific = False
+        group_matches_star = False
+        state_after_rule = False
 
     for raw in body.splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
-            in_block_for_us = False
+            # Blank line ends a group definition; rules already collected
+            # have been attributed.
+            _reset_group()
             continue
         if ":" not in line:
             continue
@@ -197,25 +222,39 @@ def _parse_disallows(body: str, *, user_agent: str) -> Iterable[str]:
         value = value.strip()
 
         if key == "user-agent":
+            # A UA line that follows a rule line ends the previous group
+            # and starts a new one. Consecutive UA lines (no intervening
+            # rule) just keep adding to the current group.
+            if state_after_rule:
+                _reset_group()
             agent = value.lower()
-            # Match either an exact prefix (e.g. our project token) or
-            # the wildcard ``*``. We prefer a specific block over ``*``.
-            if agent != "*" and agent in ua_lower:
-                in_block_for_us = True
-                seen_specific = True
-                pending_disallows = []
-            elif agent == "*" and not seen_specific:
-                in_block_for_us = True
-            else:
-                in_block_for_us = False
-        elif key == "disallow" and in_block_for_us:
-            if value:
-                if seen_specific:
-                    pending_disallows.append(value)
-                else:
-                    star_disallows.append(value)
+            if agent == "*":
+                group_matches_star = True
+            elif agent in ua_lower:
+                group_matches_specific = True
+            # A UA that doesn't match either pattern is just ignored —
+            # crucially, we do NOT clear earlier matches in this group.
+        elif key == "disallow":
+            state_after_rule = True
+            if not value:
+                continue
+            # A specific-UA match wins over a wildcard match within the
+            # same group; downstream we additionally prefer specific
+            # over wildcard across groups.
+            if group_matches_specific:
+                specific_disallows.append(value)
+            elif group_matches_star:
+                star_disallows.append(value)
+        else:
+            # Other rule-like directives (Allow, Crawl-delay, Sitemap, …)
+            # we don't model, but they still count as "rule" for the
+            # state machine so a following UA opens a new group.
+            state_after_rule = True
 
-    yield from (pending_disallows or star_disallows)
+    # RFC 9309 §2.2.1: the most specific matching group wins. If we
+    # collected any disallows from a specific-UA group, they take
+    # precedence over the wildcard group's rules.
+    yield from (specific_disallows or star_disallows)
 
 
 def _http_get(url: str) -> str:
@@ -494,34 +533,45 @@ class VLRParser:
         """``/matches?completed`` is a list of finished matches.
 
         We yield one TEAM row per ``<a href="/team/<id>/<slug>">``
-        anchor and stash the match metadata (id, completed_at, the
-        opposing team) on ``extra`` because :class:`EntityType.MATCH`
-        doesn't exist in the schema yet (out of scope per BUF-10 ticket
-        notes).
+        anchor *that lives inside a match card*, and stash the match
+        metadata (id, completed_at) on ``extra`` because
+        :class:`EntityType.MATCH` doesn't exist in the schema yet
+        (out of scope per BUF-10 ticket notes).
 
-        Per-row timestamps come from a sibling ``data-utc-ts`` (or the
-        anchor's own ``data-utc-ts``) so the connector's ``since``
-        filter can drop already-seen completed matches without us
-        having to remember the last-processed match id.
+        Match-card anchors are recognised by carrying both
+        ``data-match-id`` and ``data-utc-ts`` (either directly or
+        inherited from an enclosing card element via
+        :class:`_AnchorCollector`). Anchors without that pair are
+        page chrome — the global nav has ``/team/.../current-roster``
+        links, the sidebar lists "popular teams", etc. Including them
+        as match rows would mean every ``/matches?completed`` crawl
+        re-ingests the same chrome links (no timestamp -> bypasses the
+        ``since`` filter -> reprocessed every run). Filtering at the
+        anchor level keeps staging clean without forcing the resolver
+        to recognise duplicates downstream.
         """
         for anchor in _iter_anchors(html):
             ids = _extract_team_id_from_url(anchor["href"])
             if not ids:
                 continue
+            attrs = anchor["attrs"]
+            match_id = attrs.get("data-match-id")
+            ts_raw = attrs.get("data-utc-ts")
+            if not match_id or not ts_raw:
+                # Page chrome / sidebar link — not a match row. Skip
+                # rather than emit a stale row that would bypass the
+                # since-filter on every subsequent crawl.
+                continue
+            ts = _parse_iso_timestamp(ts_raw)
             vlr_id, slug = ids
             display_name = anchor["text"] or slug
-            ts = _parse_iso_timestamp(anchor["attrs"].get("data-utc-ts"))
-            extra: dict[str, Any] = {"slug": slug}
-            match_id = anchor["attrs"].get("data-match-id")
-            if match_id:
-                extra["match_id"] = match_id
             yield VLRPageRow(
                 entity_type=EntityType.TEAM,
                 vlr_id=vlr_id,
                 display_name=display_name,
                 profile_url=urllib.parse.urljoin(self.base_url, anchor["href"]),
                 timestamp=ts,
-                extra=extra,
+                extra={"slug": slug, "match_id": match_id},
             )
 
     def parse_rankings(self, html: str) -> Iterable[VLRPageRow]:

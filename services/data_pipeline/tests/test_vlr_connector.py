@@ -568,6 +568,100 @@ def test_robots_failure_falls_through_to_allow() -> None:
     assert cache.allows(f"{VLR_BASE_URL}/stats") is True
 
 
+def test_robots_grouped_user_agents_share_rules() -> None:
+    """Consecutive ``User-agent`` lines start one shared group (RFC 9309 §2.1).
+
+    The earlier parser dropped out of the matching group as soon as it
+    saw a non-matching ``User-agent`` line, so this layout silently
+    crawled ``/private``::
+
+        User-agent: agentic-esports-tycoon-data-pipeline
+        User-agent: otherbot
+        Disallow: /private
+
+    Both UA lines belong to the same group; the ``Disallow`` should
+    apply to us. The test pins that contract.
+    """
+    body = (
+        "User-agent: agentic-esports-tycoon-data-pipeline\n"
+        "User-agent: otherbot\n"
+        "Disallow: /private\n"
+    )
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=lambda _u: body)
+    assert cache.allows(f"{VLR_BASE_URL}/private") is False
+
+
+def test_robots_specific_group_overrides_wildcard() -> None:
+    """A specific-UA group's rules take precedence over ``User-agent: *``."""
+    body = (
+        "User-agent: *\n"
+        "Disallow: /everything\n"
+        "\n"
+        "User-agent: agentic-esports-tycoon-data-pipeline\n"
+        "Disallow: /just-us\n"
+    )
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=lambda _u: body)
+    # The specific group wins entirely — wildcard rules don't merge.
+    assert cache.allows(f"{VLR_BASE_URL}/everything") is True
+    assert cache.allows(f"{VLR_BASE_URL}/just-us") is False
+
+
+def test_robots_new_group_after_rule_resets_match_state() -> None:
+    """A ``User-agent`` line after a rule starts a fresh group.
+
+    If the second group's UA doesn't match, its rules don't apply to
+    us — even though the previous group's matched. Without correct
+    state-machine handling the parser could leak a matching-group's
+    ``state_after_rule`` into the next group's UA decision.
+    """
+    body = (
+        "User-agent: agentic-esports-tycoon-data-pipeline\n"
+        "Disallow: /ours\n"
+        "\n"
+        "User-agent: someone-else\n"
+        "Disallow: /theirs\n"
+    )
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=lambda _u: body)
+    assert cache.allows(f"{VLR_BASE_URL}/ours") is False
+    # ``/theirs`` belongs to a non-matching group — we may crawl it.
+    assert cache.allows(f"{VLR_BASE_URL}/theirs") is True
+
+
+def test_parse_matches_skips_anchors_without_match_metadata() -> None:
+    """Page-chrome ``/team/...`` links must not be ingested as match rows.
+
+    VLR's ``/matches`` page header carries global nav links like
+    ``/team/9/sentinels/current-roster`` and a sidebar with "popular
+    teams". They have no ``data-match-id`` / ``data-utc-ts``. Without
+    a metadata gate, every crawl would re-emit those rows with a
+    ``None`` timestamp, bypass the since-filter, and flood the staging
+    queue on every pass.
+    """
+    chrome_plus_card_html = """
+    <html><body>
+      <header>
+        <a href="/team/9/sentinels">Sentinels</a>  <!-- nav link, no metadata -->
+      </header>
+      <aside>
+        <a href="/team/120/100-thieves">Popular: 100T</a>  <!-- sidebar -->
+      </aside>
+      <div class="match-item" data-match-id="m-real" data-utc-ts="2026-04-26T22:00:00Z">
+        <a href="/team/188/leviatan">LEVIATAN</a>
+        <a href="/team/4915/loud">LOUD</a>
+      </div>
+    </body></html>
+    """
+    parser = VLRParser()
+    rows = list(parser.parse_matches(chrome_plus_card_html))
+
+    # Only the two anchors inside the real match card emit rows; the
+    # nav and sidebar anchors (no inherited match metadata) are skipped.
+    assert {row.vlr_id for row in rows} == {"188", "4915"}
+    for row in rows:
+        assert row.extra["match_id"] == "m-real"
+        assert row.timestamp is not None
+
+
 def test_fetch_skips_disallowed_pages() -> None:
     """End-to-end: a disallowed page yields zero payloads for that URL."""
     cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=lambda _u: "")
