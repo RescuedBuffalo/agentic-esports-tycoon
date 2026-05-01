@@ -606,6 +606,29 @@ def test_robots_specific_group_overrides_wildcard() -> None:
     assert cache.allows(f"{VLR_BASE_URL}/just-us") is False
 
 
+def test_robots_picks_most_specific_matching_group_by_token_length() -> None:
+    """RFC 9309 §2.2.1: when multiple groups match, only the most-specific applies.
+
+    A robots file with both a broader prefix (e.g. ``agentic``) and the
+    full token (``agentic-esports-tycoon-data-pipeline``) used to merge
+    rules from both groups, restricting paths the more-specific group
+    deliberately leaves open. The fix tracks each matching UA's token
+    length and yields only the longest-match group's disallows.
+    """
+    body = (
+        "User-agent: agentic\n"
+        "Disallow: /broad-only\n"
+        "\n"
+        "User-agent: agentic-esports-tycoon-data-pipeline\n"
+        "Disallow: /narrow-only\n"
+    )
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=lambda _u: body)
+
+    # Only the longer-match group's disallow applies.
+    assert cache.allows(f"{VLR_BASE_URL}/narrow-only") is False
+    assert cache.allows(f"{VLR_BASE_URL}/broad-only") is True
+
+
 def test_robots_specific_group_with_no_disallow_overrides_wildcard() -> None:
     """A matching specific group's *existence* overrides the wildcard.
 

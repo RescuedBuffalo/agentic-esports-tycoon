@@ -181,45 +181,47 @@ def _parse_disallows(body: str, *, user_agent: str) -> Iterable[str]:
 
     Group semantics (RFC 9309 §2.1): one or more *consecutive*
     ``User-agent:`` lines define a single group; rules that follow apply
-    to every UA in the group. The previous implementation treated each
-    ``User-agent:`` line independently and would clear ``in_block_for_us``
-    on a non-matching UA even when the immediately-preceding UA in the
-    same group matched us — silently ignoring rules meant to apply to
-    us. The state machine below tracks ``state_after_rule``: a UA line
-    seen *after* a rule line starts a new group; consecutive UA lines
-    accumulate match status into the current group.
+    to every UA in the group. The state machine below tracks
+    ``state_after_rule``: a UA line seen *after* a rule line starts a
+    new group; consecutive UA lines accumulate match status into the
+    current group.
+
+    Most-specific match (RFC 9309 §2.2.1): when multiple groups match
+    our UA at different specificities (e.g. a robots file lists both
+    ``User-agent: agentic`` *and* ``User-agent: agentic-esports-tycoon-
+    data-pipeline``), only the most-specific group's rules apply.
+    Specificity is the length of the matching UA token; the wildcard
+    ``*`` is the lowest at 0. We collect matches with their specificity
+    and pick the maximum at the end, so a less-specific group's
+    ``Disallow`` doesn't accidentally restrict paths the more-specific
+    group leaves open.
     """
     ua_lower = user_agent.lower()
 
-    # Per-group: did at least one UA in this group match us, and was the
-    # match a specific UA (not ``*``)? We use these to attribute rules
-    # to the right bucket below.
-    group_matches_specific = False
-    group_matches_star = False
-    state_after_rule = False  # last meaningful line was a rule directive
+    # Per-group: longest matching UA-token length seen so far in the
+    # current group; ``None`` if no UA in this group has matched us.
+    # Wildcard ``*`` matches at length 0 (lowest specificity); a
+    # specific UA matches at ``len(token)`` if that token is a
+    # substring of our UA.
+    group_match_length: int | None = None
+    state_after_rule = False
 
-    # Whether we *saw* a matching specific-UA group anywhere in the file
-    # — independent of whether that group contained any Disallow rules.
-    # This matters for the override-the-wildcard semantics: a specific
-    # group that matches us with zero disallows means "allow everything
-    # for our bot", and must NOT fall through to the wildcard's rules.
-    saw_specific_group = False
-
-    specific_disallows: list[str] = []
-    star_disallows: list[str] = []
+    # Per-disallow record: (specificity, path-or-None). We collect all
+    # matches up front and pick the max specificity at the end. ``None``
+    # in the path slot represents an *empty* ``Disallow:`` (RFC 9309's
+    # explicit "allow all" sentinel) — we still record it so the group's
+    # specificity counts in the max-pick, but we don't emit a path.
+    matches: list[tuple[int, str | None]] = []
 
     def _reset_group() -> None:
-        # Local helper so the resets stay in sync everywhere.
-        nonlocal group_matches_specific, group_matches_star, state_after_rule
-        group_matches_specific = False
-        group_matches_star = False
+        nonlocal group_match_length, state_after_rule
+        group_match_length = None
         state_after_rule = False
 
     for raw in body.splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
-            # Blank line ends a group definition; rules already collected
-            # have been attributed.
+            # Blank line ends a group definition.
             _reset_group()
             continue
         if ":" not in line:
@@ -235,53 +237,44 @@ def _parse_disallows(body: str, *, user_agent: str) -> Iterable[str]:
             if state_after_rule:
                 _reset_group()
             agent = value.lower()
+            this_match: int | None = None
             if agent == "*":
-                group_matches_star = True
-            elif agent in ua_lower:
-                group_matches_specific = True
-                saw_specific_group = True
-            # A UA that doesn't match either pattern is just ignored —
-            # crucially, we do NOT clear earlier matches in this group.
+                this_match = 0  # wildcard: lowest specificity
+            elif agent and agent in ua_lower:
+                this_match = len(agent)  # specific: token length
+            if this_match is not None and (
+                group_match_length is None or this_match > group_match_length
+            ):
+                group_match_length = this_match
         elif key == "disallow":
             state_after_rule = True
-            if not value:
-                # Per RFC 9309: an empty ``Disallow:`` is the explicit
-                # "Allow all" sentinel. Don't add it to either bucket;
-                # ``state_after_rule`` still flips so a following UA line
-                # opens a new group.
+            if group_match_length is None:
+                # No matching UA in this group; ignore its rules.
                 continue
-            # A specific-UA match wins over a wildcard match within the
-            # same group; downstream we additionally prefer specific
-            # over wildcard across groups.
-            if group_matches_specific:
-                specific_disallows.append(value)
-            elif group_matches_star:
-                star_disallows.append(value)
+            if not value:
+                # Empty Disallow = "allow all" sentinel. Record the
+                # group's existence at its specificity so it can
+                # outrank a less-specific group's restrictive rules.
+                matches.append((group_match_length, None))
+                continue
+            matches.append((group_match_length, value))
         else:
             # Other rule-like directives (Allow, Crawl-delay, Sitemap, …)
             # we don't model, but they still count as "rule" for the
             # state machine so a following UA opens a new group.
             state_after_rule = True
 
-    # RFC 9309 §2.2.1: the most specific matching group wins. A specific
-    # group's *existence* — not just its disallow content — overrides
-    # the wildcard group entirely. Otherwise a robots file like::
-    #
-    #     User-agent: *
-    #     Disallow: /
-    #
-    #     User-agent: agentic-esports-tycoon-data-pipeline
-    #     Disallow:
-    #
-    # (which deliberately allows our bot while blocking everything else)
-    # would be misread as "block everything" because
-    # ``specific_disallows`` is ``[]`` and falls through to
-    # ``star_disallows``. We therefore branch on whether a matching
-    # specific group was seen, not on whether it produced any disallows.
-    if saw_specific_group:
-        yield from specific_disallows
-    else:
-        yield from star_disallows
+    if not matches:
+        return
+
+    # Most-specific match wins. Pick the maximum specificity and yield
+    # only the path entries from groups at that level. ``None`` paths
+    # (empty Disallow sentinels) drop out at the comprehension; they
+    # still served their purpose of pinning the max specificity.
+    best_specificity = max(specificity for specificity, _ in matches)
+    for specificity, path in matches:
+        if specificity == best_specificity and path is not None:
+            yield path
 
 
 def _http_get(url: str) -> str:
