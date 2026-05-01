@@ -35,12 +35,34 @@ from esports_sim.resolver.core import (
     ResolveResult,
     resolve_entity,
 )
+from esports_sim.resolver.worker import (
+    SOURCE_PRIORITY,
+    ConflictRecord,
+    ExtractedHandle,
+    MergeResult,
+    RebrandConflictError,
+    WorkerStats,
+    handle_rebrand,
+    lookup_alias_at,
+    merge_records,
+    process_staging_queue,
+)
 
 __all__ = [
     "AUTO_MERGE_THRESHOLD",
+    "ConflictRecord",
+    "ExtractedHandle",
+    "MergeResult",
     "REVIEW_THRESHOLD",
+    "RebrandConflictError",
     "ResolutionStatus",
     "ResolveCandidate",
     "ResolveResult",
+    "SOURCE_PRIORITY",
+    "WorkerStats",
+    "handle_rebrand",
+    "lookup_alias_at",
+    "merge_records",
+    "process_staging_queue",
     "resolve_entity",
 ]
