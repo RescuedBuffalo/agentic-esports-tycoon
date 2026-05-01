@@ -107,6 +107,28 @@ _MAX_RETRY_AFTER_SECONDS = 120.0
 HttpResponse = dict[str, Any]
 HttpGet = Callable[[str, dict[str, Any]], HttpResponse]
 
+# Exception types we accept as "transient transport failure" inside
+# ``_get``. These are the recoverable shapes — everything else (a
+# RuntimeError from the default factory's RIOT_API_KEY check, an
+# ImportError from a broken httpx install, an AttributeError from a
+# code regression) bubbles up so the run aborts loudly. Adding a new
+# entry here is a deliberate decision: it removes a class of failure
+# from the operator's "fail loudly" surface.
+_TRANSPORT_FAILURES: tuple[type[BaseException], ...] = (
+    OSError,  # ConnectionError, TimeoutError, socket.gaierror, etc.
+)
+try:  # pragma: no cover - import is only present when httpx is installed
+    import httpx as _httpx_for_exceptions
+
+    _TRANSPORT_FAILURES = (*_TRANSPORT_FAILURES, _httpx_for_exceptions.HTTPError)
+    del _httpx_for_exceptions
+except ImportError:
+    # httpx is a soft runtime dependency — only the default factory
+    # uses it. Tests injecting their own ``http_get`` don't need it
+    # installed, and we'd rather skip the broader catch than refuse
+    # to import the connector at all.
+    pass
+
 
 def _default_http_get_factory() -> HttpGet:
     """Build a real-network ``http_get`` backed by ``httpx``.
@@ -441,6 +463,16 @@ class RiotConnector(Connector):
         * Any other non-200 — raise :class:`SchemaDriftError` so the
           payload is preserved for triage.
         * Malformed JSON body on a 200 — :class:`SchemaDriftError`.
+
+        Error-class triage matters for fail-fast behaviour upstream.
+        ``fetch`` swallows ``TransientFetchError`` per-seed and
+        continues, so we MUST NOT route configuration / programmer
+        errors through that class — a missing ``RIOT_API_KEY`` would
+        otherwise produce a silent no-op run with only warnings,
+        letting production stop ingesting entirely without surfacing
+        a hard failure. Only genuine transport-layer failures (network
+        timeouts, DNS misses, connection resets) become transient;
+        everything else propagates so the run aborts loudly.
         """
         try:
             response = self._http_get(url, params)
@@ -449,12 +481,17 @@ class RiotConnector(Connector):
             # raise its own TransientFetchError directly (e.g., a network
             # timeout in the real httpx wrapper).
             raise
-        except Exception as exc:
-            # Unknown network failure — treat as transient. The runner
-            # already differentiates ``TransientFetchError`` from
-            # ``SchemaDriftError``; a connect-timeout shouldn't burn
-            # the retry slot.
+        except _TRANSPORT_FAILURES as exc:
+            # Transport-layer failure (connect timeout, DNS error, TLS
+            # handshake, HTTP-level disconnect mid-stream). Treat as
+            # transient so the next scheduled run retries.
             raise TransientFetchError(f"http_get failed for {url}: {exc}") from exc
+        # Anything else — RuntimeError, ImportError, AttributeError,
+        # KeyError, etc. — is a configuration or programming bug.
+        # Letting it propagate kills the run with the original exception
+        # so an operator sees the real failure mode (e.g. unset
+        # RIOT_API_KEY, broken env, code regression) rather than a
+        # cascade of "transient" warnings.
 
         status = response.get("status_code")
         headers = response.get("headers") or {}

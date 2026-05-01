@@ -343,12 +343,14 @@ def test_fetch_raises_schema_drift_on_400() -> None:
         list(connector.fetch(_EPOCH))
 
 
-def test_fetch_unknown_http_exception_is_skipped_per_seed() -> None:
-    """Raw network errors from the http_get shim become a per-seed skip.
+def test_fetch_transport_failure_is_skipped_per_seed() -> None:
+    """Raw transport failures from the http_get shim become a per-seed skip.
 
-    ``_get`` translates a generic exception into ``TransientFetchError``;
-    that's then caught by ``fetch`` and the seed is skipped without
-    propagating. A connect-timeout shouldn't burn the whole run.
+    ``OSError`` (which covers connect timeouts, DNS misses, TLS
+    handshake failures, etc.) is the canonical "transient transport"
+    shape; ``_get`` translates it to ``TransientFetchError``, which
+    ``fetch`` then catches per-seed. A flaky network shouldn't burn
+    the whole run.
     """
 
     def boom(url: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -357,6 +359,32 @@ def test_fetch_unknown_http_exception_is_skipped_per_seed() -> None:
     connector = _make_connector(http_get=boom)
     payloads = list(connector.fetch(_EPOCH))
     assert payloads == []
+
+
+def test_fetch_propagates_configuration_errors_unchanged() -> None:
+    """Programming / configuration errors must NOT be classified as transient.
+
+    The default ``http_get`` factory raises ``RuntimeError`` when
+    ``RIOT_API_KEY`` is unset. Round 1's catch-all converted that to
+    ``TransientFetchError``; ``fetch`` then logged + skipped per seed,
+    producing a silent no-op run that let production stop ingesting
+    entirely without failing fast. The fix narrows ``_get``'s catch
+    to genuine transport-layer errors (OSError, httpx.HTTPError);
+    everything else propagates so the run aborts loudly with the
+    actual root-cause exception.
+
+    Test rigs that pass an injected ``http_get`` won't hit
+    ``RuntimeError`` from the factory, but a ``RuntimeError`` raised
+    *from inside* the injected callable simulates the same shape and
+    must not be silently swallowed.
+    """
+
+    def misconfigured(url: str, params: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("RIOT_API_KEY not set; cannot make Riot API calls")
+
+    connector = _make_connector(http_get=misconfigured)
+    with pytest.raises(RuntimeError, match="RIOT_API_KEY"):
+        list(connector.fetch(_EPOCH))
 
 
 def test_fetch_dedupes_match_id_across_seeds() -> None:
@@ -410,11 +438,17 @@ def test_fetch_payload_omits_puuid_seed_for_stable_content_hash() -> None:
     same Riot response hash differently if the seed list changes
     between runs, breaking replay detection.
     """
+    # All three matches in the fixture matchlist must have a route —
+    # ``_EPOCH`` lets every entry pass the since-filter, so the
+    # connector will try to GET each one. Without ``match-old`` we'd
+    # hit ``_FakeHttp``'s "unmocked URL" AssertionError, which now
+    # propagates (it's no longer silently swallowed as a transient).
     http = _FakeHttp(
         {
             "matchlists/by-puuid": _matchlist_response(),
             "matches/match-001": _ok_match(),
             "matches/match-002": _ok_match(),
+            "matches/match-old": _ok_match(),
         }
     )
     connector = _make_connector(http_get=http)
