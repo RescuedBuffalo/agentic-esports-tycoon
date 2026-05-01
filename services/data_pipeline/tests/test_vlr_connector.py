@@ -606,6 +606,38 @@ def test_robots_specific_group_overrides_wildcard() -> None:
     assert cache.allows(f"{VLR_BASE_URL}/just-us") is False
 
 
+def test_robots_specific_group_with_no_disallow_overrides_wildcard() -> None:
+    """A matching specific group's *existence* overrides the wildcard.
+
+    Concrete robots.txt that previously misclassified::
+
+        User-agent: *
+        Disallow: /
+
+        User-agent: agentic-esports-tycoon-data-pipeline
+        Disallow:
+
+    The site blanket-blocks crawlers but explicitly allows our bot
+    (empty ``Disallow:`` is the RFC 9309 "Allow all" sentinel). The
+    earlier code fell through to the wildcard's ``Disallow: /`` because
+    ``specific_disallows`` was empty, marking every page as blocked
+    and silently halting ingestion. The fix tracks whether any
+    matching specific group was *seen*, not just whether it produced
+    any disallow rules.
+    """
+    body = (
+        "User-agent: *\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: agentic-esports-tycoon-data-pipeline\n"
+        "Disallow:\n"
+    )
+    cache = _RobotsCache(VLR_BASE_URL, user_agent=USER_AGENT, fetcher=lambda _u: body)
+    # Specific group exists for us with no rules -> allow everything.
+    assert cache.allows(f"{VLR_BASE_URL}/stats") is True
+    assert cache.allows(f"{VLR_BASE_URL}/anything") is True
+
+
 def test_robots_new_group_after_rule_resets_match_state() -> None:
     """A ``User-agent`` line after a rule starts a fresh group.
 

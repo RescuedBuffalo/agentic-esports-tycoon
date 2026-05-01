@@ -198,6 +198,13 @@ def _parse_disallows(body: str, *, user_agent: str) -> Iterable[str]:
     group_matches_star = False
     state_after_rule = False  # last meaningful line was a rule directive
 
+    # Whether we *saw* a matching specific-UA group anywhere in the file
+    # — independent of whether that group contained any Disallow rules.
+    # This matters for the override-the-wildcard semantics: a specific
+    # group that matches us with zero disallows means "allow everything
+    # for our bot", and must NOT fall through to the wildcard's rules.
+    saw_specific_group = False
+
     specific_disallows: list[str] = []
     star_disallows: list[str] = []
 
@@ -232,11 +239,16 @@ def _parse_disallows(body: str, *, user_agent: str) -> Iterable[str]:
                 group_matches_star = True
             elif agent in ua_lower:
                 group_matches_specific = True
+                saw_specific_group = True
             # A UA that doesn't match either pattern is just ignored —
             # crucially, we do NOT clear earlier matches in this group.
         elif key == "disallow":
             state_after_rule = True
             if not value:
+                # Per RFC 9309: an empty ``Disallow:`` is the explicit
+                # "Allow all" sentinel. Don't add it to either bucket;
+                # ``state_after_rule`` still flips so a following UA line
+                # opens a new group.
                 continue
             # A specific-UA match wins over a wildcard match within the
             # same group; downstream we additionally prefer specific
@@ -251,10 +263,25 @@ def _parse_disallows(body: str, *, user_agent: str) -> Iterable[str]:
             # state machine so a following UA opens a new group.
             state_after_rule = True
 
-    # RFC 9309 §2.2.1: the most specific matching group wins. If we
-    # collected any disallows from a specific-UA group, they take
-    # precedence over the wildcard group's rules.
-    yield from (specific_disallows or star_disallows)
+    # RFC 9309 §2.2.1: the most specific matching group wins. A specific
+    # group's *existence* — not just its disallow content — overrides
+    # the wildcard group entirely. Otherwise a robots file like::
+    #
+    #     User-agent: *
+    #     Disallow: /
+    #
+    #     User-agent: agentic-esports-tycoon-data-pipeline
+    #     Disallow:
+    #
+    # (which deliberately allows our bot while blocking everything else)
+    # would be misread as "block everything" because
+    # ``specific_disallows`` is ``[]`` and falls through to
+    # ``star_disallows``. We therefore branch on whether a matching
+    # specific group was seen, not on whether it produced any disallows.
+    if saw_specific_group:
+        yield from specific_disallows
+    else:
+        yield from star_disallows
 
 
 def _http_get(url: str) -> str:
