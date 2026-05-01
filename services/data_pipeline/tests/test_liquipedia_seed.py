@@ -449,6 +449,172 @@ def test_seed_idempotent_rerun_adds_no_rows(db_session, tmp_path: Path) -> None:
     assert second.socials[Platform.TWITCH.value].existing == 2
 
 
+# --- rebrand alias extension --------------------------------------------
+
+
+def _routes_with_rebranded_team() -> dict[str, Any]:
+    """Discovery + profile routes where the team carries ``previous_slug``.
+
+    Reuses the connector test fixture ``team_rebrand.json`` so the
+    seed test and the connector test share one source of truth on
+    rebrand payload shape. Discovery advertises only the new slug —
+    that's the production scenario, where the operator has already
+    run the seed once and the team has since rebranded.
+    """
+    return {
+        "/players": {"items": [], "next_cursor": None},
+        "/teams": {"items": [{"slug": "team-sentinels-esports"}], "next_cursor": None},
+        "/coaches": {"items": [], "next_cursor": None},
+        "/tournaments": [],
+        "/team/team-sentinels-esports": _load("team_rebrand.json"),
+    }
+
+
+@pytest.mark.integration
+def test_seed_rebrand_extends_alias_chain_with_new_slug(db_session, tmp_path: Path) -> None:
+    """Round 2 regression: a profile with ``previous_slug`` registers BOTH slugs.
+
+    Without the fix, the seed resolved on ``previous_slug`` only and
+    never persisted the new slug as an alias — so a later record
+    carrying only ``team-sentinels-esports`` would fuzzy-fall-through
+    into a fork. With the fix, both ``(LIQUIPEDIA, sentinels)`` and
+    ``(LIQUIPEDIA, team-sentinels-esports)`` map to the same canonical.
+    """
+    from esports_sim.db.models import Entity, EntityAlias
+    from sqlalchemy import select
+
+    # Pre-seed the canonical under the old slug so the rebrand path
+    # exercises the MATCHED branch — this is the realistic scenario
+    # (the seed was run before the team rebranded).
+    pre = resolve_entity_unprefixed(db_session)
+    db_session.flush()
+
+    routes = _routes_with_rebranded_team()
+    manifest = seed_from_liquipedia(
+        db_session,
+        http_get=_routed_get(routes),
+        seeds_dir=tmp_path,
+        today=date(2026, 4, 30),
+    )
+    db_session.flush()
+
+    # Exactly one team canonical; alias chain = OLD slug + NEW slug.
+    team_aliases = (
+        db_session.execute(
+            select(EntityAlias).where(
+                EntityAlias.platform == Platform.LIQUIPEDIA,
+                EntityAlias.platform_id.in_(["sentinels", "team-sentinels-esports"]),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(team_aliases) == 2
+    canonical_ids = {a.canonical_id for a in team_aliases}
+    assert canonical_ids == {pre.canonical_id}
+
+    # The new alias's valid_from carries the rebrand effective date
+    # (parsed from the profile's ``renamed_at`` field).
+    new_alias = next(a for a in team_aliases if a.platform_id == "team-sentinels-esports")
+    assert new_alias.valid_from.isoformat().startswith("2026-04-01")
+
+    # Manifest counter pegged.
+    assert manifest.by_type[EntityType.TEAM.value].rebrands_registered == 1
+    assert manifest.by_type[EntityType.TEAM.value].rebrands_existing == 0
+
+    # Sanity: still one team entity, no fork.
+    team_entities = (
+        db_session.execute(select(Entity).where(Entity.entity_type == EntityType.TEAM))
+        .scalars()
+        .all()
+    )
+    assert len(team_entities) == 1
+
+
+@pytest.mark.integration
+def test_seed_rebrand_idempotent_on_rerun(db_session, tmp_path: Path) -> None:
+    """Re-running the seed on the same rebrand profile adds no new aliases."""
+    from esports_sim.db.models import EntityAlias
+    from sqlalchemy import func, select
+
+    resolve_entity_unprefixed(db_session)
+    db_session.flush()
+
+    routes = _routes_with_rebranded_team()
+    seed_from_liquipedia(
+        db_session,
+        http_get=_routed_get(routes),
+        seeds_dir=tmp_path,
+        today=date(2026, 4, 30),
+    )
+    db_session.flush()
+    alias_count_after_first = db_session.execute(
+        select(func.count()).select_from(EntityAlias)
+    ).scalar_one()
+
+    second = seed_from_liquipedia(
+        db_session,
+        http_get=_routed_get(routes),
+        seeds_dir=tmp_path,
+        today=date(2026, 4, 30),
+    )
+    db_session.flush()
+
+    alias_count_after_second = db_session.execute(
+        select(func.count()).select_from(EntityAlias)
+    ).scalar_one()
+    assert alias_count_after_second == alias_count_after_first
+    assert second.by_type[EntityType.TEAM.value].rebrands_registered == 0
+    assert second.by_type[EntityType.TEAM.value].rebrands_existing == 1
+
+
+def resolve_entity_unprefixed(db_session: Any) -> Any:
+    """Helper: pre-seed the rebrand source canonical via the resolver chokepoint."""
+    from esports_sim.resolver import resolve_entity
+
+    return resolve_entity(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="sentinels",
+        platform_name="Sentinels",
+        entity_type=EntityType.TEAM,
+    )
+
+
+# --- _parse_renamed_at ---------------------------------------------------
+
+
+def test_parse_renamed_at_handles_bare_date() -> None:
+    """ISO date strings (no time, no tz) become UTC midnight."""
+    from data_pipeline.seeds.liquipedia import _parse_renamed_at
+
+    parsed = _parse_renamed_at("2026-04-01")
+    assert parsed.year == 2026
+    assert parsed.month == 4
+    assert parsed.day == 1
+    assert parsed.hour == 0
+    assert parsed.tzinfo is not None
+
+
+def test_parse_renamed_at_falls_back_on_garbage() -> None:
+    """Unparseable input degrades to ``datetime.now(UTC)`` rather than raising."""
+    from data_pipeline.seeds.liquipedia import _parse_renamed_at
+
+    parsed = _parse_renamed_at("not-a-date")
+    assert parsed.tzinfo is not None  # tz-aware fallback
+
+
+def test_parse_renamed_at_handles_none() -> None:
+    """A missing ``renamed_at`` field falls back to ``now``."""
+    from data_pipeline.seeds.liquipedia import _parse_renamed_at
+
+    parsed = _parse_renamed_at(None)
+    assert parsed.tzinfo is not None
+
+
+# --- existing social-alias unit test -------------------------------------
+
+
 @pytest.mark.integration
 def test_insert_social_alias_idempotent_returns_existing_on_duplicate(
     db_session,

@@ -53,7 +53,13 @@ from typing import Any
 
 from esports_sim.db.enums import EntityType, Platform
 from esports_sim.db.models import EntityAlias
-from esports_sim.resolver import ResolutionStatus, resolve_entity
+from esports_sim.resolver import (
+    RebrandConflictError,
+    ResolutionStatus,
+    handle_rebrand,
+    resolve_entity,
+)
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -131,6 +137,14 @@ class _TypeCounters:
     review_queued: int = 0
     schema_drifts: int = 0
     transient_errors: int = 0
+    # Rebrand profiles (those carrying ``previous_slug``) where the
+    # seed extended the alias chain with the NEW slug after the
+    # resolver matched on the old one. Idempotent on re-runs: a
+    # second pass leaves this at zero because the new alias already
+    # exists. Tracking it lets the operator prove from the manifest
+    # that the rebrand-extension path actually fired the first time.
+    rebrands_registered: int = 0
+    rebrands_existing: int = 0
 
 
 @dataclass
@@ -517,10 +531,20 @@ def _resolve_profile(
     ``platform_id`` makes the exact-alias lookup match an existing
     canonical instead of fuzzy-falling-through into a brand-new
     entity. That's how a rebrand survives a seed re-run.
+
+    Rebrand alias extension: after the resolver matches/creates on
+    ``previous_slug``, we also register the NEW slug as an alias on
+    the same canonical via :func:`handle_rebrand`. Round 2 of Codex
+    review caught the gap — without this, a later record carrying
+    only the new slug would fuzzy-fall-through into a fork. The
+    extension is idempotent so re-running the seed leaves
+    ``rebrands_registered`` at zero and increments
+    ``rebrands_existing`` instead.
     """
     slug = profile["slug"]
     name = profile["name"]
-    platform_id = profile.get("previous_slug") or slug
+    previous_slug = profile.get("previous_slug")
+    platform_id = previous_slug or slug
 
     result = resolve_entity(
         session,
@@ -548,7 +572,106 @@ def _resolve_profile(
         )
         return None
 
+    # Rebrand: register the new slug as an alias on the canonical we
+    # just resolved. Skip when ``previous_slug`` is absent or equal to
+    # the current slug (no rebrand event to record).
+    if previous_slug and previous_slug != slug and result.canonical_id is not None:
+        _register_rebrand_alias(
+            session,
+            old_platform_id=previous_slug,
+            new_platform_id=slug,
+            new_platform_name=name,
+            renamed_at=profile.get("renamed_at"),
+            counters=counters,
+            kind=kind,
+        )
+
     return result.canonical_id
+
+
+def _register_rebrand_alias(
+    session: Session,
+    *,
+    old_platform_id: str,
+    new_platform_id: str,
+    new_platform_name: str,
+    renamed_at: Any,
+    counters: _TypeCounters,
+    kind: str,
+) -> None:
+    """Wire the BUF-12 ``handle_rebrand`` path for a profile carrying ``previous_slug``.
+
+    Resolves the rebrand effective date from the profile's
+    ``renamed_at`` field when present; otherwise stamps the alias
+    with the current UTC time so a future ``lookup_alias_at`` query
+    can still order the chain. Conflicts that point to a *different*
+    canonical (the destination handle is already owned elsewhere) are
+    logged at WARNING and counted under ``schema_drifts`` rather than
+    aborting the seed — the human reviewer is the right authority
+    for that ambiguous case.
+    """
+    effective_date = _parse_renamed_at(renamed_at)
+
+    # Pre-check whether the destination alias already exists so we
+    # can split the manifest's ``rebrands_registered`` (newly added
+    # this run) from ``rebrands_existing`` (idempotent replay). A
+    # post-hoc discriminator on ``valid_from`` would mis-count when
+    # two seed runs use the same effective date — the pre-check
+    # avoids that ambiguity at the cost of one extra SELECT, which
+    # is fine because the seed is one-shot.
+    pre_existing = session.execute(
+        select(EntityAlias).where(
+            EntityAlias.platform == Platform.LIQUIPEDIA,
+            EntityAlias.platform_id == new_platform_id,
+        )
+    ).scalar_one_or_none()
+
+    try:
+        handle_rebrand(
+            session,
+            platform=Platform.LIQUIPEDIA,
+            old_platform_id=old_platform_id,
+            new_platform_id=new_platform_id,
+            new_platform_name=new_platform_name,
+            effective_date=effective_date,
+        )
+    except RebrandConflictError as exc:
+        _logger.warning(
+            "liquipedia_seed.rebrand_conflict kind=%s old=%s new=%s detail=%s",
+            kind,
+            old_platform_id,
+            new_platform_id,
+            exc,
+        )
+        counters.schema_drifts += 1
+        return
+
+    session.flush()
+
+    if pre_existing is None:
+        counters.rebrands_registered += 1
+    else:
+        counters.rebrands_existing += 1
+
+
+def _parse_renamed_at(value: Any) -> datetime:
+    """Best-effort parse of a profile's ``renamed_at`` into a tz-aware datetime.
+
+    Liquipedia ships dates as ISO ``YYYY-MM-DD`` (no time, no tz).
+    A bare date is upgraded to UTC midnight; a full ISO datetime with
+    no tz is also upgraded to UTC. Anything unparseable degrades to
+    ``datetime.now(UTC)`` so the rebrand still records — losing the
+    correct timestamp is better than dropping the alias.
+    """
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.now(UTC)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+    return datetime.now(UTC)
 
 
 # --- social aliases -------------------------------------------------------
