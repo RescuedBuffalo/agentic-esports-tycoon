@@ -348,6 +348,15 @@ class RiotConnector(Connector):
         if not isinstance(match["players"], list):
             raise SchemaDriftError("match.players must be a list")
 
+        # ``transform`` iterates ``roundResults`` and passes each entry
+        # to ``_slim_round_for_player`` (which expects a dict). If Riot
+        # ships ``roundResults`` as a different shape during a schema
+        # change, classify it as drift here so the runner logs
+        # SCHEMA_DRIFT and preserves the raw payload — rather than
+        # raising AttributeError mid-transform and aborting the pass.
+        if not isinstance(match["roundResults"], list):
+            raise SchemaDriftError("match.roundResults must be a list")
+
         return raw_payload
 
     def transform(self, validated_payload: dict[str, Any]) -> Iterable[IngestionRecord]:
@@ -459,7 +468,15 @@ class RiotConnector(Connector):
             return body
 
         if status == 429:
-            retry_after = _parse_retry_after(headers.get("Retry-After"))
+            # Header lookup must be case-insensitive: ``httpx`` stores
+            # headers in a dict-like that lower-cases keys when iterated
+            # via ``dict(response.headers)``, so the production factory's
+            # ``"headers": dict(response.headers)`` yields ``"retry-after"``
+            # not ``"Retry-After"``. A direct ``headers.get("Retry-After")``
+            # would silently miss every real 429 and skip the documented
+            # backoff sleep — repeatedly slamming the rate-limited
+            # endpoint instead of waiting it out.
+            retry_after = _parse_retry_after(_lookup_header(headers, "Retry-After"))
             self._log.warning(
                 "riot.rate_limited",
                 code="RATE_LIMITED",
@@ -484,6 +501,25 @@ class RiotConnector(Connector):
         # raw row helps a maintainer diagnose. SchemaDriftError makes
         # the runner persist raw and continue.
         raise SchemaDriftError(f"Riot returned unexpected status {status} for {url}; body={body!r}")
+
+
+def _lookup_header(headers: dict[str, Any], name: str) -> Any:
+    """Case-insensitive header lookup.
+
+    HTTP headers are case-insensitive per RFC 7230, but plain Python
+    dicts are not. The default ``http_get`` factory builds the headers
+    dict from ``dict(httpx.Response.headers)``, which yields lower-case
+    keys; tests' ``_FakeHttp`` may pass either case. Centralising the
+    lookup here means callers don't need to know which variant lives
+    in the dict.
+    """
+    if name in headers:
+        return headers[name]
+    target = name.lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == target:
+            return value
+    return None
 
 
 def _parse_retry_after(header_value: Any) -> float:

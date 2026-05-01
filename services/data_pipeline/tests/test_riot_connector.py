@@ -206,7 +206,54 @@ def test_validate_raises_schema_drift_on_non_dict_match_block() -> None:
         connector.validate({"match_id": "x", "puuid_seed": "y", "match": "not a dict"})
 
 
+def test_validate_raises_schema_drift_on_non_list_round_results() -> None:
+    """``roundResults`` shape changes are caught at validate, not transform.
+
+    ``transform`` iterates ``roundResults`` and passes each entry to
+    ``_slim_round_for_player`` (expects a dict). A schema change that
+    ships, say, a ``{"rounds": [...]}`` envelope would otherwise raise
+    AttributeError mid-transform and abort the run instead of being
+    classified cleanly as drift. Validate now type-checks the field.
+    """
+    connector = _make_connector(http_get=_FakeHttp({}))
+    fixture = _load_fixture("match.json")
+    fixture["roundResults"] = {"rounds": fixture["roundResults"]}  # wrong shape
+    payload = {"match_id": "x", "puuid_seed": "y", "match": fixture}
+
+    with pytest.raises(SchemaDriftError, match="roundResults"):
+        connector.validate(payload)
+
+
 # --- fetch: 429 / Retry-After / 5xx ---------------------------------------
+
+
+def test_fetch_429_honours_retry_after_with_lowercase_header_key() -> None:
+    """``Retry-After`` lookup must be case-insensitive.
+
+    ``httpx.Response.headers`` becomes a plain ``dict`` with lower-case
+    keys when the production factory does ``dict(response.headers)``,
+    so the connector's ``_get`` reads ``retry-after`` from a real 429.
+    A naive ``headers.get("Retry-After")`` would silently miss this
+    and skip the documented backoff sleep — causing immediate retries
+    against an already rate-limited Riot endpoint.
+    """
+    sleeps: list[float] = []
+    http = _FakeHttp(
+        {
+            "matchlists/by-puuid": {
+                "status_code": 429,
+                # Lower-case key, mimicking the production httpx-backed
+                # factory's headers dict.
+                "headers": {"retry-after": "3"},
+                "json": None,
+            }
+        }
+    )
+    connector = _make_connector(http_get=http, sleeper=sleeps.append)
+    payloads = list(connector.fetch(_EPOCH))
+
+    assert payloads == []
+    assert sleeps == [3.0]
 
 
 def test_fetch_429_on_matchlist_skips_seed_and_continues() -> None:
