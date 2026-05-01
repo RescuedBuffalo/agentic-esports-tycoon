@@ -1,0 +1,126 @@
+{
+  "matchInfo": {
+    "matchId": "match-001",
+    "mapId": "/Game/Maps/Ascent/Ascent",
+    "gameVersion": "release-08.10",
+    "gameLengthMillis": 2400000,
+    "gameStartMillis": 1714000000000,
+    "queueId": "competitive",
+    "seasonId": "act-7",
+    "isCompleted": true,
+    "customGameName": "",
+    "isRanked": true
+  },
+  "players": [
+    {
+      "puuid": "PUUID-PLAYER-01",
+      "gameName": "Alpha",
+      "tagLine": "NA1",
+      "teamId": "Blue",
+      "characterId": "jett-id",
+      "stats": {"score": 320, "kills": 22, "deaths": 14, "assists": 4}
+    },
+    {
+      "puuid": "PUUID-PLAYER-02",
+      "gameName": "Bravo",
+      "tagLine": "NA1",
+      "teamId": "Blue",
+      "characterId": "viper-id",
+      "stats": {"score": 280, "kills": 18, "deaths": 16, "assists": 5}
+    },
+    {
+      "puuid": "PUUID-PLAYER-03",
+      "gameName": "Charlie",
+      "tagLine": "NA1",
+      "teamId": "Blue",
+      "characterId": "killjoy-id",
+      "stats": {"score": 240, "kills": 15, "deaths": 17, "assists": 6}
+    },
+    {
+      "puuid": "PUUID-PLAYER-04",
+      "gameName": "Delta",
+      "tagLine": "NA1",
+      "teamId": "Blue",
+      "characterId": "omen-id",
+      "stats": {"score": 210, "kills": 13, "deaths": 18, "assists": 7}
+    },
+    {
+      "puuid": "PUUID-PLAYER-05",
+      "gameName": "Echo",
+      "tagLine": "NA1",
+      "teamId": "Blue",
+      "characterId": "sova-id",
+      "stats": {"score": 200, "kills": 12, "deaths": 19, "assists": 8}
+    },
+    {
+      "puuid": "PUUID-PLAYER-06",
+      "gameName": "Foxtrot",
+      "tagLine": "EU1",
+      "teamId": "Red",
+      "characterId": "raze-id",
+      "stats": {"score": 310, "kills": 21, "deaths": 13, "assists": 3}
+    },
+    {
+      "puuid": "PUUID-PLAYER-07",
+      "gameName": "Golf",
+      "tagLine": "EU1",
+      "teamId": "Red",
+      "characterId": "brimstone-id",
+      "stats": {"score": 290, "kills": 19, "deaths": 14, "assists": 5}
+    },
+    {
+      "puuid": "PUUID-PLAYER-08",
+      "gameName": "Hotel",
+      "tagLine": "EU1",
+      "teamId": "Red",
+      "characterId": "cypher-id",
+      "stats": {"score": 250, "kills": 16, "deaths": 16, "assists": 4}
+    },
+    {
+      "puuid": "PUUID-PLAYER-09",
+      "gameName": "India",
+      "tagLine": "EU1",
+      "teamId": "Red",
+      "characterId": "phoenix-id",
+      "stats": {"score": 220, "kills": 14, "deaths": 17, "assists": 5}
+    },
+    {
+      "puuid": "PUUID-PLAYER-10",
+      "gameName": "Juliet",
+      "tagLine": "EU1",
+      "teamId": "Red",
+      "characterId": "skye-id",
+      "stats": {"score": 205, "kills": 13, "deaths": 18, "assists": 6}
+    }
+  ],
+  "roundResults": [
+    {
+      "roundNum": 0,
+      "roundResult": "Eliminated",
+      "winningTeam": "Blue",
+      "bombPlanter": "PUUID-PLAYER-01",
+      "bombDefuser": null,
+      "plantRoundTime": 38500,
+      "defuseRoundTime": 0,
+      "playerStats": [
+        {"puuid": "PUUID-PLAYER-01", "kills": [], "score": 220, "damage": []},
+        {"puuid": "PUUID-PLAYER-02", "kills": [], "score": 180, "damage": []},
+        {"puuid": "PUUID-PLAYER-06", "kills": [], "score": 100, "damage": []},
+        {"puuid": "PUUID-PLAYER-07", "kills": [], "score": 95, "damage": []}
+      ]
+    },
+    {
+      "roundNum": 1,
+      "roundResult": "Defused",
+      "winningTeam": "Red",
+      "bombPlanter": "PUUID-PLAYER-02",
+      "bombDefuser": "PUUID-PLAYER-08",
+      "plantRoundTime": 45000,
+      "defuseRoundTime": 80000,
+      "playerStats": [
+        {"puuid": "PUUID-PLAYER-01", "kills": [], "score": 130, "damage": []},
+        {"puuid": "PUUID-PLAYER-08", "kills": [], "score": 240, "damage": []}
+      ]
+    }
+  ]
+}

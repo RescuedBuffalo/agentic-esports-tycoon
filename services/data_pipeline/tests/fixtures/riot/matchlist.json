@@ -1,0 +1,20 @@
+{
+  "puuid": "PUUID-SEED-AAAA",
+  "history": [
+    {
+      "matchId": "match-001",
+      "gameStartTimeMillis": 1714000000000,
+      "queueId": "competitive"
+    },
+    {
+      "matchId": "match-002",
+      "gameStartTimeMillis": 1715000000000,
+      "queueId": "competitive"
+    },
+    {
+      "matchId": "match-old",
+      "gameStartTimeMillis": 1700000000000,
+      "queueId": "competitive"
+    }
+  ]
+}

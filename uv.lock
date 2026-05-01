@@ -190,12 +190,14 @@ version = "0.0.1"
 source = { editable = "services/data_pipeline" }
 dependencies = [
     { name = "esports-sim-shared" },
+    { name = "httpx" },
     { name = "structlog" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "esports-sim-shared", editable = "packages/shared" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "structlog", specifier = ">=24.1" },
 ]
 
