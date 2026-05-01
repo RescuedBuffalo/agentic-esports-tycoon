@@ -21,6 +21,13 @@ dependencies = [
     # HTML parsing for the playvalorant.com patch-notes scraper (BUF-83).
     # ``beautifulsoup4`` is the de-facto choice for tag-structure extraction.
     "beautifulsoup4>=4.12",
+    # Headless browser for the BUF-10 VLR.gg connector. VLR pages are JS-
+    # rendered, so a plain ``requests``-based scrape returns shells with
+    # no stats data. The default factory in ``connectors.vlr`` wires
+    # Playwright at runtime; tests inject a synchronous fake page-fetcher
+    # and never import this dependency, so CI doesn't have to install
+    # browser binaries.
+    "playwright>=1.45",
 ]
 
 [tool.uv.sources]
