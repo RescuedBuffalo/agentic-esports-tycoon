@@ -86,8 +86,14 @@ def db_engine() -> Generator[Engine, None, None]:
     finally:
         # Roll back to a clean DB so re-runs are idempotent. Drop the
         # alembic_version table too — otherwise the next run thinks it's
-        # already migrated.
+        # already migrated. ``drop_all`` only knows about ORM-mapped
+        # tables; the patch_era view + assign_era SQL function are
+        # plain DDL inside migration 0004, so we drop them by hand
+        # *before* drop_all so the table drop isn't blocked by the
+        # view's dependency on it.
         with engine.begin() as conn:
+            conn.execute(text("DROP VIEW IF EXISTS patch_era_window"))
+            conn.execute(text("DROP FUNCTION IF EXISTS assign_era(timestamptz)"))
             Base.metadata.drop_all(bind=conn)
             conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
             for typename in (

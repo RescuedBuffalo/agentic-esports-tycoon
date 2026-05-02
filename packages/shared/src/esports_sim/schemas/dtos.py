@@ -74,10 +74,24 @@ class AliasReviewQueueDTO(_Frozen):
     created_at: datetime
 
 
+class PatchEraDTO(_Frozen):
+    """BUF-13 patch-era partition. Half-open: ``[start_date, end_date)``."""
+
+    era_id: uuid.UUID
+    era_slug: str = Field(min_length=1, max_length=32)
+    patch_version: str = Field(min_length=1, max_length=32)
+    start_date: datetime
+    end_date: datetime | None = None
+    meta_magnitude: float = Field(ge=0.0, le=1.0)
+    is_major_shift: bool = False
+    created_at: datetime
+
+
 __all__ = [
     "EntityDTO",
     "EntityAliasDTO",
     "StagingRecordDTO",
     "RawRecordDTO",
     "AliasReviewQueueDTO",
+    "PatchEraDTO",
 ]

@@ -24,6 +24,7 @@ from data_pipeline.seeds.liquipedia import (
     DEFAULT_SEEDS_DIR,
     seed_from_liquipedia,
 )
+from data_pipeline.seeds.patch_eras import seed_patch_eras
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -53,6 +54,23 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip writing the manifest file (still printed on stdout).",
     )
+
+    eras = sub.add_parser(
+        "patch-eras",
+        help="Seed the patch_era table with the historical Valorant timeline (BUF-13).",
+    )
+    eras.add_argument(
+        "--seeds-dir",
+        type=Path,
+        default=DEFAULT_SEEDS_DIR,
+        help=f"Where to write the manifest (default: {DEFAULT_SEEDS_DIR}).",
+    )
+    eras.add_argument(
+        "--no-manifest",
+        action="store_true",
+        help="Skip writing the manifest file (still printed on stdout).",
+    )
+
     return parser
 
 
@@ -73,25 +91,39 @@ def _resolve_database_url() -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     args = _build_parser().parse_args(argv)
-    if args.command != "liquipedia":  # pragma: no cover - argparse rejects others
-        return 2
 
     engine = create_engine(_resolve_database_url(), future=True)
     try:
         with Session(engine) as session, session.begin():
-            manifest = seed_from_liquipedia(
-                session,
-                base_url=args.base_url,
-                seeds_dir=args.seeds_dir,
-                write_manifest=not args.no_manifest,
-            )
+            if args.command == "liquipedia":
+                manifest = seed_from_liquipedia(
+                    session,
+                    base_url=args.base_url,
+                    seeds_dir=args.seeds_dir,
+                    write_manifest=not args.no_manifest,
+                )
+                summary = (
+                    f"liquipedia seed complete: created={manifest.total_canonical_created} "
+                    f"date={manifest.seed_date}"
+                )
+            elif args.command == "patch-eras":
+                era_manifest = seed_patch_eras(
+                    session,
+                    seeds_dir=args.seeds_dir,
+                    write_manifest=not args.no_manifest,
+                )
+                summary = (
+                    f"patch_eras seed complete: planned={era_manifest.counters.planned} "
+                    f"inserted={era_manifest.counters.inserted} "
+                    f"existing={era_manifest.counters.existing} "
+                    f"open_era={era_manifest.open_era_slug}"
+                )
+            else:  # pragma: no cover - argparse rejects others
+                return 2
     finally:
         engine.dispose()
 
-    print(  # noqa: T201 - operator-facing CLI
-        f"liquipedia seed complete: created={manifest.total_canonical_created} "
-        f"date={manifest.seed_date}"
-    )
+    print(summary)  # noqa: T201 - operator-facing CLI
     return 0
 
 
