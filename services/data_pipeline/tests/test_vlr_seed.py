@@ -124,6 +124,25 @@ def test_parse_int_coerces_floats() -> None:
     assert _parse_int("garbage") is None
 
 
+def test_parse_int_rejects_non_integer_floats() -> None:
+    """Codex P2 regression (PR #22): ``"13.5"`` must not silently truncate.
+
+    The previous implementation used ``int(float(candidate))`` for the
+    fallback, which would have ingested ``13.5`` as ``13`` and corrupted
+    round totals. The fix gates the fallback on
+    :meth:`float.is_integer` so a fractional value reads as malformed
+    and routes the row to ``rows_skipped_malformed`` via
+    :func:`_require_int`.
+    """
+    assert _parse_int("13.5") is None
+    assert _parse_int("0.1") is None
+    assert _parse_int("-7.9") is None
+    # Negative integer-valued floats stay accepted — they're rare in
+    # round columns but ``_parse_float`` accepts them so consistency
+    # matters.
+    assert _parse_int("-13.0") == -13
+
+
 def test_is_sentinel_drops_only_known_dates() -> None:
     assert _is_sentinel({"Date": "1970-01-01"}) is True
     assert _is_sentinel({"Date": "2024-09-04"}) is False

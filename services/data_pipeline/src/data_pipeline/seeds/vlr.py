@@ -602,11 +602,18 @@ def _parse_int(value: str) -> int | None:
         return int(candidate)
     except ValueError:
         # Some CSV rows ship integer columns as floats (e.g.
-        # "13.0"). Fall back via float() so we don't reject those.
+        # "13.0"). Fall back via float() so we don't reject those —
+        # but ONLY when the value is integer-valued. ``int(float(...))``
+        # alone would silently truncate ``"13.5"`` to ``13`` and
+        # corrupt round totals; we'd rather route the malformed row
+        # to ``rows_skipped_malformed`` than ingest a wrong number.
         try:
-            return int(float(candidate))
+            as_float = float(candidate)
         except ValueError:
             return None
+        if not as_float.is_integer():
+            return None
+        return int(as_float)
 
 
 def _require_int(row: dict[str, str], column: str) -> int:
