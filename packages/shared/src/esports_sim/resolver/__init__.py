@@ -41,10 +41,12 @@ from esports_sim.resolver.worker import (
     ExtractedHandle,
     MergeResult,
     RebrandConflictError,
+    RebrandTarget,
     WorkerStats,
     handle_rebrand,
     lookup_alias_at,
     merge_records,
+    parse_renamed_at,
     process_staging_queue,
 )
 
@@ -55,6 +57,7 @@ __all__ = [
     "MergeResult",
     "REVIEW_THRESHOLD",
     "RebrandConflictError",
+    "RebrandTarget",
     "ResolutionStatus",
     "ResolveCandidate",
     "ResolveResult",
@@ -63,6 +66,7 @@ __all__ = [
     "handle_rebrand",
     "lookup_alias_at",
     "merge_records",
+    "parse_renamed_at",
     "process_staging_queue",
     "resolve_entity",
 ]

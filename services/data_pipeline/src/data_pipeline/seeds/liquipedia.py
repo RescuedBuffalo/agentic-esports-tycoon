@@ -57,6 +57,7 @@ from esports_sim.resolver import (
     RebrandConflictError,
     ResolutionStatus,
     handle_rebrand,
+    parse_renamed_at,
     resolve_entity,
 )
 from sqlalchemy import select
@@ -158,6 +159,11 @@ class _SocialCounters:
 
     inserted: int = 0
     existing: int = 0
+    # Cross-canonical conflicts: this run tried to attach the handle
+    # to canonical X, but it was already pinned to canonical Y. The
+    # seed logs + counts these rather than aborting; an operator can
+    # run an audit pass to disambiguate.
+    conflicts: int = 0
 
 
 @dataclass
@@ -610,7 +616,7 @@ def _register_rebrand_alias(
     aborting the seed — the human reviewer is the right authority
     for that ambiguous case.
     """
-    effective_date = _parse_renamed_at(renamed_at)
+    effective_date = parse_renamed_at(renamed_at)
 
     # Pre-check whether the destination alias already exists so we
     # can split the manifest's ``rebrands_registered`` (newly added
@@ -654,24 +660,11 @@ def _register_rebrand_alias(
         counters.rebrands_existing += 1
 
 
-def _parse_renamed_at(value: Any) -> datetime:
-    """Best-effort parse of a profile's ``renamed_at`` into a tz-aware datetime.
-
-    Liquipedia ships dates as ISO ``YYYY-MM-DD`` (no time, no tz).
-    A bare date is upgraded to UTC midnight; a full ISO datetime with
-    no tz is also upgraded to UTC. Anything unparseable degrades to
-    ``datetime.now(UTC)`` so the rebrand still records — losing the
-    correct timestamp is better than dropping the alias.
-    """
-    if isinstance(value, str) and value:
-        try:
-            parsed = datetime.fromisoformat(value)
-        except ValueError:
-            return datetime.now(UTC)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed
-    return datetime.now(UTC)
+# ``_parse_renamed_at`` previously lived here; it's now
+# :func:`esports_sim.resolver.parse_renamed_at` so the BUF-12 worker
+# extractor (which detects the same Liquipedia rebrand events) can
+# project the effective date the same way without duplicating the
+# helper.
 
 
 # --- social aliases -------------------------------------------------------
@@ -705,13 +698,28 @@ def _attach_social_aliases(
             )
             continue
 
-        outcome = _insert_social_alias_idempotent(
-            session,
-            canonical_id=canonical_id,
-            platform=platform,
-            handle=handle,
-        )
         bucket = manifest.socials[platform.value]
+        try:
+            outcome = _insert_social_alias_idempotent(
+                session,
+                canonical_id=canonical_id,
+                platform=platform,
+                handle=handle,
+            )
+        except SocialAliasConflictError as exc:
+            # Cross-canonical handle collision — log + count, don't
+            # abort. The primary canonical resolution already
+            # succeeded; the social alias just doesn't get attached
+            # this run. Operator can audit + resolve.
+            _logger.warning(
+                "liquipedia_seed.social_conflict canonical_id=%s field=%s handle=%s detail=%s",
+                canonical_id,
+                field_name,
+                handle,
+                exc,
+            )
+            bucket.conflicts += 1
+            continue
         if outcome == "inserted":
             bucket.inserted += 1
         else:
@@ -733,6 +741,15 @@ def _insert_social_alias_idempotent(
     no-op-retry case. Pre-checking with a SELECT first would race
     against a concurrent worker; the catch-the-violation pattern is
     the only one that's correct under concurrency.
+
+    Cross-canonical conflict guard: round 3 of Codex review caught
+    that the round-2 code returned ``"existing"`` on ANY collision,
+    even when the colliding row belonged to a *different* canonical
+    — silently masking a real cross-canonical handle conflict (e.g.
+    two different players who both claim ``@TenZ`` on Twitter). On
+    a collision we now re-read the winner; if it points at the same
+    canonical the call is genuinely idempotent, otherwise it raises
+    :class:`SocialAliasConflictError` so an operator can resolve.
     """
     try:
         with session.begin_nested():
@@ -753,8 +770,32 @@ def _insert_social_alias_idempotent(
         # yet) is a real failure that belongs to the caller.
         if "uq_entity_alias_platform_platform_id" not in str(exc):
             raise
+        winner = session.execute(
+            select(EntityAlias).where(
+                EntityAlias.platform == platform,
+                EntityAlias.platform_id == handle,
+            )
+        ).scalar_one()
+        if winner.canonical_id != canonical_id:
+            raise SocialAliasConflictError(
+                f"({platform.value}, {handle!r}) already maps to canonical "
+                f"{winner.canonical_id}; seed expected {canonical_id}"
+            ) from exc
         return "existing"
     return "inserted"
+
+
+class SocialAliasConflictError(RuntimeError):
+    """Raised when a social handle is already attached to a different canonical.
+
+    The seed assumes Liquipedia profile pages are the source of truth
+    for ``(player_canonical, twitter_handle)`` mappings — but two
+    profiles can legitimately both claim the same handle (a typo on
+    one editor's page, or a copy-paste mistake on another). Surfacing
+    this as a typed exception lets a future ``--allow-conflicts``
+    flag downgrade it to a counter without changing the default-safe
+    behaviour.
+    """
 
 
 # --- manifest persistence -------------------------------------------------

@@ -138,6 +138,14 @@ class WorkerStats:
     review: int = 0
     blocked: int = 0
     extractor_misses: int = 0
+    # Rebrand events the worker handled by extending the alias chain
+    # with the new slug. ``rebrand_conflicts`` is the count of payloads
+    # whose destination handle was already owned by a different
+    # canonical — those rows still resolve to PROCESSED on the OLD
+    # slug, but the rebrand alias extension is logged + skipped rather
+    # than silently corrupted into the wrong canonical.
+    rebrands_registered: int = 0
+    rebrand_conflicts: int = 0
     by_status: dict[str, int] = field(default_factory=dict)
     elapsed_seconds: float = 0.0
 
@@ -153,18 +161,47 @@ PayloadExtractor = Callable[
 
 
 @dataclass(frozen=True)
+class RebrandTarget:
+    """The new-handle half of a rebrand event detected during extraction.
+
+    When an extractor surfaces this on an :class:`ExtractedHandle`, the
+    worker resolves on the OLD handle (``platform_id`` of the parent
+    ``ExtractedHandle``) and then calls :func:`handle_rebrand` to also
+    register the new handle on the same canonical. Without this, a
+    rebrand payload would resolve as MATCHED on the old slug and a
+    later record carrying ONLY the new slug would fork into a
+    duplicate canonical — same bug the seed had before round 2 of the
+    PR review fixed it.
+
+    ``effective_date`` lands as ``EntityAlias.valid_from`` on the new
+    alias so :func:`lookup_alias_at` can answer "what was this handle
+    pointing at on date D" correctly.
+    """
+
+    new_platform_id: str
+    new_platform_name: str
+    effective_date: datetime
+
+
+@dataclass(frozen=True)
 class ExtractedHandle:
     """The (platform, platform_id, platform_name) triple a worker needs.
 
     ``source`` is the staging row's ``source`` string echoed back so
     the worker doesn't have to thread it through; useful for the
     structured log line.
+
+    ``rebrand_target`` is set when the payload describes a rebrand
+    event. The worker resolves on ``platform_id`` (the OLD handle),
+    then calls :func:`handle_rebrand` with the rebrand target's new
+    handle on the same canonical.
     """
 
     source: str
     platform: Platform
     platform_id: str
     platform_name: str
+    rebrand_target: RebrandTarget | None = None
 
 
 # Default mapping from a staging row's free-form ``source`` string to
@@ -193,6 +230,17 @@ def default_payload_extractor(
     common Liquipedia/VLR shape of ``slug`` + ``name``. Returns
     ``None`` if the payload doesn't carry either pattern, in which
     case the worker logs an extractor miss and skips the row.
+
+    Rebrand detection: when a payload carries both ``slug`` and
+    ``previous_slug`` (different values), an :class:`ExtractedHandle`
+    is returned with ``platform_id=previous_slug`` (so the resolver
+    matches the existing canonical) and a populated
+    ``rebrand_target`` so the worker fires :func:`handle_rebrand`
+    afterward to also register the new slug. Without this, a rebrand
+    record would silently leave the new slug unattached and a later
+    record carrying only the new slug would fork into a duplicate
+    canonical — exactly the seed-side bug round 2 of the review
+    caught.
     """
     platform = DEFAULT_SOURCE_PLATFORMS.get(source)
     if platform is None:
@@ -213,18 +261,69 @@ def default_payload_extractor(
 
     # Fallback: Liquipedia/VLR ship the upstream raw shape. A team or
     # player record carries ``slug`` + ``name``; tournaments the same.
-    # ``previous_slug`` wins if present so a rebrand survives a worker
-    # pass without forking a canonical.
-    slug = payload.get("previous_slug") or payload.get("slug")
+    slug = payload.get("slug")
+    previous_slug = payload.get("previous_slug")
     name = payload.get("name") or payload.get("display_name")
-    if isinstance(slug, str) and isinstance(name, str):
+    if not isinstance(name, str):
+        return None
+
+    # Rebrand event: resolve on the OLD slug so the existing canonical
+    # matches, then surface the new slug as a ``rebrand_target`` for
+    # the worker to register via ``handle_rebrand``.
+    if (
+        isinstance(previous_slug, str)
+        and previous_slug
+        and isinstance(slug, str)
+        and slug
+        and previous_slug != slug
+    ):
         return ExtractedHandle(
             source=source,
             platform=platform,
-            platform_id=slug,
+            platform_id=previous_slug,
+            platform_name=name,
+            rebrand_target=RebrandTarget(
+                new_platform_id=slug,
+                new_platform_name=name,
+                effective_date=parse_renamed_at(payload.get("renamed_at")),
+            ),
+        )
+
+    # Plain (no rebrand): use whichever slug is present.
+    handle_id = previous_slug or slug
+    if isinstance(handle_id, str) and handle_id:
+        return ExtractedHandle(
+            source=source,
+            platform=platform,
+            platform_id=handle_id,
             platform_name=name,
         )
     return None
+
+
+def parse_renamed_at(value: Any) -> datetime:
+    """Best-effort parse of a payload's ``renamed_at`` into a tz-aware datetime.
+
+    Liquipedia ships dates as ISO ``YYYY-MM-DD`` (no time, no tz).
+    A bare date is upgraded to UTC midnight; a full ISO datetime with
+    no tz is also upgraded to UTC. Anything unparseable degrades to
+    ``datetime.now(UTC)`` so the rebrand still records — losing the
+    correct timestamp is better than dropping the alias.
+
+    Lives in the worker module because both the seed (BUF-8) and the
+    extractor (BUF-12) need to project a Liquipedia rebrand event's
+    effective date the same way; centralising it keeps the two paths
+    in lockstep.
+    """
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.now(UTC)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+    return datetime.now(UTC)
 
 
 # --- merge_records --------------------------------------------------------
@@ -580,6 +679,19 @@ def process_staging_queue(
                 row.canonical_id = result.canonical_id
                 row.status = StagingStatus.PROCESSED
                 stats.processed += 1
+                # Rebrand extension: when the extractor surfaces a
+                # rebrand_target the worker also registers the new
+                # slug as an alias on the same canonical, mirroring
+                # what the BUF-8 seed does on its side. Without this,
+                # a later record carrying ONLY the new slug would
+                # fork into a duplicate canonical.
+                if handle.rebrand_target is not None and result.canonical_id is not None:
+                    _apply_rebrand_target(
+                        session,
+                        handle=handle,
+                        rebrand=handle.rebrand_target,
+                        stats=stats,
+                    )
             session.flush()
 
     stats.elapsed_seconds = time.monotonic() - started
@@ -597,6 +709,46 @@ def process_staging_queue(
 # --- helpers (re-exported for callers that need to monkey-patch) ----------
 
 
+def _apply_rebrand_target(
+    session: Session,
+    *,
+    handle: ExtractedHandle,
+    rebrand: RebrandTarget,
+    stats: WorkerStats,
+) -> None:
+    """Extend the canonical's alias chain with the rebrand's new slug.
+
+    Called by ``process_staging_queue`` after a successful
+    ``resolve_entity`` on the OLD slug. Wraps :func:`handle_rebrand`
+    with worker-level bookkeeping: a :class:`RebrandConflictError`
+    (the destination handle is owned by a different canonical) is
+    logged at WARNING and counted under ``rebrand_conflicts`` rather
+    than aborting the worker pass — the row's primary resolution still
+    succeeded, only the rebrand alias extension didn't, and an
+    operator can decide what to do with the conflict.
+    """
+    try:
+        handle_rebrand(
+            session,
+            platform=handle.platform,
+            old_platform_id=handle.platform_id,
+            new_platform_id=rebrand.new_platform_id,
+            new_platform_name=rebrand.new_platform_name,
+            effective_date=rebrand.effective_date,
+        )
+    except RebrandConflictError as exc:
+        stats.rebrand_conflicts += 1
+        _logger.warning(
+            "resolver.worker.rebrand_conflict source=%s old=%s new=%s detail=%s",
+            handle.source,
+            handle.platform_id,
+            rebrand.new_platform_id,
+            exc,
+        )
+        return
+    stats.rebrands_registered += 1
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -608,11 +760,13 @@ __all__ = [
     "MergeResult",
     "PayloadExtractor",
     "RebrandConflictError",
+    "RebrandTarget",
     "SOURCE_PRIORITY",
     "WorkerStats",
     "default_payload_extractor",
     "handle_rebrand",
     "lookup_alias_at",
     "merge_records",
+    "parse_renamed_at",
     "process_staging_queue",
 ]

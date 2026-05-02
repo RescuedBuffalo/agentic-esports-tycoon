@@ -585,10 +585,15 @@ def resolve_entity_unprefixed(db_session: Any) -> Any:
 
 
 def test_parse_renamed_at_handles_bare_date() -> None:
-    """ISO date strings (no time, no tz) become UTC midnight."""
-    from data_pipeline.seeds.liquipedia import _parse_renamed_at
+    """ISO date strings (no time, no tz) become UTC midnight.
 
-    parsed = _parse_renamed_at("2026-04-01")
+    ``parse_renamed_at`` lives in ``esports_sim.resolver.worker`` so
+    both the BUF-8 seed and the BUF-12 worker extractor project a
+    Liquipedia rebrand event's effective date the same way.
+    """
+    from esports_sim.resolver import parse_renamed_at
+
+    parsed = parse_renamed_at("2026-04-01")
     assert parsed.year == 2026
     assert parsed.month == 4
     assert parsed.day == 1
@@ -598,21 +603,59 @@ def test_parse_renamed_at_handles_bare_date() -> None:
 
 def test_parse_renamed_at_falls_back_on_garbage() -> None:
     """Unparseable input degrades to ``datetime.now(UTC)`` rather than raising."""
-    from data_pipeline.seeds.liquipedia import _parse_renamed_at
+    from esports_sim.resolver import parse_renamed_at
 
-    parsed = _parse_renamed_at("not-a-date")
+    parsed = parse_renamed_at("not-a-date")
     assert parsed.tzinfo is not None  # tz-aware fallback
 
 
 def test_parse_renamed_at_handles_none() -> None:
     """A missing ``renamed_at`` field falls back to ``now``."""
-    from data_pipeline.seeds.liquipedia import _parse_renamed_at
+    from esports_sim.resolver import parse_renamed_at
 
-    parsed = _parse_renamed_at(None)
+    parsed = parse_renamed_at(None)
     assert parsed.tzinfo is not None
 
 
 # --- existing social-alias unit test -------------------------------------
+
+
+@pytest.mark.integration
+def test_insert_social_alias_raises_on_cross_canonical_collision(db_session) -> None:
+    """Round 3 regression: a handle owned by another canonical must NOT be silently absorbed.
+
+    Round 2's helper returned ``"existing"`` on any unique-key
+    collision, masking the case where the colliding row belonged to
+    a different canonical. Round 3's fix re-reads the winner and
+    raises :class:`SocialAliasConflictError` if the canonicals
+    differ.
+    """
+    from data_pipeline.seeds.liquipedia import SocialAliasConflictError
+    from esports_sim.db.models import Entity
+
+    a = Entity(entity_type=EntityType.PLAYER)
+    b = Entity(entity_type=EntityType.PLAYER)
+    db_session.add_all([a, b])
+    db_session.flush()
+
+    # Pin handle "@TenZ" to canonical A first.
+    first = _insert_social_alias_idempotent(
+        db_session,
+        canonical_id=a.canonical_id,
+        platform=Platform.TWITTER,
+        handle="TenZ",
+    )
+    assert first == "inserted"
+    db_session.flush()
+
+    # Now try to attach the same handle to canonical B — must raise.
+    with pytest.raises(SocialAliasConflictError):
+        _insert_social_alias_idempotent(
+            db_session,
+            canonical_id=b.canonical_id,
+            platform=Platform.TWITTER,
+            handle="TenZ",
+        )
 
 
 @pytest.mark.integration

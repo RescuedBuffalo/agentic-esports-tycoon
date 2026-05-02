@@ -25,6 +25,7 @@ from esports_sim.resolver import (
     SOURCE_PRIORITY,
     ConflictRecord,
     RebrandConflictError,
+    RebrandTarget,
     WorkerStats,
     handle_rebrand,
     lookup_alias_at,
@@ -32,6 +33,7 @@ from esports_sim.resolver import (
     process_staging_queue,
     resolve_entity,
 )
+from esports_sim.resolver.worker import default_payload_extractor
 
 # --- merge_records: pure-function unit tests ------------------------------
 
@@ -725,3 +727,192 @@ def test_handle_rebrand_race_recovery_uses_savepoint_not_outer_rollback(
         ).scalar_one_or_none()
         is not None
     )
+
+
+# --- default_payload_extractor: rebrand surface (pure unit) --------------
+
+
+def test_default_extractor_surfaces_rebrand_target_when_previous_slug_differs() -> None:
+    """A payload with both ``slug`` and ``previous_slug`` becomes a rebrand."""
+    handle = default_payload_extractor(
+        "liquipedia",
+        EntityType.TEAM,
+        {
+            "slug": "team-sentinels-esports",
+            "name": "Team Sentinels Esports",
+            "previous_slug": "sentinels",
+            "renamed_at": "2026-04-01",
+        },
+    )
+    assert handle is not None
+    # Resolve on the OLD slug so the existing canonical matches.
+    assert handle.platform_id == "sentinels"
+    assert handle.platform_name == "Team Sentinels Esports"
+    assert handle.rebrand_target is not None
+    assert handle.rebrand_target.new_platform_id == "team-sentinels-esports"
+    assert handle.rebrand_target.new_platform_name == "Team Sentinels Esports"
+    assert handle.rebrand_target.effective_date.isoformat().startswith("2026-04-01")
+
+
+def test_default_extractor_no_rebrand_when_previous_slug_equals_slug() -> None:
+    """``previous_slug == slug`` is not a rebrand event."""
+    handle = default_payload_extractor(
+        "liquipedia",
+        EntityType.TEAM,
+        {"slug": "sentinels", "name": "Sentinels", "previous_slug": "sentinels"},
+    )
+    assert handle is not None
+    assert handle.rebrand_target is None
+
+
+def test_default_extractor_no_rebrand_when_previous_slug_absent() -> None:
+    """A plain payload (no ``previous_slug``) carries no rebrand target."""
+    handle = default_payload_extractor(
+        "liquipedia",
+        EntityType.PLAYER,
+        {"slug": "tenz", "name": "TenZ"},
+    )
+    assert handle is not None
+    assert handle.platform_id == "tenz"
+    assert handle.rebrand_target is None
+
+
+def test_default_extractor_uses_explicit_platform_id_when_present() -> None:
+    """Explicit ``platform_id`` / ``platform_name`` win over the slug fallback."""
+    handle = default_payload_extractor(
+        "vlr",
+        EntityType.PLAYER,
+        {"platform_id": "vlr-12345", "platform_name": "TenZ", "slug": "ignored"},
+    )
+    assert handle is not None
+    assert handle.platform_id == "vlr-12345"
+    assert handle.rebrand_target is None
+
+
+# --- process_staging_queue: rebrand wiring (integration) ----------------
+
+
+@pytestmark_integration
+def test_process_staging_queue_extends_alias_chain_on_rebrand_payload(
+    db_session,
+) -> None:
+    """Round 3 regression: worker handles a rebrand payload like the seed does.
+
+    Without the fix, the worker resolved on the OLD slug only and
+    never registered the new slug as an alias — so a later record
+    carrying only the new slug would fork into a duplicate canonical.
+    """
+    # Pre-seed canonical under the OLD slug.
+    seed = resolve_entity(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="sentinels",
+        platform_name="Sentinels",
+        entity_type=EntityType.TEAM,
+    )
+    db_session.flush()
+
+    # Pending staging row carrying both slug + previous_slug.
+    row = StagingRecord(
+        source="liquipedia",
+        entity_type=EntityType.TEAM,
+        canonical_id=None,
+        payload={
+            "slug": "team-sentinels-esports",
+            "name": "Team Sentinels Esports",
+            "previous_slug": "sentinels",
+            "renamed_at": "2026-04-01",
+        },
+        status=StagingStatus.PENDING,
+    )
+    db_session.add(row)
+    db_session.flush()
+
+    stats = process_staging_queue(db_session, batch_size=10, max_batches=1)
+    db_session.refresh(row)
+
+    assert stats.processed == 1
+    assert stats.rebrands_registered == 1
+    assert stats.rebrand_conflicts == 0
+    assert row.canonical_id == seed.canonical_id
+
+    # Both slugs should now resolve to the same canonical.
+    new_alias = lookup_alias_at(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="team-sentinels-esports",
+        at=datetime(2026, 4, 5, tzinfo=UTC),
+    )
+    assert new_alias is not None
+    assert new_alias.canonical_id == seed.canonical_id
+
+
+@pytestmark_integration
+def test_process_staging_queue_logs_rebrand_conflict_without_aborting(
+    db_session,
+) -> None:
+    """A rebrand whose new slug already maps to a different canonical is logged."""
+    # Two distinct canonicals: one under the old slug, one already at
+    # the new slug. The rebrand attempt should fail with a conflict
+    # but the row's primary resolution still completes.
+    resolve_entity(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="oldteam",
+        platform_name="OldTeam",
+        entity_type=EntityType.TEAM,
+    )
+    other = resolve_entity(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="newteam",
+        platform_name="UnrelatedNewTeam",
+        entity_type=EntityType.TEAM,
+    )
+    db_session.flush()
+
+    row = StagingRecord(
+        source="liquipedia",
+        entity_type=EntityType.TEAM,
+        canonical_id=None,
+        payload={
+            "slug": "newteam",
+            "name": "OldTeam Renamed",
+            "previous_slug": "oldteam",
+            "renamed_at": "2026-04-01",
+        },
+        status=StagingStatus.PENDING,
+    )
+    db_session.add(row)
+    db_session.flush()
+
+    stats = process_staging_queue(db_session, batch_size=10, max_batches=1)
+    db_session.refresh(row)
+
+    # Primary resolution succeeded on the OLD slug.
+    assert stats.processed == 1
+    # But the rebrand extension was rejected as a conflict.
+    assert stats.rebrand_conflicts == 1
+    assert stats.rebrands_registered == 0
+    # The "newteam" alias still maps to the unrelated canonical
+    # — we did NOT silently overwrite it.
+    new_alias = lookup_alias_at(
+        db_session,
+        platform=Platform.LIQUIPEDIA,
+        platform_id="newteam",
+        at=datetime(2026, 4, 5, tzinfo=UTC),
+    )
+    assert new_alias is not None
+    assert new_alias.canonical_id == other.canonical_id
+
+
+def test_rebrand_target_dataclass_round_trip() -> None:
+    """RebrandTarget is frozen + carries the three fields the worker needs."""
+    target = RebrandTarget(
+        new_platform_id="newslug",
+        new_platform_name="NewName",
+        effective_date=datetime(2026, 4, 1, tzinfo=UTC),
+    )
+    assert target.new_platform_id == "newslug"
+    with pytest.raises((AttributeError, Exception)):
+        target.new_platform_id = "other"  # type: ignore[misc]
