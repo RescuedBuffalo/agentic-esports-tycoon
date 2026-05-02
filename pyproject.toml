@@ -23,6 +23,7 @@ match-wm = { workspace = true }
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=5.0",
     "pytest-picked>=0.5",
     "ruff>=0.4",
     "black>=24.0",
@@ -45,6 +46,42 @@ testpaths = [
 addopts = "-ra --import-mode=importlib"
 markers = [
     "integration: requires a running Postgres (TEST_DATABASE_URL set). Skipped by default on a fresh clone.",
+]
+
+# --- Coverage -----------------------------------------------------------------
+# ``make coverage`` and ``make ci`` enable --cov via the per-target overrides;
+# the defaults here keep the data clean (parallel-safe, branches counted) and
+# tell coverage where production code lives so reports are scoped to it.
+
+[tool.coverage.run]
+branch = true
+parallel = true
+source = [
+    "packages/shared/src",
+    "services/data_pipeline/src",
+    "services/ecosystem/src",
+    "services/match_wm/src",
+]
+omit = [
+    # Test code itself is not interesting in the report; tests/ contains
+    # support fixtures and stubs whose execution is incidental.
+    "*/tests/*",
+    # Alembic auto-generated migration scripts: production code, but
+    # exercised by ``alembic upgrade``, not by pytest. Including them
+    # would push the headline number down without a useful signal.
+    "*/alembic/versions/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# Lines tagged ``# pragma: no cover`` are excluded; add a couple of
+# repo-wide patterns for the same intent without the magic comment.
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
 ]
 
 # --- Tooling configuration shared by every workspace member -------------------

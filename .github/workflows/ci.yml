@@ -63,5 +63,17 @@ jobs:
       - name: Typecheck (mypy)
         run: uv run mypy
 
-      - name: Test (pytest)
-        run: uv run pytest
+      - name: Test + coverage (pytest)
+        # ``make coverage`` runs the full suite with line+branch coverage
+        # and fails the build if it drops below COVERAGE_FAIL_UNDER (set
+        # in the Makefile). Postgres is up via the ``services`` block
+        # above, so the @pytest.mark.integration tests run here too.
+        run: make coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
