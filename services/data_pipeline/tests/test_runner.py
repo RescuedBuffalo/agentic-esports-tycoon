@@ -299,11 +299,22 @@ def test_unexpected_connector_exception_logs_connector_error_and_propagates(
 
 
 def test_runner_consults_rate_limiter_per_record(db_session) -> None:
-    """Every ``fetch`` yield should trip the bucket exactly once.
+    """The runner brackets every ``next()`` on the connector's iterator with
+    one ``acquire()`` — including the final ``next()`` that raises
+    ``StopIteration``.
 
-    Use a real :class:`TokenBucket` with capacity 100 (so it never
-    blocks) but a counting wrapper so the test can assert the runner
-    actually called it.
+    The runner's ``_rate_limited`` helper documents this deliberately:
+    a connector that issues its HTTP call before yielding (the
+    documented contract) would otherwise run unmetered if the bucket
+    only fired post-yield, and refunding the token on ``StopIteration``
+    would let an empty-poll cadence bypass the limiter and exceed
+    provider quotas. The cost is one "wasted" token per pass on
+    materialised-list connectors that do no HTTP after the last yield.
+
+    So for N yielded payloads, the bucket is consulted N+1 times. Use a
+    real :class:`TokenBucket` with capacity 100 (so it never blocks)
+    plus a counting wrapper so the test can assert the runner actually
+    called it.
     """
     real_bucket = TokenBucket(capacity=100, refill_per_second=100.0)
     calls = {"n": 0}
@@ -313,12 +324,13 @@ def test_runner_consults_rate_limiter_per_record(db_session) -> None:
             calls["n"] += 1
             real_bucket.acquire()
 
+    payloads = [
+        make_player_payload(platform_id="vlr-1", platform_name="A"),
+        make_player_payload(platform_id="vlr-2", platform_name="B"),
+        make_player_payload(platform_id="vlr-3", platform_name="C"),
+    ]
     connector = FakeConnector(
-        payloads=[
-            make_player_payload(platform_id="vlr-1", platform_name="A"),
-            make_player_payload(platform_id="vlr-2", platform_name="B"),
-            make_player_payload(platform_id="vlr-3", platform_name="C"),
-        ],
+        payloads=payloads,
         rate_limit=RateLimit(capacity=10, refill_per_second=10.0),
     )
 
@@ -329,7 +341,8 @@ def test_runner_consults_rate_limiter_per_record(db_session) -> None:
         rate_limiter=CountingBucket(),  # type: ignore[arg-type]
     )
 
-    assert calls["n"] == 3
+    # 3 yields + 1 stream-end probe == 4. See docstring + ``_rate_limited``.
+    assert calls["n"] == len(payloads) + 1
 
 
 def test_runner_uses_connector_rate_limit_when_no_explicit_limiter(db_session) -> None:
