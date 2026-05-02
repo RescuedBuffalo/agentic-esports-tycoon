@@ -18,7 +18,9 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     String,
+    Text,
     UniqueConstraint,
     event,
     func,
@@ -526,10 +528,140 @@ class TemporalBleedError(RuntimeError):
     """
 
 
+class Match(Base):
+    """One series of maps between two teams (BUF-8 v2, VLR seed).
+
+    Joins three times to :class:`Entity` — home team, away team, and
+    the tournament — through nullable FKs. ``ON DELETE SET NULL`` on
+    every FK keeps match history intact when an entity-side cleanup
+    or merge happens; a row with a dangling participant is still
+    valid historical record. Nullability also handles the upstream
+    edge cases (TBD opponents represented as id=0, unresolved
+    tournaments) that the CSV bootstrap inevitably surfaces.
+
+    The ``vlr_match_id`` uniqueness is the seeder's idempotency
+    anchor: a re-run against the same CSV no-ops on existing rows.
+    """
+
+    __tablename__ = "match"
+
+    match_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    vlr_match_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    match_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    team1_canonical_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entity.canonical_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    team2_canonical_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entity.canonical_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    tournament_canonical_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entity.canonical_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    series_odds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    team1_map_odds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    map_results: Mapped[list[MapResult]] = relationship(
+        back_populates="match",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("vlr_match_id", name="uq_match_vlr_match_id"),
+    )
+
+
+class MapResult(Base):
+    """One map within a :class:`Match` (BUF-8 v2).
+
+    Per-team rounds (split atk/def), the headline rating, and a JSONB
+    blob of the long-tail aggregate stats (ACS/KAST/ADR/HS/FK/FD/
+    pistols/ecos/semibuys/fullbuys). The seed module is the single
+    documented writer for ``team{1,2}_stats``; readers should treat
+    keys outside that documented set as best-effort.
+
+    ``round_breakdown`` is the raw VLR-encoded round-by-round ledger.
+    We stash the text and let a downstream feature extractor parse
+    it — the encoding has shifted at least once across VLR versions,
+    and a parser regression should not be able to break the seed.
+
+    ``vod_url`` lives here, not on ``match``: the CSV ships one VOD
+    link per map (different games of the same series often have
+    different upload links), so a per-row column is the right shape.
+    """
+
+    __tablename__ = "map_result"
+
+    map_result_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    match_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("match.match_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    vlr_game_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # VLR's internal map id (1=Bind, 2=Haven, ..., 11=Abyss in roughly
+    # release order). 0 / -1 are upstream sentinels for unplayed
+    # / forfeited slots; we keep them verbatim so a future map-name
+    # resolver doesn't lose the upstream signal.
+    vlr_map_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    team1_rounds: Mapped[int] = mapped_column(Integer, nullable=False)
+    team2_rounds: Mapped[int] = mapped_column(Integer, nullable=False)
+    team1_atk_rounds: Mapped[int] = mapped_column(Integer, nullable=False)
+    team1_def_rounds: Mapped[int] = mapped_column(Integer, nullable=False)
+    team2_atk_rounds: Mapped[int] = mapped_column(Integer, nullable=False)
+    team2_def_rounds: Mapped[int] = mapped_column(Integer, nullable=False)
+    team1_rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    team2_rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    team1_stats: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    team2_stats: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    round_breakdown: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vod_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    match: Mapped[Match] = relationship(back_populates="map_results")
+
+    __table_args__ = (
+        UniqueConstraint("vlr_game_id", name="uq_map_result_vlr_game_id"),
+    )
+
+
 __all__ = [
     "AliasReviewQueue",
     "Entity",
     "EntityAlias",
+    "MapResult",
+    "Match",
     "PatchEra",
     "PatchNote",
     "RawRecord",

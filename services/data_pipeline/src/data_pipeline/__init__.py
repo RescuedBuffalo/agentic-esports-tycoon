@@ -1,4 +1,4 @@
-"""Valorant-native ingest service: VLR / Riot / Liquipedia -> entity graph -> data/.
+"""Valorant-native ingest service: VLR / Riot -> entity graph -> data/.
 
 Stages defined in config/scheduler.yaml. See docs/ARCHITECTURE.md §5.1.
 

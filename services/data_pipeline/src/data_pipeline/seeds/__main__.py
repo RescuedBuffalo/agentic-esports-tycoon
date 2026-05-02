@@ -1,10 +1,16 @@
-"""``python -m data_pipeline.seeds liquipedia`` operator entry point.
+"""``python -m data_pipeline.seeds <command>`` operator entry point.
 
-The ticket spec is "run ``seed_from_liquipedia()`` once" — this module
-is the one-line invocation an operator types after standing up a fresh
-Postgres. Reads ``DATABASE_URL`` from the environment and commits at
-the end of the run; on failure rolls back and re-raises so a partial
-seed never lands.
+Two seeds wired here:
+
+* ``vlr`` — bulk match history from a community-scraped VLR.gg CSV
+  (BUF-8 v2). The replacement for the Liquipedia seed; reads a path,
+  populates canonical TEAM + TOURNAMENT entities plus every match
+  and map row.
+* ``patch-eras`` — Valorant patch-era timeline (BUF-13).
+
+Reads ``DATABASE_URL`` from the environment and commits at the end of
+the run; on failure rolls back and re-raises so a partial seed never
+lands.
 """
 
 from __future__ import annotations
@@ -19,12 +25,11 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from data_pipeline.connectors.liquipedia import DEFAULT_BASE_URL
-from data_pipeline.seeds.liquipedia import (
-    DEFAULT_SEEDS_DIR,
-    seed_from_liquipedia,
-)
 from data_pipeline.seeds.patch_eras import seed_patch_eras
+from data_pipeline.seeds.vlr import (
+    DEFAULT_SEEDS_DIR,
+    seed_from_vlr_csv,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -34,22 +39,22 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    liq = sub.add_parser(
-        "liquipedia",
-        help="Bootstrap canonical entities from Liquipedia (BUF-8).",
+    vlr = sub.add_parser(
+        "vlr",
+        help="Bootstrap canonical entities + match history from a VLR.gg CSV (BUF-8 v2).",
     )
-    liq.add_argument(
-        "--base-url",
-        default=DEFAULT_BASE_URL,
-        help=f"Liquipedia REST base URL (default: {DEFAULT_BASE_URL}).",
+    vlr.add_argument(
+        "csv_path",
+        type=Path,
+        help="Path to the VLR.gg map-level CSV (one row per map).",
     )
-    liq.add_argument(
+    vlr.add_argument(
         "--seeds-dir",
         type=Path,
         default=DEFAULT_SEEDS_DIR,
         help=f"Where to write the manifest (default: {DEFAULT_SEEDS_DIR}).",
     )
-    liq.add_argument(
+    vlr.add_argument(
         "--no-manifest",
         action="store_true",
         help="Skip writing the manifest file (still printed on stdout).",
@@ -95,15 +100,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     engine = create_engine(_resolve_database_url(), future=True)
     try:
         with Session(engine) as session, session.begin():
-            if args.command == "liquipedia":
-                manifest = seed_from_liquipedia(
+            if args.command == "vlr":
+                manifest = seed_from_vlr_csv(
                     session,
-                    base_url=args.base_url,
+                    csv_path=args.csv_path,
                     seeds_dir=args.seeds_dir,
                     write_manifest=not args.no_manifest,
                 )
                 summary = (
-                    f"liquipedia seed complete: created={manifest.total_canonical_created} "
+                    f"vlr seed complete: "
+                    f"teams_created={manifest.teams.created} "
+                    f"tournaments_created={manifest.tournaments.created} "
+                    f"matches_inserted={manifest.matches.matches_inserted} "
+                    f"maps_inserted={manifest.matches.maps_inserted} "
                     f"date={manifest.seed_date}"
                 )
             elif args.command == "patch-eras":

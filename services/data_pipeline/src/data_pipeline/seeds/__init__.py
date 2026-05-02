@@ -6,19 +6,19 @@ Connectors then keep that store fresh on their normal cadence.
 
 Public surface::
 
-    seed_from_liquipedia      # BUF-8 entry point
-    SeedManifest              # auditable record of one seed run
-    DEFAULT_SEEDS_DIR         # ./seeds
+    seed_from_vlr_csv      # BUF-8 v2 entry point — bulk match history
+    VlrSeedManifest        # auditable record of one VLR seed run
+    DEFAULT_SEEDS_DIR      # ./seeds
 """
 
-from data_pipeline.seeds.liquipedia import (
+from data_pipeline.seeds.vlr import (
     DEFAULT_SEEDS_DIR,
-    SeedManifest,
-    seed_from_liquipedia,
+    VlrSeedManifest,
+    seed_from_vlr_csv,
 )
 
 __all__ = [
     "DEFAULT_SEEDS_DIR",
-    "SeedManifest",
-    "seed_from_liquipedia",
+    "VlrSeedManifest",
+    "seed_from_vlr_csv",
 ]
