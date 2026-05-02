@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -401,7 +401,7 @@ def test_ten_known_handle_changes_produce_zero_duplicate_canonicals(
     """
     from sqlalchemy import func, select
 
-    # 10 fixture players: (old_handle, new_handle, new_display_name).
+    # 10 fixture players: (old_handle, new_handle, display_name).
     handle_changes = [
         ("tenz_2023", "tenz", "TenZ"),
         ("zekken_2024", "zekken", "Zekken"),
@@ -416,13 +416,21 @@ def test_ten_known_handle_changes_produce_zero_duplicate_canonicals(
     ]
 
     # 1. Seed the 10 originals via the resolver.
+    #
+    # Use the bare display name (not e.g. ``old.replace("_", " ").title()``)
+    # so seed rows don't share the ``2023`` / ``2024`` year suffix that
+    # rapidfuzz's WRatio token-set component treats as a strong match
+    # signal — "Less 2024" vs "Aspas 2024" scores 0.7368, above
+    # REVIEW_THRESHOLD (0.70), pushing the seed call into PENDING and
+    # breaking the canonical_id post-condition. The bare names worst-pair
+    # at 0.60, comfortably below the threshold.
     canonical_ids: list[uuid.UUID] = []
-    for old, _new, _name in handle_changes:
+    for _old, _new, name in handle_changes:
         result = resolve_entity(
             db_session,
             platform=Platform.LIQUIPEDIA,
-            platform_id=old,
-            platform_name=old.replace("_", " ").title(),
+            platform_id=_old,
+            platform_name=name,
             entity_type=EntityType.PLAYER,
         )
         assert result.canonical_id is not None
@@ -896,11 +904,17 @@ def test_process_staging_queue_logs_rebrand_conflict_without_aborting(
     assert stats.rebrands_registered == 0
     # The "newteam" alias still maps to the unrelated canonical
     # — we did NOT silently overwrite it.
+    #
+    # ``at`` must be after the seeded alias's ``valid_from`` (server
+    # default ``NOW()``); a hard-coded past date here would make this
+    # a date-bomb test that quietly starts failing once wall-clock
+    # time rolls past it. Use ``now + 1 day`` so the lookup is always
+    # in the future relative to the seed flush.
     new_alias = lookup_alias_at(
         db_session,
         platform=Platform.LIQUIPEDIA,
         platform_id="newteam",
-        at=datetime(2026, 4, 5, tzinfo=UTC),
+        at=datetime.now(UTC) + timedelta(days=1),
     )
     assert new_alias is not None
     assert new_alias.canonical_id == other.canonical_id
