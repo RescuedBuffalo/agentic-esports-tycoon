@@ -328,6 +328,61 @@ def test_seed_is_idempotent_on_re_run(db_session, tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
+def test_malformed_map_column_is_skipped_not_coerced(
+    db_session,
+    tmp_path: Path,
+) -> None:
+    """Codex P2 regression (PR #22): bad ``Map`` columns route to skipped, not zero.
+
+    The seed previously coerced an unparseable ``Map`` value to 0 via
+    ``_parse_int(...) or 0`` — but 0 is also a real upstream sentinel
+    for an unplayed/forfeit map slot. That double-meaning let
+    corrupted data land alongside legitimate forfeits with no
+    distinction. The fix routes a non-numeric Map column to
+    ``rows_skipped_malformed`` via :func:`_require_int`. We assert
+    that two rows differing only in their ``Map`` value (one valid,
+    one ``"NaN"``) produce one inserted ``map_result`` and one
+    skip count.
+    """
+    bad_map_row = (
+        # Same shape as ``_ROW_VALORANT_BO3_MAP1`` but with Map="NaN" —
+        # unparseable, must skip.
+        "600001,600001,2200,2024-09-04,9001,9002,Alpha,Beta,"
+        "0,0,NaN,13,9,7,6,6,3,1.134,0.87,211.4,178.2,83,70,70,83,39,32,"
+        "13,-13,72.8,66.6,134.8,115.8,29.4,29.8,12,10,10,12,2,-2,2,0,"
+        "0,0,2,3,4,2,7,4,7,7,11,13,enc,0,0,0,0,0,0,0,0,0,0,"
+    )
+    good_map_row = (
+        # Same MatchID different GameID, valid Map=1, lands cleanly.
+        "600001,600002,2200,2024-09-04,9001,9002,Alpha,Beta,"
+        "0,0,1,13,9,7,6,6,3,1.134,0.87,211.4,178.2,83,70,70,83,39,32,"
+        "13,-13,72.8,66.6,134.8,115.8,29.4,29.8,12,10,10,12,2,-2,2,0,"
+        "0,0,2,3,4,2,7,4,7,7,11,13,enc,0,0,0,0,0,0,0,0,0,0,"
+    )
+    csv_path = _make_csv(tmp_path, rows=[bad_map_row, good_map_row])
+
+    manifest = seed_from_vlr_csv(
+        db_session,
+        csv_path=csv_path,
+        seeds_dir=tmp_path / "seeds-out",
+        write_manifest=False,
+    )
+
+    assert manifest.matches.maps_inserted == 1
+    assert manifest.matches.rows_skipped_malformed == 1
+    # The bad row's parent Match is *constructed* (the exception is
+    # raised by ``_construct_map_result``, not ``_construct_match``)
+    # but never ``session.add``ed because the exception propagates
+    # before the call site reaches that line. The good row that
+    # follows is the first observation that actually persists a
+    # Match for ``600001``.
+    matches = db_session.execute(select(Match)).scalars().all()
+    assert {m.vlr_match_id for m in matches} == {"600001"}
+    maps = db_session.execute(select(MapResult)).scalars().all()
+    assert {mr.vlr_game_id for mr in maps} == {"600002"}
+
+
+@pytest.mark.integration
 def test_team_and_event_with_same_numeric_id_resolve_to_distinct_canonicals(
     db_session,
     tmp_path: Path,

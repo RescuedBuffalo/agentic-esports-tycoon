@@ -295,6 +295,7 @@ def seed_from_vlr_csv(
             )
             manifest.matches.rows_skipped_malformed += 1
             continue
+        wrote_anything = match_record is not None or map_record is not None
         if match_record is not None:
             session.add(match_record)
             match_canonical_by_vlr_id[match_record.vlr_match_id] = match_record.match_id
@@ -303,12 +304,17 @@ def seed_from_vlr_csv(
             session.add(map_record)
             existing_game_ids.add(map_record.vlr_game_id)
             manifest.matches.maps_inserted += 1
-        # Flush per ~1000 added rows keeps the in-session state
+        # Flush every ~1000 inserts keeps the in-session state
         # consistent for the next iteration's existing-id checks
-        # without paying a flush per row. The bound is by inserted
-        # count so a re-run (mostly idempotent skips) doesn't flush
-        # at all.
-        if (manifest.matches.maps_inserted + manifest.matches.matches_inserted) % 1000 == 0:
+        # without paying a flush per row. The ``wrote_anything``
+        # gate is what makes a full-idempotent re-run cheap: with
+        # both counters stuck at 0 the modulo would be true every
+        # iteration and we'd flush on every CSV row even though
+        # nothing was added. Skipping when nothing was written
+        # keeps re-runs at ~zero DB round-trips beyond the
+        # initial pre-load SELECTs.
+        total_inserted = manifest.matches.maps_inserted + manifest.matches.matches_inserted
+        if wrote_anything and total_inserted % 1000 == 0:
             session.flush()
     session.flush()
 
@@ -530,7 +536,14 @@ def _construct_map_result(row: dict[str, str], *, match_id: uuid.UUID) -> MapRes
         map_result_id=uuid.uuid4(),
         match_id=match_id,
         vlr_game_id=row["GameID"],
-        vlr_map_id=_parse_int(row["Map"]) or 0,
+        # ``_require_int`` rather than ``_parse_int(...) or 0``: ``0``
+        # is a real upstream sentinel for an unplayed/forfeit map, so
+        # silently coercing a blank or non-numeric Map column to 0
+        # would erase the distinction between "VLR's id space says
+        # unplayed" and "the upstream row was corrupt". Routing
+        # malformed Map values to ``rows_skipped_malformed`` keeps the
+        # data-quality counter truthful.
+        vlr_map_id=_require_int(row, "Map"),
         team1_rounds=_require_int(row, "Team1 Rounds"),
         team2_rounds=_require_int(row, "Team2 Rounds"),
         team1_atk_rounds=_require_int(row, "Team1 Atk Rounds"),
