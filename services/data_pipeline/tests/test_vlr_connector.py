@@ -176,16 +176,22 @@ def test_transform_yields_well_formed_records_per_entity_type() -> None:
     seen_types = {record.entity_type for record in all_records}
     assert seen_types == {EntityType.PLAYER, EntityType.TEAM, EntityType.TOURNAMENT}
 
-    # platform_id is the VLR-stable numeric id, never a display name.
+    # platform_id is the VLR-stable numeric id namespaced by entity type
+    # (see :func:`vlr_alias_platform_id`), never a display name.
     for record in all_records:
         assert record.platform_id, "platform_id must be non-empty"
         assert not record.platform_id.isspace()
-        # All seeded ids in the fixtures are numeric.
-        assert record.platform_id.isdigit()
+        # All seeded fixture ids are numeric, so the namespaced form is
+        # ``"<entity_type>-<digits>"`` — split + check the suffix.
+        prefix, _, suffix = record.platform_id.partition("-")
+        assert prefix == record.entity_type.value
+        assert suffix.isdigit()
         # platform_name is the free-form display string.
         assert record.platform_name
-        # Payload preserves the row blob for replay.
-        assert record.payload["vlr_id"] == record.platform_id
+        # Payload preserves the row blob for replay; ``vlr_id`` keeps
+        # the raw upstream id (audit-friendly) — the namespaced form
+        # only lives on the IngestionRecord/EntityAlias platform_id.
+        assert record.payload["vlr_id"] == suffix
 
 
 def test_transform_uses_numeric_id_not_slug_or_display_name() -> None:
@@ -197,7 +203,10 @@ def test_transform_uses_numeric_id_not_slug_or_display_name() -> None:
     payloads = list(connector.fetch(_EPOCH))
     records = list(connector.transform(connector.validate(payloads[0])))
     assert len(records) == 1
-    assert records[0].platform_id == "9"
+    # Namespaced by entity type — see :func:`vlr_alias_platform_id`.
+    # The raw VLR id ``9`` stays on the row payload.
+    assert records[0].platform_id == "player-9"
+    assert records[0].payload["vlr_id"] == "9"
     # Display name reflects the upstream rename, but the id is stable.
     assert records[0].platform_name == "tenz"
 
@@ -280,8 +289,9 @@ def test_since_filter_excludes_older_match_rows() -> None:
     # Six anchors total in the fixture, two from 2025-12 (Paper Rex + DRX)
     # and four from 2026-04. Filter must drop exactly two.
     assert len(records) == 4
-    assert "2593" not in {r.platform_id for r in records}  # Paper Rex
-    assert "8877" not in {r.platform_id for r in records}  # DRX
+    # platform_id is namespaced (``team-<id>``); raw ids stay on payload.
+    assert "team-2593" not in {r.platform_id for r in records}  # Paper Rex
+    assert "team-8877" not in {r.platform_id for r in records}  # DRX
 
 
 def test_since_filter_passes_rows_without_timestamps() -> None:
@@ -330,9 +340,10 @@ def test_match_anchor_inherits_timestamp_from_ancestor() -> None:
     records = list(connector.transform(connector.validate(payloads[0])))
 
     # The 2025-12 card's two anchors must be filtered out via inherited
-    # ancestor timestamp; the 2026-04 card's two anchors pass.
+    # ancestor timestamp; the 2026-04 card's two anchors pass. The
+    # platform_id is namespaced by entity type (team-<id>).
     ids = {r.platform_id for r in records}
-    assert ids == {"188", "4915"}
+    assert ids == {"team-188", "team-4915"}
     # And the inherited match_id is on each kept row's payload, so the
     # transform sees the row-level metadata even when the anchor itself
     # carried none.
@@ -823,7 +834,8 @@ def test_tenz_to_tenz_rename_does_not_split_canonical(db_session: Any) -> None:
     aliases_after_pass_one = (
         db_session.execute(
             select(EntityAlias).where(
-                EntityAlias.platform == Platform.VLR, EntityAlias.platform_id == "9"
+                EntityAlias.platform == Platform.VLR,
+                EntityAlias.platform_id == "player-9",
             )
         )
         .scalars()
@@ -841,7 +853,8 @@ def test_tenz_to_tenz_rename_does_not_split_canonical(db_session: Any) -> None:
     aliases_after_pass_two = (
         db_session.execute(
             select(EntityAlias).where(
-                EntityAlias.platform == Platform.VLR, EntityAlias.platform_id == "9"
+                EntityAlias.platform == Platform.VLR,
+                EntityAlias.platform_id == "player-9",
             )
         )
         .scalars()

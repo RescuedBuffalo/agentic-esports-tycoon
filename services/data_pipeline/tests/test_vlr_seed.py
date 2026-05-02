@@ -29,7 +29,6 @@ from esports_sim.db.enums import EntityType, Platform
 from esports_sim.db.models import Entity, EntityAlias, MapResult, Match
 from sqlalchemy import select
 
-
 # A tiny VLR-shaped CSV exercising:
 # * two matches (381258, 381287) — one with two maps (Bo3 partial),
 #   the other with one map (Bo1 / partial Bo3);
@@ -226,6 +225,11 @@ def test_seed_creates_canonical_entities_and_match_rows(
     # 4 teams + 2 events = 6 VLR aliases, all at confidence 1.0
     assert len(aliases) == 6
     assert all(a.confidence == 1.0 for a in aliases)
+    # The alias platform_id is namespaced by entity type so a team and
+    # an event with the same raw VLR id can coexist (see Codex review,
+    # PR #22). Spot-check the prefix shape.
+    alias_ids = {a.platform_id for a in aliases}
+    assert all(pid.startswith(("team-", "tournament-")) for pid in alias_ids), alias_ids
 
     matches = db_session.execute(select(Match)).scalars().all()
     assert {m.vlr_match_id for m in matches} == {"381258", "381287", "381999"}
@@ -298,6 +302,70 @@ def test_seed_is_idempotent_on_re_run(db_session, tmp_path: Path) -> None:
     maps_count = db_session.execute(select(MapResult)).scalars().all()
     assert len(matches_count) == 2
     assert len(maps_count) == 3
+
+
+@pytest.mark.integration
+def test_team_and_event_with_same_numeric_id_resolve_to_distinct_canonicals(
+    db_session,
+    tmp_path: Path,
+) -> None:
+    """Codex P1 regression (PR #22): namespace VLR alias ids by entity type.
+
+    VLR's per-resource numeric spaces overlap. Without prefixing the
+    alias ``platform_id`` by entity type, a team with id ``2158`` and
+    an event with id ``2158`` would collide on the
+    ``(platform, platform_id)`` unique constraint and the second
+    create-or-get would silently return the first canonical — wiring
+    ``match.tournament_canonical_id`` to a TEAM entity. We synthesise
+    that exact collision (Team1ID = EventID = 2158) and assert two
+    distinct canonicals + correctly-typed FKs.
+    """
+    # MatchID 500001 has Team1ID 2158 (the same numeric id as EventID 2158).
+    # Each side of the collision must land under its own canonical.
+    colliding_row = (
+        "500001,500001,2158,2024-09-04,2158,15138,Collider,KS Hunters,"
+        "0,0,1,13,9,7,6,6,3,1.134,0.87,211.4,178.2,83,70,70,83,39,32,"
+        "13,-13,72.8,66.6,134.8,115.8,29.4,29.8,12,10,10,12,2,-2,2,0,"
+        "0,0,2,3,4,2,7,4,7,7,11,13,enc,0,0,0,0,0,0,0,0,0,0,"
+    )
+    csv_path = _make_csv(tmp_path, rows=[colliding_row])
+
+    seed_from_vlr_csv(
+        db_session,
+        csv_path=csv_path,
+        seeds_dir=tmp_path / "seeds-out",
+        write_manifest=False,
+    )
+
+    aliases = db_session.execute(
+        select(EntityAlias).where(EntityAlias.platform == Platform.VLR)
+    ).scalars().all()
+    # Three aliases: team-2158 (Team1), team-15138 (Team2), tournament-2158.
+    alias_by_pid = {a.platform_id: a for a in aliases}
+    assert "team-2158" in alias_by_pid
+    assert "tournament-2158" in alias_by_pid
+    # Distinct canonicals — no collapsing onto a shared row.
+    assert alias_by_pid["team-2158"].canonical_id != alias_by_pid["tournament-2158"].canonical_id
+
+    # Each canonical's entity_type matches its alias prefix — i.e. the
+    # team id resolves to a TEAM Entity, the event id to a TOURNAMENT.
+    team_entity = db_session.execute(
+        select(Entity).where(Entity.canonical_id == alias_by_pid["team-2158"].canonical_id)
+    ).scalar_one()
+    tournament_entity = db_session.execute(
+        select(Entity).where(Entity.canonical_id == alias_by_pid["tournament-2158"].canonical_id)
+    ).scalar_one()
+    assert team_entity.entity_type is EntityType.TEAM
+    assert tournament_entity.entity_type is EntityType.TOURNAMENT
+
+    # And the match row's FKs point at the right ones — the bug being
+    # tested is precisely that ``tournament_canonical_id`` would
+    # otherwise resolve to the TEAM entity.
+    match = db_session.execute(
+        select(Match).where(Match.vlr_match_id == "500001")
+    ).scalar_one()
+    assert match.team1_canonical_id == team_entity.canonical_id
+    assert match.tournament_canonical_id == tournament_entity.canonical_id
 
 
 @pytest.mark.integration

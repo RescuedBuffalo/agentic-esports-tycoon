@@ -65,6 +65,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from data_pipeline.connectors.vlr import vlr_alias_platform_id
+
 _logger = logging.getLogger("data_pipeline.seeds.vlr")
 
 # Where the manifest file lands. Operators can override; default is
@@ -209,17 +211,26 @@ def seed_from_vlr_csv(
     # in O(1) per row rather than a SELECT-per-id round-trip.
     existing_alias_canonical = _load_existing_vlr_aliases(session)
 
-    canonical_for: dict[str, uuid.UUID] = {}
+    # Tuple-keyed lookup so the team and tournament namespaces stay
+    # disjoint by entity type. VLR's per-resource id spaces overlap on
+    # the integer axis (a team and an event can share the same raw
+    # numeric id), so a single ``vlr_id -> canonical`` dict would be
+    # ambiguous. The platform_id we hand the alias store goes through
+    # :func:`vlr_alias_platform_id` for the same reason at the row
+    # level — the alias unique constraint is on ``(platform, platform_id)``
+    # alone, and we'd silently overwrite one entity with the other if
+    # we let raw VLR ids land directly.
+    canonical_for: dict[tuple[EntityType, str], uuid.UUID] = {}
     for vlr_id, display_name in teams_to_resolve.items():
         cid, was_created = _create_or_get_canonical(
             session,
             platform=Platform.VLR,
-            platform_id=vlr_id,
+            platform_id=vlr_alias_platform_id(EntityType.TEAM, vlr_id),
             platform_name=display_name,
             entity_type=EntityType.TEAM,
             existing=existing_alias_canonical,
         )
-        canonical_for[vlr_id] = cid
+        canonical_for[(EntityType.TEAM, vlr_id)] = cid
         if was_created:
             manifest.teams.created += 1
         else:
@@ -232,12 +243,12 @@ def seed_from_vlr_csv(
         cid, was_created = _create_or_get_canonical(
             session,
             platform=Platform.VLR,
-            platform_id=vlr_id,
+            platform_id=vlr_alias_platform_id(EntityType.TOURNAMENT, vlr_id),
             platform_name=f"vlr-event-{vlr_id}",
             entity_type=EntityType.TOURNAMENT,
             existing=existing_alias_canonical,
         )
-        canonical_for[vlr_id] = cid
+        canonical_for[(EntityType.TOURNAMENT, vlr_id)] = cid
         if was_created:
             manifest.tournaments.created += 1
         else:
@@ -334,8 +345,7 @@ def _iter_rows(csv_path: Path) -> Iterator[dict[str, str]]:
     # emit on Windows. Plain ``utf-8`` would leave it embedded in
     # the first column name and cause a downstream KeyError.
     with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
-        for row in csv.DictReader(fh):
-            yield row
+        yield from csv.DictReader(fh)
 
 
 def _is_sentinel(row: dict[str, str]) -> bool:
@@ -439,7 +449,7 @@ class _RowMalformed(ValueError):
 def _build_match_and_map(
     row: dict[str, str],
     *,
-    canonical_for: dict[str, uuid.UUID],
+    canonical_for: dict[tuple[EntityType, str], uuid.UUID],
     match_canonical_by_vlr_id: dict[str, uuid.UUID],
     pre_existing_match_ids: frozenset[str],
     seen_match_ids: set[str],
@@ -494,18 +504,22 @@ def _build_match_and_map(
 def _construct_match(
     row: dict[str, str],
     *,
-    canonical_for: dict[str, uuid.UUID],
+    canonical_for: dict[tuple[EntityType, str], uuid.UUID],
 ) -> Match:
     match_date = _parse_date(row["Date"])
     if match_date is None:
         raise _RowMalformed(f"unparseable date {row['Date']!r}")
+    # Look up by (entity_type, raw_vlr_id). The seeder populates
+    # canonical_for with disjoint TEAM and TOURNAMENT keys so the same
+    # numeric id under each type resolves to its own canonical row —
+    # see the namespacing rationale in :func:`seed_from_vlr_csv`.
     return Match(
         match_id=uuid.uuid4(),
         vlr_match_id=row["MatchID"],
         match_date=match_date,
-        team1_canonical_id=canonical_for.get(row["Team1ID"]),
-        team2_canonical_id=canonical_for.get(row["Team2ID"]),
-        tournament_canonical_id=canonical_for.get(row["EventID"]),
+        team1_canonical_id=canonical_for.get((EntityType.TEAM, row["Team1ID"])),
+        team2_canonical_id=canonical_for.get((EntityType.TEAM, row["Team2ID"])),
+        tournament_canonical_id=canonical_for.get((EntityType.TOURNAMENT, row["EventID"])),
         series_odds=_parse_float(row.get("Series Odds", "")),
         team1_map_odds=_parse_float(row.get("Team1 Map Odds", "")),
     )
