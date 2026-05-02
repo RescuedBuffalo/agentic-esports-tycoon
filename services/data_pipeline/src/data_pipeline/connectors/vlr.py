@@ -102,6 +102,7 @@ def vlr_alias_platform_id(entity_type: EntityType, raw_vlr_id: str) -> str:
     """
     return f"{entity_type.value}-{raw_vlr_id}"
 
+
 logger = logging.getLogger(__name__)
 
 

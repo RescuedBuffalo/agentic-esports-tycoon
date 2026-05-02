@@ -214,14 +214,18 @@ def test_seed_creates_canonical_entities_and_match_rows(
 
     # Schema-level assertions — direct DB queries, not via the
     # manifest, so a manifest bug can't mask a missing row.
-    teams = db_session.execute(
-        select(Entity).where(Entity.entity_type == EntityType.TEAM)
-    ).scalars().all()
+    teams = (
+        db_session.execute(select(Entity).where(Entity.entity_type == EntityType.TEAM))
+        .scalars()
+        .all()
+    )
     assert len(teams) == 4
 
-    aliases = db_session.execute(
-        select(EntityAlias).where(EntityAlias.platform == Platform.VLR)
-    ).scalars().all()
+    aliases = (
+        db_session.execute(select(EntityAlias).where(EntityAlias.platform == Platform.VLR))
+        .scalars()
+        .all()
+    )
     # 4 teams + 2 events = 6 VLR aliases, all at confidence 1.0
     assert len(aliases) == 6
     assert all(a.confidence == 1.0 for a in aliases)
@@ -337,9 +341,11 @@ def test_team_and_event_with_same_numeric_id_resolve_to_distinct_canonicals(
         write_manifest=False,
     )
 
-    aliases = db_session.execute(
-        select(EntityAlias).where(EntityAlias.platform == Platform.VLR)
-    ).scalars().all()
+    aliases = (
+        db_session.execute(select(EntityAlias).where(EntityAlias.platform == Platform.VLR))
+        .scalars()
+        .all()
+    )
     # Three aliases: team-2158 (Team1), team-15138 (Team2), tournament-2158.
     alias_by_pid = {a.platform_id: a for a in aliases}
     assert "team-2158" in alias_by_pid
@@ -361,9 +367,7 @@ def test_team_and_event_with_same_numeric_id_resolve_to_distinct_canonicals(
     # And the match row's FKs point at the right ones — the bug being
     # tested is precisely that ``tournament_canonical_id`` would
     # otherwise resolve to the TEAM entity.
-    match = db_session.execute(
-        select(Match).where(Match.vlr_match_id == "500001")
-    ).scalar_one()
+    match = db_session.execute(select(Match).where(Match.vlr_match_id == "500001")).scalar_one()
     assert match.team1_canonical_id == team_entity.canonical_id
     assert match.tournament_canonical_id == tournament_entity.canonical_id
 

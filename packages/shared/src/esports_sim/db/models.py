@@ -588,9 +588,7 @@ class Match(Base):
         lazy="selectin",
     )
 
-    __table_args__ = (
-        UniqueConstraint("vlr_match_id", name="uq_match_vlr_match_id"),
-    )
+    __table_args__ = (UniqueConstraint("vlr_match_id", name="uq_match_vlr_match_id"),)
 
 
 class MapResult(Base):
@@ -651,9 +649,7 @@ class MapResult(Base):
 
     match: Mapped[Match] = relationship(back_populates="map_results")
 
-    __table_args__ = (
-        UniqueConstraint("vlr_game_id", name="uq_map_result_vlr_game_id"),
-    )
+    __table_args__ = (UniqueConstraint("vlr_game_id", name="uq_map_result_vlr_game_id"),)
 
 
 __all__ = [
