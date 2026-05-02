@@ -5,7 +5,12 @@
 
 SHELL := /bin/bash
 
-.PHONY: help dev up down sync migrate test lint format typecheck precommit ci clean
+.PHONY: help dev up down sync migrate test coverage lint format typecheck precommit ci clean
+
+# Minimum line coverage the ``make coverage`` / ``make ci`` targets enforce.
+# Picked to sit just under the suite's measured number so the ratchet is
+# locked in without false-failing the next PR. Bump as coverage grows.
+COVERAGE_FAIL_UNDER ?= 80
 
 help:
 	@echo "Targets:"
@@ -15,11 +20,12 @@ help:
 	@echo "  sync        Resolve and install the uv workspace (incl. dev group)."
 	@echo "  migrate     Apply Alembic migrations against \$$DATABASE_URL."
 	@echo "  test        Run pytest across all workspace members."
+	@echo "  coverage    Run pytest with line+branch coverage; fail under \$$COVERAGE_FAIL_UNDER (currently $(COVERAGE_FAIL_UNDER))."
 	@echo "  lint        Run ruff + black --check."
 	@echo "  format      Apply ruff --fix and black."
 	@echo "  typecheck   Run mypy."
 	@echo "  precommit   Run all configured pre-commit hooks on every file."
-	@echo "  ci          Lint + typecheck + test (mirrors CI)."
+	@echo "  ci          Lint + typecheck + coverage (mirrors CI)."
 	@echo "  clean       Tear down volumes and caches."
 
 dev: sync up
@@ -49,6 +55,19 @@ migrate:
 test:
 	uv run pytest
 
+coverage:
+	# Run the full suite under coverage and fail the build if the line
+	# coverage drops below ``$$COVERAGE_FAIL_UNDER``. ``term-missing``
+	# prints uncovered lines inline so a regression points straight at
+	# the file that lost coverage. Configuration (source paths, omit
+	# patterns, branch coverage) lives in pyproject.toml under
+	# ``[tool.coverage.*]``.
+	uv run pytest \
+		--cov \
+		--cov-report=term-missing \
+		--cov-report=xml \
+		--cov-fail-under=$(COVERAGE_FAIL_UNDER)
+
 lint:
 	uv run ruff check .
 	uv run black --check .
@@ -63,7 +82,7 @@ typecheck:
 precommit:
 	uv run pre-commit run --all-files
 
-ci: lint typecheck test
+ci: lint typecheck coverage
 
 clean:
 	docker compose down -v
