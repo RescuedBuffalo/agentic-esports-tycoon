@@ -16,6 +16,7 @@ from esports_sim.schemas.dtos import (
     AliasReviewQueueDTO,
     EntityAliasDTO,
     EntityDTO,
+    PatchEraDTO,
     RawRecordDTO,
     StagingRecordDTO,
 )
@@ -111,6 +112,35 @@ def test_review_queue_dto_from_orm() -> None:
     dto = AliasReviewQueueDTO.model_validate(item)
     assert dto.status is ReviewStatus.PENDING
     assert dto.candidates and isinstance(dto.candidates[0], dict)
+
+
+def _patch_era_dto_kwargs(**overrides):
+    base = {
+        "era_id": uuid.uuid4(),
+        "era_slug": "e2024_01",
+        "patch_version": "8.0",
+        "start_date": datetime.now(UTC),
+        "end_date": None,
+        "meta_magnitude": 0.5,
+        "is_major_shift": False,
+        "created_at": datetime.now(UTC),
+    }
+    base.update(overrides)
+    return base
+
+
+def test_patch_era_dto_meta_magnitude_bounds() -> None:
+    PatchEraDTO(**_patch_era_dto_kwargs(meta_magnitude=0.0))
+    PatchEraDTO(**_patch_era_dto_kwargs(meta_magnitude=1.0))
+    with pytest.raises(ValidationError):
+        PatchEraDTO(**_patch_era_dto_kwargs(meta_magnitude=-0.01))
+    with pytest.raises(ValidationError):
+        PatchEraDTO(**_patch_era_dto_kwargs(meta_magnitude=1.01))
+
+
+def test_patch_era_dto_open_era_has_null_end_date() -> None:
+    dto = PatchEraDTO(**_patch_era_dto_kwargs(end_date=None))
+    assert dto.end_date is None
 
 
 def test_extra_fields_rejected() -> None:

@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -412,12 +413,127 @@ class AliasReviewQueue(Base):
     )
 
 
+class PatchEra(Base):
+    """One Valorant patch window — the temporal partition every joinable
+    record carries (BUF-13, Systems-spec System 04).
+
+    Identity is the ``era_id`` UUID; ``era_slug`` (e.g. ``"e2024_01"``) is
+    the human-friendly key the YAML config uses and downstream tooling
+    grep-matches against. ``patch_version`` carries the Riot patch label
+    that opened the era (e.g. ``"8.0"``); when an era spans multiple
+    Riot hotfixes, this is the *first* one — meaningful enough to grep
+    out of a log line without claiming the era is bound to a single
+    point release.
+
+    Half-open semantics. ``[start_date, end_date)``: a match played at
+    exactly ``end_date`` belongs to the *next* era, not this one. The
+    closed-then-opened transactional pair :func:`roll_era` exploits this
+    so a re-roll from era A to era B can stamp both rows with the same
+    timestamp without overlap. The exclusion constraint enforced by the
+    migration spells out the same rule at the DB level so two writers
+    racing on a roll can't produce overlapping ranges.
+
+    The ``end_date`` column is nullable to mark "the current era". A
+    partial unique index (created in the migration) caps the open era
+    count at one — the schema-level guarantee that
+    :func:`current_era` can't return more than one row.
+
+    ``meta_magnitude`` is a 0..1 hand-tuned magnitude estimate: how
+    much the meta shifted at the start of this era. ``is_major_shift``
+    is the boolean that gates the BUF-13 ``TEMPORAL_BLEED`` guard;
+    aggregations that span across an era marked ``is_major_shift=True``
+    raise :class:`TemporalBleedError` so models trained pre-shift never
+    silently leak into post-shift evaluation.
+    """
+
+    __tablename__ = "patch_era"
+
+    era_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    era_slug: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    patch_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    start_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    # Nullable: ``end_date IS NULL`` is the open-current-era marker.
+    end_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    meta_magnitude: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        server_default="0",
+    )
+    is_major_shift: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default="false",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        # Half-open ranges with end_date strictly after start_date. The
+        # exclusion constraint in the migration prevents overlap; this
+        # CHECK is the guard against a single-row bug (someone setting
+        # end_date == start_date or end_date < start_date inside one
+        # row). Keeping it CHECK rather than EXCLUDE keeps the per-row
+        # validation cost effectively zero.
+        CheckConstraint(
+            "end_date IS NULL OR end_date > start_date",
+            name="ck_patch_era_end_after_start",
+        ),
+        # ``meta_magnitude`` is a 0..1 estimate. The CHECK keeps a
+        # buggy seed loader from inserting nonsense (e.g. -1, 5) that
+        # would silently break the magnitude-weighted aggregations.
+        CheckConstraint(
+            "meta_magnitude >= 0 AND meta_magnitude <= 1",
+            name="ck_patch_era_meta_magnitude_range",
+        ),
+        # At most one open era. The migration installs this as a
+        # partial unique index (UNIQUE WHERE end_date IS NULL); the
+        # ORM-side declaration mirrors it so alembic autogenerate
+        # doesn't see drift in a future revision.
+        Index(
+            "ix_patch_era_open_unique",
+            "end_date",
+            unique=True,
+            postgresql_where=text("end_date IS NULL"),
+        ),
+    )
+
+
+class TemporalBleedError(RuntimeError):
+    """Raised when an aggregation would span a major-shift era boundary.
+
+    Systems-spec System 04: every record carries an era context, and no
+    cross-era feature aggregation ever happens. The boundaries that
+    make the rule load-bearing are the ones marked
+    :attr:`PatchEra.is_major_shift` — those are the patches where the
+    meta moved enough that a stat aggregated across the boundary is
+    measuring two different games. See
+    :func:`esports_sim.eras.assert_no_temporal_bleed` for the runtime
+    guard.
+    """
+
+
 __all__ = [
     "AliasReviewQueue",
     "Entity",
     "EntityAlias",
+    "PatchEra",
     "PatchNote",
     "RawRecord",
     "StagingInvariantError",
     "StagingRecord",
+    "TemporalBleedError",
 ]

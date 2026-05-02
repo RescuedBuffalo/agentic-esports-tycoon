@@ -78,6 +78,41 @@ uv run nexus run finalize <run_id> --status=completed --notes="ok"
 
 Public Python API: `from esports_sim.registry import Registry, RunStatus`.
 
+## Patch-era partitioning (BUF-13)
+
+Every record that carries a timestamp also carries an era context.
+`patch_era` is the temporal-partition table; `assign_era(ts)` (Python
+helper or the matching Postgres SQL function) maps a timestamp onto
+its era. Aggregations across an era marked `is_major_shift=True`
+raise `TemporalBleedError` — the runtime guard for the System 04
+"no cross-era feature aggregation" rule.
+
+Bootstrap the historical 2020→present timeline once per environment:
+
+```bash
+DATABASE_URL=postgresql+psycopg://nexus:nexus@localhost:5432/nexus \
+    uv run python -m data_pipeline.seeds patch-eras
+```
+
+Steady-state era transitions (called from BUF-24's patch-intent
+extractor when a new patch ships):
+
+```python
+from esports_sim.eras import roll_era
+
+closed, opened = roll_era(
+    session,
+    new_slug="e2026_02",
+    new_patch_version="11.05",
+    boundary_at=patch_release_ts,
+    is_major_shift=True,
+    meta_magnitude=0.85,
+)
+```
+
+The close + open pair is atomic (single savepoint, half-open ranges,
+EXCLUDE constraint at the DB layer) — no gap, no overlap.
+
 ## Claude API budget governor (BUF-22)
 
 Every Claude call goes through `esports_sim.budget.claude_call`. The governor

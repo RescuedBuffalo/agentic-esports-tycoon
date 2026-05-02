@@ -77,6 +77,8 @@ def db_engine() -> Generator[Engine, None, None]:
         yield engine
     finally:
         with engine.begin() as conn:
+            conn.execute(text("DROP VIEW IF EXISTS patch_era_window"))
+            conn.execute(text("DROP FUNCTION IF EXISTS assign_era(timestamptz)"))
             Base.metadata.drop_all(bind=conn)
             conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
             for typename in (
