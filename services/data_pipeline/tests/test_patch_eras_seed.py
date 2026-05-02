@@ -164,6 +164,43 @@ def test_seeded_timeline_assigns_every_year_2020_to_present(db_session) -> None:
 
 
 @pytest.mark.integration
+def test_seed_reports_open_era_after_steady_state_roll(db_session, tmp_path: Path) -> None:
+    """Codex P2 regression: a re-run after ``roll_era`` opened a new
+    era *outside* the curated dataset must still report the open era
+    on the manifest.
+
+    Scenario: seed populates the curated timeline → operator runs
+    ``roll_era`` for a Valorant patch the curated list doesn't yet
+    cover → seed is re-run by a CI hook before the curated list gets
+    a follow-up update. The manifest must still surface the *real*
+    open era from the DB, not ``None``.
+    """
+    from esports_sim.eras import roll_era
+
+    seed_patch_eras(db_session, seeds_dir=tmp_path, write_manifest=False)
+
+    # Operator rolls into an era the curated list doesn't know about.
+    closed, opened = roll_era(
+        db_session,
+        new_slug="e2027_xx",
+        new_patch_version="12.0",
+        boundary_at=datetime(2027, 1, 15, tzinfo=UTC),
+        is_major_shift=True,
+        meta_magnitude=0.85,
+    )
+    assert closed is not None
+    assert opened.era_slug == "e2027_xx"
+
+    # Re-run the seed: every curated row is ``existing``, no rows
+    # inserted, but the manifest's ``open_era_slug`` must reflect the
+    # *DB truth*, not the planned-rows-loop view.
+    manifest = seed_patch_eras(db_session, seeds_dir=tmp_path, write_manifest=False)
+    assert manifest.counters.inserted == 0
+    assert manifest.counters.existing == len(_VALORANT_ERAS)
+    assert manifest.open_era_slug == "e2027_xx"
+
+
+@pytest.mark.integration
 def test_manifest_to_json_roundtrips() -> None:
     """The manifest dataclass serialises cleanly for the on-disk file."""
     m = PatchEraSeedManifest(

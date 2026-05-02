@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from esports_sim.db.models import PatchEra
-from esports_sim.eras import open_new_era
+from esports_sim.eras import current_era, open_new_era
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -221,14 +221,10 @@ def seed_patch_eras(
         row.era_slug: row for row in session.execute(select(PatchEra)).scalars()
     }
 
-    open_era_slug: str | None = None
     for spec in planned:
         slug = spec["era_slug"]
-        existing = existing_by_slug.get(slug)
-        if existing is not None:
+        if slug in existing_by_slug:
             manifest.counters.existing += 1
-            if existing.end_date is None:
-                open_era_slug = existing.era_slug
             continue
 
         # New row. ``open_new_era`` is for the open-current path; for
@@ -247,10 +243,18 @@ def seed_patch_eras(
         session.add(row)
         session.flush()
         manifest.counters.inserted += 1
-        if row.end_date is None:
-            open_era_slug = row.era_slug
 
-    manifest.open_era_slug = open_era_slug
+    # Report the open era from the DB after the seed completes, not from
+    # whichever planned spec happened to land with ``end_date=None``.
+    # In steady state, ``roll_era`` opens new eras *not* present in the
+    # curated ``_VALORANT_ERAS`` list — a re-run of the seed would then
+    # see all planned slugs as ``existing`` and report
+    # ``open_era_slug=None`` even though an open row clearly exists,
+    # misleading any operational check that grep'd the manifest. Query
+    # the partial-unique-indexed open row directly so the manifest is
+    # always truthful.
+    open_row = current_era(session)
+    manifest.open_era_slug = open_row.era_slug if open_row is not None else None
     manifest.finished_at = datetime.now(UTC).isoformat()
 
     if write_manifest:

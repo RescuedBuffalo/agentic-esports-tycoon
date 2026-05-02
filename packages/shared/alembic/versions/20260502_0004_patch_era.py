@@ -54,14 +54,16 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # ``btree_gist`` lets us put a UUID column in the same EXCLUDE
-    # constraint as a tstzrange, but we don't actually need that here
-    # — the EXCLUDE is purely on the range. Still useful to install in
-    # case future migrations layer per-game / per-region partitions on
-    # top, and ``IF NOT EXISTS`` keeps the call cheap. Loaded explicitly
-    # rather than relying on the operator having pre-installed it.
-    op.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
-
+    # Note: this migration deliberately does NOT install ``btree_gist``.
+    # Postgres's core GIST opclass already supports range types, so the
+    # ``EXCLUDE USING gist (tstzrange(...) WITH &&)`` constraint below
+    # works without a contrib extension. Adding ``btree_gist`` would only
+    # be required if we wanted to combine a btree-indexable column (e.g.
+    # a per-game UUID) into the same EXCLUDE — at which point the
+    # migration that introduces that column should install it. Doing it
+    # eagerly here would block alembic upgrade in environments where the
+    # app role can't install extensions or where ``postgresql-contrib``
+    # isn't on the host.
     op.create_table(
         "patch_era",
         sa.Column("era_id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -193,5 +195,3 @@ def downgrade() -> None:
     op.drop_index("ix_patch_era_open_unique", table_name="patch_era")
     op.drop_index("ix_patch_era_start_date", table_name="patch_era")
     op.drop_table("patch_era")
-    # Leave btree_gist in place — other tables may grow to depend on
-    # it and dropping the extension would cascade their constraints.
