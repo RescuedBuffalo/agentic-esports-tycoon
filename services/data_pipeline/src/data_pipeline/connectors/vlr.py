@@ -79,6 +79,30 @@ _REQUIRED_PAGE_KEYS: dict[str, tuple[str, ...]] = {
     "rankings": ("page_type", "url", "rows"),
 }
 
+
+def vlr_alias_platform_id(entity_type: EntityType, raw_vlr_id: str) -> str:
+    """Namespace a raw VLR numeric id by entity type for the alias store.
+
+    VLR's URL paths use disjoint namespaces per resource (``/team/<id>``,
+    ``/player/<id>``, ``/event/<id>``) — but those numeric spaces overlap.
+    A team and an event can share the same integer id (early VLR data
+    has documented collisions in the low thousands). The
+    ``entity_alias`` unique constraint is on ``(platform, platform_id)``
+    only, so we collapse the two-axis upstream identity into a single
+    string by prefixing the raw id with the entity type. Without this,
+    a team scrape and an event scrape with the same numeric id would
+    point at the same alias row and one entity would silently overwrite
+    the other.
+
+    Format: ``"<entity_type>-<raw_vlr_id>"`` (e.g. ``"player-9"``,
+    ``"team-188"``, ``"tournament-2097"``). The seed module imports
+    this helper to keep its bulk-import path consistent with the live
+    connector — divergence between the two writers would re-introduce
+    the same race at a different layer.
+    """
+    return f"{entity_type.value}-{raw_vlr_id}"
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -822,14 +846,23 @@ class VLRConnector(Connector):
         the display name would split the canonical row the moment VLR
         re-cased "TenZ" -> "tenz".
 
+        Namespacing: the raw ``vlr_id`` field on the payload stays as
+        the upstream value (e.g. ``"9"``) for audit, but the
+        ``platform_id`` on the emitted :class:`IngestionRecord` is
+        prefixed by entity type via :func:`vlr_alias_platform_id`.
+        VLR's per-resource numeric spaces overlap; without that prefix
+        a team and an event with the same raw id would collide on the
+        ``(platform, platform_id)`` alias unique constraint.
+
         The since-filter is applied during ``fetch`` (before the
         payload is hashed for dedup), so this method just projects
         whatever rows the validated payload contains.
         """
         for row in validated_payload["rows"]:
+            entity_type = EntityType(row["entity_type"])
             yield IngestionRecord(
-                entity_type=EntityType(row["entity_type"]),
-                platform_id=row["vlr_id"],
+                entity_type=entity_type,
+                platform_id=vlr_alias_platform_id(entity_type, row["vlr_id"]),
                 platform_name=row["display_name"],
                 payload=row,
             )
@@ -891,4 +924,5 @@ __all__ = [
     "VLRPageRow",
     "VLRParser",
     "VLR_BASE_URL",
+    "vlr_alias_platform_id",
 ]

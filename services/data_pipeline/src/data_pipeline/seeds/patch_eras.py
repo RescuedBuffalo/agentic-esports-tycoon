@@ -61,7 +61,7 @@ from sqlalchemy.orm import Session
 
 _logger = logging.getLogger("data_pipeline.seeds.patch_eras")
 
-# Default seed manifest location; mirrors the liquipedia seed.
+# Default seed manifest location; mirrors the VLR seed.
 DEFAULT_SEEDS_DIR = Path("seeds")
 
 
