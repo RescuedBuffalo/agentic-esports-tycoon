@@ -1,8 +1,13 @@
 # Local dev stack. Boot with `make dev` (or `docker compose up -d`).
 #
-# Phase 0 scope: Postgres 16 + Qdrant. Prefect joins as a separate profile in a
-# later phase — declared here as a stub so `docker compose --profile orchestration
-# up` works once the image is pinned. See BUF-5.
+# Phase 0 scope: Postgres 16 (with pgvector). Prefect joins as a separate
+# profile in a later phase — declared here as a stub so
+# `docker compose --profile orchestration up` works once the image is pinned.
+# See BUF-5.
+#
+# Vector storage lives in Postgres via the ``vector`` extension (ADR-006,
+# BUF-28); Qdrant was removed once we landed pgvector because the queries
+# we actually run are cross-entity SQL JOINs.
 #
 # Image is intentionally light: no GPU, no model servers. Phase 2 concern.
 
@@ -28,21 +33,6 @@ services:
       timeout: 5s
       retries: 10
 
-  qdrant:
-    image: qdrant/qdrant:v1.11.3
-    container_name: nexus-qdrant
-    restart: unless-stopped
-    ports:
-      - "${QDRANT_HTTP_PORT:-6333}:6333"
-      - "${QDRANT_GRPC_PORT:-6334}:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   prefect:
     image: prefecthq/prefect:3-latest
     container_name: nexus-prefect
@@ -60,4 +50,3 @@ services:
 
 volumes:
   postgres_data:
-  qdrant_data:

@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -33,6 +34,12 @@ from sqlalchemy.orm import Mapped, Mapper, Session, mapped_column, relationship
 
 from esports_sim.db.base import Base
 from esports_sim.db.enums import EntityType, Platform, ReviewStatus, StagingStatus
+
+# all-MiniLM-L6-v2's output width (BUF-28, ADR-006). Pinned as a
+# module-level constant so the model declarations, the migration, and
+# the runtime ``Embedder.embed`` call all agree on the width — a
+# mismatch would surface as an opaque pgvector cast error at insert.
+EMBEDDING_DIM: int = 384
 
 # Reusable Postgres ENUM types. ``create_type=False`` keeps every model
 # definition from trying to recreate the type — the migration owns the
@@ -737,17 +744,134 @@ class MapResult(Base):
     __table_args__ = (UniqueConstraint("vlr_game_id", name="uq_map_result_vlr_game_id"),)
 
 
+class PersonalityEmbedding(Base):
+    """One embedding per canonical entity (BUF-28, ADR-006).
+
+    The personality extractor (BUF-25) summarises everything we know
+    about a player into a paragraph; that paragraph is embedded with
+    ``sentence-transformers/all-MiniLM-L6-v2`` and the resulting
+    384-dim vector lands here. One row per entity is the right
+    cardinality: the personality summary is the entity's current
+    state, not a time series. Re-extraction is an UPSERT, anchored on
+    ``entity_id`` as the primary key.
+
+    Why a hard FK to ``entity.canonical_id`` with ``ON DELETE
+    CASCADE``: the embedding is meaningless without the row that
+    produced it. A merged-away duplicate's stale embedding would
+    show up in :func:`similar_players` results pointing at a
+    canonical id that no longer exists; cascading the delete keeps
+    the index honest.
+
+    ``model_version`` records which embedder produced the row (e.g.
+    ``"sentence-transformers/all-MiniLM-L6-v2@v1"``). Stored
+    per-row so a future model rotation can detect mixed populations
+    and re-embed in place without losing the audit trail; the
+    HNSW index doesn't care, but recall comparisons across model
+    versions are nonsense.
+    """
+
+    __tablename__ = "personality_embedding"
+
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entity.canonical_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(EMBEDDING_DIM),
+        nullable=False,
+    )
+    model_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class TranscriptChunkEmbedding(Base):
+    """One embedded chunk of a transcript (BUF-28, ADR-006).
+
+    Whisper (BUF-21) emits transcripts of player and caster media.
+    Each transcript gets sliced into ~500-token chunks, embedded
+    with the same MiniLM model as :class:`PersonalityEmbedding`,
+    and stored here for retrieval-during-inference.
+
+    Why store ``chunk_text`` alongside the vector instead of joining
+    back to a ``transcript_chunk`` table on every query: the helper
+    that builds an LLM prompt needs the raw text after the kNN
+    selects the chunk, and a per-row 500-token blob keeps the join
+    out of the hot path. Costs ~2 KB per row in TOAST storage; the
+    saving is one less JOIN on every retrieval call.
+
+    ``media_id`` is intentionally **not** a foreign key in this
+    revision. The ``media`` table that BUF-21 owns isn't in the
+    schema yet; minting an FK constraint pointing at a non-existent
+    table would force this migration to wait. The next migration
+    after BUF-21 lands will add the FK + ``ON DELETE CASCADE`` so a
+    deleted media row drops its chunks. Until then, the cleanup
+    contract is the writer's responsibility — the Whisper pipeline
+    deletes the per-media chunks before re-inserting on a re-run.
+
+    Idempotency: ``(media_id, chunk_idx)`` is unique. A re-embedding
+    pass for the same media UPSERTs by that key, so a re-run of the
+    Whisper pipeline never produces duplicates.
+    """
+
+    __tablename__ = "transcript_chunk_embedding"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    # No FK yet — see class docstring. Indexed because every read
+    # path filters on it (either "all chunks for this media" during
+    # cleanup, or "select chunk_text where media_id IN (...)" after
+    # the kNN narrows down the candidate set).
+    media_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+    )
+    chunk_idx: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(EMBEDDING_DIM),
+        nullable=False,
+    )
+    model_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "media_id",
+            "chunk_idx",
+            name="uq_transcript_chunk_embedding_media_chunk",
+        ),
+    )
+
+
 __all__ = [
     "AliasReviewQueue",
+    "EMBEDDING_DIM",
     "Entity",
     "EntityAlias",
     "MapResult",
     "Match",
     "PatchEra",
     "PatchNote",
+    "PersonalityEmbedding",
     "PlayerMatchStat",
     "RawRecord",
     "StagingInvariantError",
     "StagingRecord",
     "TemporalBleedError",
+    "TranscriptChunkEmbedding",
 ]

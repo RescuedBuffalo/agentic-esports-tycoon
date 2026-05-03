@@ -133,3 +133,21 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["torch", "torch.*", "torch_geometric", "torch_geometric.*"]
 ignore_missing_imports = true
+
+# ``sentence_transformers`` is the BUF-28 default embedder. Same
+# rationale as torch above — pulling it into CI would mean shipping
+# torch + huggingface; the embedder is lazy-imported inside
+# ``SentenceTransformerEmbedder.embed`` so the rest of the codebase
+# (and the test suite, which injects a stub Embedder) doesn't depend
+# on it.
+[[tool.mypy.overrides]]
+module = ["sentence_transformers", "sentence_transformers.*"]
+ignore_missing_imports = true
+
+# pgvector ships without a ``py.typed`` marker today, so mypy's strict
+# mode treats every import as ``Any``. The schema-side pgvector usage
+# (``Vector(384)`` columns) is narrow enough that suppressing here is
+# preferable to scattering ``# type: ignore`` across the model + queries.
+[[tool.mypy.overrides]]
+module = ["pgvector", "pgvector.*"]
+ignore_missing_imports = true

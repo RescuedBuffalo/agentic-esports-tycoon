@@ -41,6 +41,9 @@ def test_alembic_upgrade_creates_all_tables(db_engine) -> None:
         "staging_record",
         "raw_record",
         "alias_review_queue",
+        # BUF-28: pgvector embedding store (ADR-006).
+        "personality_embedding",
+        "transcript_chunk_embedding",
         "alembic_version",  # bookkeeping table that proves the migration ran
     }
     missing = expected - tables

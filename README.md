@@ -13,7 +13,10 @@ make dev
 ```
 
 That syncs the [`uv`](https://docs.astral.sh/uv/) workspace and brings up
-Postgres 16 and Qdrant via docker-compose. Run tests with:
+Postgres 16 (with the `vector` extension preinstalled) via docker-compose.
+Embeddings live in the same Postgres instance per
+[ADR-006](docs/adr/ADR-006-storage-stack.md) — there is no separate vector
+store. Run tests with:
 
 ```bash
 uv run pytest
@@ -139,7 +142,7 @@ See `packages/shared/src/esports_sim/budget/__init__.py` for the public API.
 
 | Command           | What it does                                            |
 | ----------------- | ------------------------------------------------------- |
-| `make dev`        | Sync workspace + bring up Postgres & Qdrant.            |
+| `make dev`        | Sync workspace + bring up Postgres (with pgvector).     |
 | `make up`         | Bring up the data plane only.                           |
 | `make down`       | Stop the data plane (volumes preserved).                |
 | `make sync`       | Resolve and install the uv workspace.                   |
