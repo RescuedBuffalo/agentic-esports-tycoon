@@ -344,3 +344,34 @@ def test_similar_players_target_without_embedding_raises(db_session, embedder: E
 
     with pytest.raises(SimilarPlayerNotFoundError):
         similar_players(db_session, "newbie", k=3)
+
+
+def test_similar_players_uuid_target_must_be_player(db_session, embedder: Embedder) -> None:
+    """A non-player UUID with a personality embedding (legal at the
+    schema level — the FK only points at ``entity``) must not be
+    accepted as a similar_players target. The function compares
+    player-shaped vectors; mixing in a team's vector would silently
+    rank players against the wrong centroid.
+    """
+    team = make_entity(entity_type=EntityType.TEAM)
+    db_session.add(team)
+    db_session.flush()
+    upsert_personality_embedding(
+        db_session,
+        entity_id=team.canonical_id,
+        text="duelist-aggressive",
+        embedder=embedder,
+    )
+    db_session.flush()
+
+    with pytest.raises(SimilarPlayerNotFoundError, match="not a player"):
+        similar_players(db_session, team.canonical_id, k=3)
+
+
+def test_similar_players_unknown_uuid_raises(db_session) -> None:
+    """A canonical UUID that doesn't exist in `entity` must surface
+    as a structured error — silently returning zero results would
+    make a typo in a caller indistinguishable from a real no-match.
+    """
+    with pytest.raises(SimilarPlayerNotFoundError, match="does not exist"):
+        similar_players(db_session, uuid.uuid4(), k=3)

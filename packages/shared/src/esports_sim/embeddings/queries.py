@@ -53,13 +53,35 @@ class SimilarPlayer:
 def _resolve_target(session: Session, target: uuid.UUID | str) -> uuid.UUID:
     """Return the canonical id for ``target``.
 
-    UUIDs pass through; strings resolve via ``entity_alias.platform_name``
+    UUIDs are validated to point at a row whose ``entity_type =
+    'player'``; strings resolve via ``entity_alias.platform_name``
     (case-insensitive exact match) restricted to ``entity_type =
-    'player'``. Raises :class:`SimilarPlayerNotFoundError` on no-match
-    or ambiguous-match because either is a programming error the
-    caller should see, not a silent zero-result.
+    'player'``. Raises :class:`SimilarPlayerNotFoundError` on
+    no-match, ambiguous-match, or wrong-entity-type because each
+    is a programming error the caller should see, not a silent
+    zero-result or — worse — a result that ranks players against
+    a team-shaped vector.
     """
     if isinstance(target, uuid.UUID):
+        # Entity-type guard: similar_players claims to compare
+        # players, so a caller who passes a team / coach /
+        # tournament UUID with a personality embedding gets a
+        # structured error rather than a kNN result that mixes
+        # vector spaces. Distinguish "no such row" from "wrong
+        # type" so the message points at the actual problem.
+        row = session.execute(
+            text("SELECT entity_type FROM entity WHERE canonical_id = :id"),
+            {"id": target},
+        ).first()
+        if row is None:
+            raise SimilarPlayerNotFoundError(
+                f"entity {target} does not exist; pass a canonical id from `entity`"
+            )
+        if row[0] != "player":
+            raise SimilarPlayerNotFoundError(
+                f"entity {target} is a {row[0]!r}, not a player. "
+                "similar_players is only defined over player-typed entities."
+            )
         return target
 
     rows = session.execute(
