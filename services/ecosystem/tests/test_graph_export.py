@@ -159,6 +159,39 @@ def test_export_era_is_idempotent(
     assert second.passed
 
 
+def test_manifest_serializes_datetime_metadata(tmp_path: Path) -> None:
+    """Codex P1 (PR #24): datetime values from ``patch_meta`` must serialize.
+
+    The ``GraphDataSource.patch_meta`` contract documents that era
+    window timestamps may flow through; ``json.dumps`` would otherwise
+    raise ``TypeError`` on the manifest write.
+    """
+    from datetime import UTC, datetime
+
+    from ecosystem.graph.source import InMemoryDataSource
+
+    src = InMemoryDataSource()
+    src.set_patch(
+        "e_t",
+        {
+            "era_ordinal": 0.0,
+            "starts_at": datetime(2024, 1, 9, tzinfo=UTC),
+            "ends_at": datetime(2024, 4, 15, tzinfo=UTC),
+        },
+    )
+    snap = build_snapshot(src, era_slug="e_t")
+    out_dir = tmp_path / "snap"
+    snap.write(out_dir)
+
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    patch_meta = manifest["metadata"]["patch_meta"]
+    # Datetimes round-trip as ISO strings; the exact format is whatever
+    # ``datetime.isoformat()`` produces, so we just confirm it landed
+    # as a string rather than crashing the dump.
+    assert isinstance(patch_meta["starts_at"], str)
+    assert "2024-01-09" in patch_meta["starts_at"]
+
+
 def test_failed_validation_writes_failed_status(
     registry: Registry, config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -218,7 +218,12 @@ class GraphSnapshot:
         # cleanly, which is the documented use.
         np.savez(npz_path, **arrays)  # type: ignore[arg-type]
         manifest_path.write_text(
-            json.dumps(self._build_manifest(), indent=2, sort_keys=True),
+            json.dumps(
+                self._build_manifest(),
+                indent=2,
+                sort_keys=True,
+                default=_jsonable_default,
+            ),
             encoding="utf-8",
         )
         return {"snapshot": npz_path, "manifest": manifest_path}
@@ -341,6 +346,35 @@ class GraphSnapshot:
 
 
 # ---- helpers ---------------------------------------------------------------
+
+
+def _jsonable_default(obj: Any) -> Any:
+    """Coerce non-native types (datetime, numpy scalars, ...) for ``json.dumps``.
+
+    The snapshot's metadata block carries whatever the data source
+    handed back from ``patch_meta`` — typically era window timestamps
+    as ``datetime`` instances. Without this default, ``json.dumps``
+    raises ``TypeError`` when the manifest is written.
+
+    The handler is deliberately permissive: anything ISO-stringifiable
+    is converted, anything else falls through to ``str()``. The
+    manifest is a human-readable record, not a typed contract — losing
+    a millisecond of precision on a stored timestamp is a fair price
+    for not failing the export.
+    """
+    # ``datetime`` and ``date`` carry ``.isoformat()``; numpy datetimes
+    # do not, but ``str(np.datetime64(...))`` returns ISO-like text.
+    iso = getattr(obj, "isoformat", None)
+    if callable(iso):
+        return iso()
+    # numpy scalars implement ``.item()`` to fall back to a Python type.
+    item = getattr(obj, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except (TypeError, ValueError):
+            pass
+    return str(obj)
 
 
 def _edge_key_str(key: tuple[str, str, str]) -> str:

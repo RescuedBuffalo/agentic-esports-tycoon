@@ -247,6 +247,64 @@ def test_missing_feature_does_not_propagate_nan() -> None:
     assert validate_snapshot(snap).passed
 
 
+def test_duplicate_edges_get_deterministic_order() -> None:
+    """Codex P2 (PR #24): duplicate-endpoint edges must sort deterministically.
+
+    Two ``InMemoryDataSource`` instances with the same edges in two
+    different insertion orders should produce identical snapshots —
+    otherwise the registry's content fingerprint changes on every
+    re-run and the idempotency contract breaks.
+    """
+    def _build_one(order: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+        src = InMemoryDataSource()
+        src.set_patch("e_t", {"era_ordinal": 0.0})
+        src.add_node("e_t", "player", NodeRow(id="p-0", features=_player_features_full(0.0)))
+        # One team to anchor the dst endpoint.
+        src.add_node(
+            "e_t",
+            "team",
+            NodeRow(
+                id="t-0",
+                features={
+                    "avg_acs": 210.0,
+                    "avg_kast": 0.68,
+                    "win_rate": 0.5,
+                    "map_win_rate": 0.5,
+                    "attack_rwr": 0.5,
+                    "defense_rwr": 0.5,
+                    "eco_efficiency": 0.5,
+                    "comeback_rate": 0.1,
+                    "strength_rating": 0.0,
+                    "style_aggression": 0.5,
+                    "style_utility": 0.5,
+                    "region_americas": 1.0,
+                    "region_emea": 0.0,
+                    "region_pacific": 0.0,
+                    "region_china": 0.0,
+                    "tier_rank": 0.5,
+                    "roster_age_days": 365.0,
+                },
+            ),
+        )
+        # Three duplicate-endpoint edges with distinct attributes.
+        edges = [
+            EdgeRow(src_id="p-0", dst_id="t-0", attributes={"tenure_days": 30.0, "role_slot": 0.2}),
+            EdgeRow(src_id="p-0", dst_id="t-0", attributes={"tenure_days": 60.0, "role_slot": 0.4}),
+            EdgeRow(src_id="p-0", dst_id="t-0", attributes={"tenure_days": 90.0, "role_slot": 0.6}),
+        ]
+        for i in order:
+            src.add_edge("e_t", ("player", "plays_for", "team"), edges[i])
+        snap = build_snapshot(src, era_slug="e_t")
+        block = snap.edges(("player", "plays_for", "team"))
+        assert block.edge_attr is not None
+        return block.edge_index, block.edge_attr
+
+    a_index, a_attr = _build_one((0, 1, 2))
+    b_index, b_attr = _build_one((2, 0, 1))
+    np.testing.assert_array_equal(a_index, b_index)
+    np.testing.assert_array_equal(a_attr, b_attr)
+
+
 def test_missing_edge_attribute_does_not_propagate_nan() -> None:
     """Edge attributes go through the same fill path; protect that too."""
     src = InMemoryDataSource()

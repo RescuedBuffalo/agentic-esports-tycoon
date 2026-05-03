@@ -162,6 +162,19 @@ def _build_node_block(
     return block, fit_by_col
 
 
+def _attr_sort_key(attrs: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    """Stable tertiary sort key for edges with identical endpoints.
+
+    Sorting attribute items by key first canonicalises the dict
+    iteration order; rendering values through ``str`` keeps the key
+    comparable even when values are mixed types (float / NaN /
+    datetime). We don't need the original value back — just a
+    deterministic ordering that two equivalent source implementations
+    will agree on.
+    """
+    return tuple(sorted((k, str(attrs[k])) for k in attrs))
+
+
 def _apply_fill_policy(
     normed: np.ndarray, raw: np.ndarray, col: FeatureColumn
 ) -> np.ndarray:
@@ -262,9 +275,22 @@ def _build_edge_block(
         kept_rows.append(row)
 
     # Determinism: sort by (src, dst) so a reorder in the source can't
-    # shuffle the snapshot's edge_index columns.
+    # shuffle the snapshot's edge_index columns. Two rows with the
+    # same endpoints are legal (a time-bounded relation re-asserted at
+    # different windows; an upstream double-write) and we break the
+    # tie on a canonicalised attribute fingerprint so identical
+    # source contents from two implementations still produce
+    # byte-identical snapshots — preserving the registry's
+    # idempotency contract.
     if kept_rows:
-        order = sorted(range(len(kept_rows)), key=lambda i: (src_idx[i], dst_idx[i]))
+        order = sorted(
+            range(len(kept_rows)),
+            key=lambda i: (
+                src_idx[i],
+                dst_idx[i],
+                _attr_sort_key(kept_rows[i].attributes),
+            ),
+        )
         src_idx = [src_idx[i] for i in order]
         dst_idx = [dst_idx[i] for i in order]
         kept_rows = [kept_rows[i] for i in order]
