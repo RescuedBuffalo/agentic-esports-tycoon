@@ -157,17 +157,34 @@ def _build_node_block(
     return block, fit_by_col
 
 
-def _attr_sort_key(attrs: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+def _attr_sort_key(
+    attrs: dict[str, Any], schema_columns: tuple[FeatureColumn, ...]
+) -> tuple[tuple[str, str], ...]:
     """Stable tertiary sort key for edges with identical endpoints.
 
-    Sorting attribute items by key first canonicalises the dict
-    iteration order; rendering values through ``str`` keeps the key
-    comparable even when values are mixed types (float / NaN /
-    datetime). We don't need the original value back — just a
-    deterministic ordering that two equivalent source implementations
-    will agree on.
+    Restricted to the schema-declared ``edge_attr_columns`` so volatile
+    non-schema keys (debug timestamps, per-source metadata) on the
+    source row can't perturb the sort order of duplicate-endpoint
+    edges. Without that restriction two equivalent sources — same
+    modeled features, different bookkeeping fields — produce different
+    snapshot fingerprints and the registry's idempotency contract
+    breaks. (See Codex review on PR #24.)
+
+    Missing keys and explicit ``None`` values are folded to the same
+    canonical token so a source that *omits* a column and one that
+    sets it to ``None`` agree on order. They already agree on the
+    final ``edge_attr`` row (both run through ``_extract_raw`` →
+    ``NaN`` → ``_apply_fill_policy``), so the sort key has to match.
     """
-    return tuple(sorted((k, str(attrs[k])) for k in attrs))
+    _MISSING = "\x00MISSING\x00"
+    items: list[tuple[str, str]] = []
+    for col in schema_columns:
+        value = attrs.get(col.name)
+        items.append((col.name, _MISSING if value is None else str(value)))
+    # ``schema_columns`` already comes in declaration order, so we
+    # don't need to sort — but sort defensively in case the schema
+    # ever uses a non-tuple iterable.
+    return tuple(sorted(items))
 
 
 def _apply_fill_policy(normed: np.ndarray, raw: np.ndarray, col: FeatureColumn) -> np.ndarray:
@@ -276,12 +293,13 @@ def _build_edge_block(
     # byte-identical snapshots — preserving the registry's
     # idempotency contract.
     if kept_rows:
+        attr_columns = spec.edge_attr_columns
         order = sorted(
             range(len(kept_rows)),
             key=lambda i: (
                 src_idx[i],
                 dst_idx[i],
-                _attr_sort_key(kept_rows[i].attributes),
+                _attr_sort_key(kept_rows[i].attributes, attr_columns),
             ),
         )
         src_idx = [src_idx[i] for i in order]

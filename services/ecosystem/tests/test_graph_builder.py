@@ -7,6 +7,8 @@ assert the structural invariants the System-09 validator pins.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 from ecosystem.graph import (
@@ -177,6 +179,79 @@ def test_validator_flags_edge_attr_column_mismatch() -> None:
     report = validate_snapshot(snap)
     assert not report.passed
     assert any(i.code == "edge_attr_column_mismatch" for i in report.errors)
+
+
+def test_duplicate_edge_sort_ignores_non_schema_attributes() -> None:
+    """Codex P2 (PR #24): non-schema keys must not perturb the sort key.
+
+    Two sources that emit the same modeled features but disagree on a
+    bookkeeping field (debug timestamps, per-source metadata) must
+    still produce identical snapshot fingerprints. The
+    duplicate-edge tie-breaker now restricts itself to
+    ``spec.edge_attr_columns``; any other key on the row's
+    ``attributes`` dict gets ignored.
+
+    Also pins the missing-vs-None equivalence: a source that omits
+    an attribute and one that sets it to ``None`` agree on order
+    (both already produce the same ``edge_attr`` row via
+    ``_extract_raw`` → NaN → ``_apply_fill_policy``).
+    """
+    base_attrs = {"tenure_days": 30.0, "role_slot": 0.2}
+
+    def _build(extra_per_row: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray]:
+        src = InMemoryDataSource()
+        src.set_patch("e_t", {"era_ordinal": 0.0})
+        src.add_node("e_t", "player", NodeRow(id="p-0", features=_player_features_full(0.0)))
+        src.add_node(
+            "e_t",
+            "team",
+            NodeRow(
+                id="t-0",
+                features={
+                    "avg_acs": 210.0,
+                    "avg_kast": 0.68,
+                    "win_rate": 0.5,
+                    "map_win_rate": 0.5,
+                    "attack_rwr": 0.5,
+                    "defense_rwr": 0.5,
+                    "eco_efficiency": 0.5,
+                    "comeback_rate": 0.1,
+                    "strength_rating": 0.0,
+                    "style_aggression": 0.5,
+                    "style_utility": 0.5,
+                    "region_americas": 1.0,
+                    "region_emea": 0.0,
+                    "region_pacific": 0.0,
+                    "region_china": 0.0,
+                    "tier_rank": 0.5,
+                    "roster_age_days": 365.0,
+                },
+            ),
+        )
+        # Three duplicate-endpoint edges; the per-row ``extra`` dict
+        # holds non-schema keys that two sources might disagree on.
+        for extra in extra_per_row:
+            src.add_edge(
+                "e_t",
+                ("player", "plays_for", "team"),
+                EdgeRow(src_id="p-0", dst_id="t-0", attributes={**base_attrs, **extra}),
+            )
+        snap = build_snapshot(src, era_slug="e_t")
+        block = snap.edges(("player", "plays_for", "team"))
+        assert block.edge_attr is not None
+        return block.edge_index, block.edge_attr
+
+    # Source A includes a "fetched_at" timestamp; source B omits it.
+    a_index, a_attr = _build(
+        [
+            {"fetched_at": "2024-01-01T00:00:00Z"},
+            {"fetched_at": "2024-01-02T00:00:00Z"},
+            {"fetched_at": "2024-01-03T00:00:00Z"},
+        ]
+    )
+    b_index, b_attr = _build([{}, {}, {}])
+    np.testing.assert_array_equal(a_index, b_index)
+    np.testing.assert_array_equal(a_attr, b_attr)
 
 
 def test_validator_flags_missing_edge_attr_when_schema_declares_columns() -> None:
