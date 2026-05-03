@@ -326,6 +326,23 @@ def _check_edge_blocks(
                 )
             )
 
+        # Column-name parity. A snapshot with the right *width* but
+        # swapped or renamed attribute columns would otherwise pass
+        # validation and the trainer would consume the wrong feature
+        # at every position — silent semantic corruption is exactly
+        # what System 09 should catch.
+        expected_attr_cols = tuple(c.name for c in spec.edge_attr_columns)
+        if block.edge_attr_columns != expected_attr_cols:
+            report.issues.append(
+                ValidationIssue(
+                    "edge_attr_column_mismatch",
+                    "error",
+                    loc,
+                    f"edge_attr_columns={block.edge_attr_columns!r} != "
+                    f"expected={expected_attr_cols!r}",
+                )
+            )
+
         # Edge-attribute health: same NaN / range checks as nodes.
         if block.edge_attr is not None and block.num_edges:
             if not np.all(np.isfinite(block.edge_attr)):

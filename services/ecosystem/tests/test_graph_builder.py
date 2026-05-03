@@ -144,6 +144,43 @@ def test_validation_catches_dropped_edge_endpoints() -> None:
     assert plays_for.num_edges == 0
 
 
+def test_edge_block_rejects_non_integer_edge_index() -> None:
+    """Codex P2 (PR #24): a float edge_index must raise, not be coerced.
+
+    Truncating ``0.9`` to ``0`` would still pass the bounds check and
+    produce a "valid" snapshot with rewired edges — exactly the
+    silent corruption the validator exists to catch.
+    """
+    from ecosystem.graph.snapshot import EdgeBlock
+
+    bad_index = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+    with pytest.raises(ValueError, match="edge_index dtype"):
+        EdgeBlock(
+            src="player",
+            relation="plays_for",
+            dst="team",
+            edge_index=bad_index,
+            edge_attr=None,
+            edge_attr_columns=(),
+        )
+
+
+def test_validator_flags_edge_attr_column_mismatch() -> None:
+    """Codex P1 (PR #24): renamed/swapped edge_attr columns must fail.
+
+    Same width, same dtype, same numeric range — a silent semantic
+    swap that only column-name parity catches.
+    """
+    src = build_three_era_source()
+    snap = build_snapshot(src, era_slug="e2024_01")
+    block = snap.edges(("player", "plays_for", "team"))
+    # Swap the two declared column names.
+    block.edge_attr_columns = ("role_slot", "tenure_days")
+    report = validate_snapshot(snap)
+    assert not report.passed
+    assert any(i.code == "edge_attr_column_mismatch" for i in report.errors)
+
+
 def test_validator_flags_missing_edge_attr_when_schema_declares_columns() -> None:
     """Codex P2 (PR #24): a typed-attribute edge with edge_attr=None must fail.
 

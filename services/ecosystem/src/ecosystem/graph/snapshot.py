@@ -111,6 +111,18 @@ class EdgeBlock:
                 f"EdgeBlock[{self.key}]: edge_index must be shape (2, E), "
                 f"got {self.edge_index.shape}"
             )
+        # Refuse a non-integer edge_index instead of silently casting.
+        # Truncating ``0.9`` to ``0`` would still pass the bounds check
+        # downstream and the trainer would see a different graph than
+        # the producer wrote — exactly the corruption mode the
+        # validator exists to catch.
+        if not np.issubdtype(self.edge_index.dtype, np.integer):
+            raise ValueError(
+                f"EdgeBlock[{self.key}]: edge_index dtype must be an integer "
+                f"kind; got {self.edge_index.dtype}. The builder always emits "
+                f"int64; a float dtype here means an upstream producer wrote "
+                f"the wrong array."
+            )
         if self.edge_index.dtype != _INDEX_DTYPE:
             self.edge_index = self.edge_index.astype(_INDEX_DTYPE, copy=False)
         if self.edge_attr is not None:
