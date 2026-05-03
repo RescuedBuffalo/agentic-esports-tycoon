@@ -68,3 +68,43 @@ class ReviewStatus(enum.StrEnum):
     RESOLVED = "resolved"
     SKIPPED = "skipped"
     BLOCKED = "blocked"
+
+
+class RelationshipEdgeType(enum.StrEnum):
+    """Kinds of pairwise relationships the ecosystem layer tracks (BUF-26, System 07).
+
+    Each kind has its own decay rate in
+    :data:`ecosystem.relationships.DECAY_RATES`; bumping the dict and the
+    enum together is a versioned event that Phase-1 retro-decay analyses
+    have to re-run against. Members are deliberately coarse — finer
+    distinctions live in ``relationship_event.event_kind`` so a downstream
+    feature extractor can split a TEAMMATE edge into "shared scrim" vs
+    "co-clutch" without forcing a new edge type.
+
+    Symmetric kinds (teammate, ex-teammate, rival, friend) MUST be
+    persisted with ``src_id < dst_id`` so a single pair owns at most one
+    row of that type — see :data:`SYMMETRIC_RELATIONSHIP_EDGE_TYPES`
+    and the partial check in the migration.
+    """
+
+    TEAMMATE = "teammate"
+    EX_TEAMMATE = "ex_teammate"
+    RIVAL = "rival"
+    FRIEND = "friend"
+    MENTOR = "mentor"
+    MANAGER_OF = "manager_of"
+
+
+# Edge kinds whose semantics are symmetric: the relationship "A is a
+# teammate of B" is the same fact as "B is a teammate of A". The
+# bootstrap and the application API enforce ``src_id < dst_id`` for
+# these, so a pair of players never owns two rows of the same symmetric
+# kind. Asymmetric kinds (mentor, manager_of) keep direction.
+SYMMETRIC_RELATIONSHIP_EDGE_TYPES: frozenset[RelationshipEdgeType] = frozenset(
+    {
+        RelationshipEdgeType.TEAMMATE,
+        RelationshipEdgeType.EX_TEAMMATE,
+        RelationshipEdgeType.RIVAL,
+        RelationshipEdgeType.FRIEND,
+    }
+)

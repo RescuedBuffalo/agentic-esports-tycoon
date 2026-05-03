@@ -26,7 +26,14 @@ schema. Migrations live at ``packages/shared/alembic/``.
 """
 
 from esports_sim.db.base import Base
-from esports_sim.db.enums import EntityType, Platform, ReviewStatus, StagingStatus
+from esports_sim.db.enums import (
+    SYMMETRIC_RELATIONSHIP_EDGE_TYPES,
+    EntityType,
+    Platform,
+    RelationshipEdgeType,
+    ReviewStatus,
+    StagingStatus,
+)
 from esports_sim.db.models import (
     EMBEDDING_DIM,
     AliasReviewQueue,
@@ -37,6 +44,8 @@ from esports_sim.db.models import (
     PatchNote,
     PersonalityEmbedding,
     RawRecord,
+    RelationshipEdge,
+    RelationshipEvent,
     StagingInvariantError,
     StagingRecord,
     TemporalBleedError,
@@ -56,10 +65,14 @@ __all__ = [
     "PersonalityEmbedding",
     "Platform",
     "RawRecord",
+    "RelationshipEdge",
+    "RelationshipEdgeType",
+    "RelationshipEvent",
     "ReviewStatus",
     "StagingInvariantError",
     "StagingRecord",
     "StagingStatus",
+    "SYMMETRIC_RELATIONSHIP_EDGE_TYPES",
     "TemporalBleedError",
     "TranscriptChunkEmbedding",
 ]
