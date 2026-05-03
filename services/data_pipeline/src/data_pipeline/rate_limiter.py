@@ -94,11 +94,22 @@ class TokenBucket:
         the lock first, even though the wait itself doesn't need the
         lock held.
         """
+        # Float-precision floor: a sleep-then-refill round-trip can leave
+        # ``self._tokens`` at e.g. 0.9999999999999991 instead of exactly
+        # 1.0 (the FakeClock advance + clock subtraction in tests, and
+        # any real-clock equivalent, both round at the ULP level). Without
+        # an epsilon the next iteration computes a sub-ULP ``wait``, the
+        # sleep is a no-op against ``time.monotonic`` (or the FakeClock's
+        # ``+=`` of a value below its precision), and the bucket spins
+        # forever. ``1e-9`` is comfortably above any realistic
+        # accumulated rounding error and well below any meaningful
+        # rate-limit budget.
+        _TOKEN_EPS = 1e-9
         while True:
             with self._lock:
                 self._refill()
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
+                if self._tokens >= 1.0 - _TOKEN_EPS:
+                    self._tokens = max(0.0, self._tokens - 1.0)
                     return
                 # ``self._tokens`` is in [0, 1); we need ``1 - self._tokens``
                 # more tokens, each takes ``1 / refill_per_second`` seconds.
