@@ -501,6 +501,46 @@ def test_rate_limiter_paces_fetch(db_session) -> None:
     assert clock.now >= 2 * 3.0 - 1e-9
 
 
+@pytestmark_integration
+def test_scrape_accepts_one_shot_generator(db_session) -> None:
+    """The signature accepts ``Iterable[str]`` — a one-shot generator must work.
+
+    The scraper consumes ``vlr_match_ids`` twice — once for the
+    ``map_result`` pre-load query and once in the main fetch loop.
+    Without an early ``list()`` materialisation the generator drains
+    on the first pass and the loop sees zero matches, silently writing
+    no stats. Pin the contract here so a future refactor that removes
+    the materialisation re-introduces the regression visibly.
+    """
+    from esports_sim.db.models import PlayerMatchStat
+
+    _seed_match(
+        db_session,
+        vlr_match_id="m-300001",
+        map_payloads=[{"vlr_game_id": "g-100001"}, {"vlr_game_id": "g-100002"}],
+    )
+    url = f"{VLR_BASE_URL}/match/m-300001"
+    fetcher = _make_fetcher({url: _read_fixture("match_300001.html")})
+
+    # A one-shot generator: re-iterating it after exhaustion yields
+    # nothing. If the scraper ever consumes it twice, the second pass
+    # is empty.
+    def one_shot() -> Any:
+        yield "m-300001"
+
+    stats = scrape_vlr_match_players(
+        db_session,
+        vlr_match_ids=one_shot(),
+        page_fetcher=fetcher,
+        rate_limiter=_free_bucket(),
+        robots_cache=_stub_robots(),
+    )
+    assert stats.matches_fetched == 1
+    assert stats.players_inserted == 5
+    rows = db_session.execute(select(PlayerMatchStat)).scalars().all()
+    assert len(rows) == 5
+
+
 # --- ParsedPlayerStat dataclass --------------------------------------------
 
 

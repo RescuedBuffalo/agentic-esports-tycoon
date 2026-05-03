@@ -503,6 +503,18 @@ def scrape_vlr_match_players(
     robots_cache = robots_cache or _RobotsCache(base_url, user_agent=user_agent)
     stats = VlrMatchScrapeStats()
 
+    # Materialise the input once. The signature accepts ``Iterable[str]``
+    # so callers can pass a generator (notably
+    # :func:`iter_match_ids_from_db`, a one-shot ``session.execute(...)``
+    # iterator), but the scraper consumes the sequence twice — once for
+    # the ``map_result`` pre-load query and once in the main fetch loop.
+    # Without this list() conversion the second pass would silently see
+    # zero matches on a one-shot iterator and the scraper would write no
+    # stats. Materialising early also gives ``_load_map_results_for_matches``
+    # a stable list to bind into its ``IN (...)`` clause without paying for
+    # a second iteration.
+    vlr_match_id_list = list(vlr_match_ids)
+
     # Pre-load existing PLAYER aliases so the per-row create-or-get is
     # an O(1) hashmap probe instead of a SELECT per id. Only PLAYER
     # rows are relevant; the BUF-85 scraper writes nothing else.
@@ -513,14 +525,14 @@ def scrape_vlr_match_players(
     # ingested that match — we log + skip rather than mint a phantom
     # map_result row, since the seed is the canonical writer for that
     # column.
-    map_id_by_game_id = _load_map_results_for_matches(session, vlr_match_ids)
+    map_id_by_game_id = _load_map_results_for_matches(session, vlr_match_id_list)
 
     # Pre-load existing (map_result_id, entity_id) pairs so the
     # idempotent re-run path doesn't hit the DB at all per row. We
     # query in one shot rather than per-row.
     existing_stat_keys = _load_existing_stat_keys(session, list(map_id_by_game_id.values()))
 
-    for vlr_match_id in vlr_match_ids:
+    for vlr_match_id in vlr_match_id_list:
         stats.matches_seen += 1
         url = _match_page_url(base_url, vlr_match_id)
         if not robots_cache.allows(url):
