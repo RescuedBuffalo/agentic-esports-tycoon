@@ -25,6 +25,12 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "pytest-picked>=0.5",
+    # Per-test timeout so a hanging test surfaces as a fail-with-traceback
+    # instead of stalling CI for the full 6-hour job budget. Limit set
+    # in ``addopts`` below; integration tests can override per-test
+    # via ``@pytest.mark.timeout(...)`` if a legitimately slow path
+    # ever needs more headroom.
+    "pytest-timeout>=2.3",
     "ruff>=0.4",
     "black>=24.0",
     "mypy>=1.10",
@@ -43,7 +49,7 @@ testpaths = [
 # directories — one per workspace member — without colliding on the shared
 # module name. Without it, the second ``conftest.py`` import raises
 # ImportPathMismatchError because two paths resolve to ``tests.conftest``.
-addopts = "-ra --import-mode=importlib"
+addopts = "-ra --import-mode=importlib --timeout=120 --timeout-method=thread"
 markers = [
     "integration: requires a running Postgres (TEST_DATABASE_URL set). Skipped by default on a fresh clone.",
 ]
