@@ -267,10 +267,7 @@ def seed_from_vlr_csv(
     # ``.tuples()`` quirk in a particular SQLAlchemy minor version
     # changing semantics.
     match_canonical_by_vlr_id: dict[str, uuid.UUID] = {
-        row[0]: row[1]
-        for row in session.execute(
-            select(Match.vlr_match_id, Match.match_id)
-        ).all()
+        row[0]: row[1] for row in session.execute(select(Match.vlr_match_id, Match.match_id)).all()
     }
     pre_existing_match_ids: frozenset[str] = frozenset(match_canonical_by_vlr_id)
     existing_game_ids: set[str] = set(
