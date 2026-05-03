@@ -144,6 +144,24 @@ def test_validation_catches_dropped_edge_endpoints() -> None:
     assert plays_for.num_edges == 0
 
 
+def test_validator_flags_missing_edge_attr_when_schema_declares_columns() -> None:
+    """Codex P2 (PR #24): a typed-attribute edge with edge_attr=None must fail.
+
+    Without this check, a corrupted ``snapshot.npz`` (or a producer
+    that forgot to write the matrix) would pass validation, and the
+    trainer would silently lose every attribute on relations like
+    ``plays_for`` / ``affects``.
+    """
+    src = build_three_era_source()
+    snap = build_snapshot(src, era_slug="e2024_01")
+    # ``plays_for`` declares two edge_attr columns; blanking the matrix
+    # post-build models the corrupted-snapshot scenario.
+    snap.edges(("player", "plays_for", "team")).edge_attr = None
+    report = validate_snapshot(snap)
+    assert not report.passed
+    assert any(i.code == "missing_edge_attr" for i in report.errors)
+
+
 def test_validator_flags_out_of_range_node_features() -> None:
     """If we hand-mutate the snapshot post-build, the validator should catch it."""
     src = build_three_era_source()

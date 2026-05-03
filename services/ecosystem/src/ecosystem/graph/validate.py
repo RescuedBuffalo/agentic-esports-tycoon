@@ -309,6 +309,23 @@ def _check_edge_blocks(
                     )
                 )
 
+        # If the schema declares attribute columns for this edge, the
+        # block must carry an ``edge_attr`` matrix — a corrupted
+        # ``snapshot.npz`` (or a producer that forgot to write the
+        # array) would otherwise sail through and the trainer would
+        # silently lose every attribute on relations like
+        # ``plays_for`` / ``affects``.
+        if spec.edge_attr_columns and block.edge_attr is None:
+            report.issues.append(
+                ValidationIssue(
+                    "missing_edge_attr",
+                    "error",
+                    loc,
+                    f"schema declares {len(spec.edge_attr_columns)} edge_attr "
+                    f"column(s) but block carries no edge_attr matrix",
+                )
+            )
+
         # Edge-attribute health: same NaN / range checks as nodes.
         if block.edge_attr is not None and block.num_edges:
             if not np.all(np.isfinite(block.edge_attr)):
