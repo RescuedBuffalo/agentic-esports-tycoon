@@ -87,6 +87,33 @@ class PatchEraDTO(_Frozen):
     created_at: datetime
 
 
+class PatchIntentDTO(_Frozen):
+    """BUF-24 patch-intent classification (System 06).
+
+    Mirrors the ``patch_intent`` row, including the cost/usage triple
+    so downstream readers can audit "this classification cost $0.04 on
+    Opus 4.7 with prompt v1" without joining back to the budget ledger.
+    """
+
+    id: uuid.UUID
+    patch_note_id: uuid.UUID
+    prompt_version: str = Field(min_length=1, max_length=32)
+    model: str = Field(min_length=1, max_length=64)
+    primary_intent: str = Field(min_length=1, max_length=64)
+    pro_play_driven_score: float = Field(ge=0.0, le=1.0)
+    agents_affected: list[str]
+    maps_affected: list[str]
+    econ_changed: bool
+    expected_pickrate_shifts: list[dict[str, Any]]
+    community_controversy_predicted: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str = Field(min_length=1)
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    usd_cost: float = Field(ge=0.0)
+    created_at: datetime
+
+
 __all__ = [
     "EntityDTO",
     "EntityAliasDTO",
@@ -94,4 +121,5 @@ __all__ = [
     "RawRecordDTO",
     "AliasReviewQueueDTO",
     "PatchEraDTO",
+    "PatchIntentDTO",
 ]

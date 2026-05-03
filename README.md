@@ -113,6 +113,32 @@ closed, opened = roll_era(
 The close + open pair is atomic (single savepoint, half-open ranges,
 EXCLUDE constraint at the DB layer) — no gap, no overlap.
 
+## Patch-intent extraction (BUF-24)
+
+Every patch ingested by `data_pipeline.connectors.playvalorant` is
+classified by `esports_sim.patch_intent.extract_patch_intent` — primary
+intent, agents/maps affected, expected pickrate shifts, predicted
+community controversy. Results land in the `patch_intent` table keyed on
+`(patch_note_id, prompt_version)`; bumping the prompt produces a new
+row instead of overwriting the older classification.
+
+The Phase 0 scheduler hook (`extract_intent_for_pending`) enumerates
+patch notes that don't yet have an intent for the current prompt and
+runs the extractor against each. Idempotent — a re-run after every
+patch is classified is a no-op:
+
+```python
+from esports_sim.budget import Governor, default_caps
+from esports_sim.patch_intent import extract_intent_for_pending
+
+stats = extract_intent_for_pending(session, governor=Governor(caps=default_caps()))
+# stats.inserted, stats.updated, stats.skipped_existing, stats.budget_exhausted
+```
+
+System prompt is wrapped in `cache_control` (1 h TTL) so a corpus-wide
+re-classification amortises the rubric across patches. One patch costs
+well under the BUF-22 `patch_intent` per-purpose soft cap ($3/wk).
+
 ## Claude API budget governor (BUF-22)
 
 Every Claude call goes through `esports_sim.budget.claude_call`. The governor
