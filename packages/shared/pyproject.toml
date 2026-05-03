@@ -30,6 +30,19 @@ dependencies = [
     "rapidfuzz>=3.6",
 ]
 
+# Optional extras keep the heavy ML stack out of every install (CI, devs
+# who only touch the data pipeline). Production embedding workers install
+# the ``embeddings`` extra; the BUF-28 ``SentenceTransformerEmbedder``
+# raises a pointed ImportError telling callers to install it if they
+# reach the lazy-load path without it present.
+[project.optional-dependencies]
+# BUF-28 default embedder. ``sentence-transformers`` pulls torch +
+# huggingface; the runtime path is lazy-imported so callers that inject
+# their own ``Embedder`` don't have to install this.
+embeddings = [
+    "sentence-transformers>=3.0",
+]
+
 [project.scripts]
 # Top-level CLI. Subcommands register via add_subparser:
 #   nexus budget report        — BUF-22 spend digest

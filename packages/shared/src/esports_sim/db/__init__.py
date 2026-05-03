@@ -1,4 +1,4 @@
-"""Database layer (BUF-6 + BUF-13 + BUF-83).
+"""Database layer (BUF-6 + BUF-13 + BUF-83 + BUF-28).
 
 The canonical+staging substrate every other System (02–10) joins on:
 
@@ -16,6 +16,10 @@ The canonical+staging substrate every other System (02–10) joins on:
   a timestamp resolves to one via :func:`esports_sim.eras.assign_era`;
   the runtime guard against cross-major-shift aggregation is
   :class:`TemporalBleedError`.
+* :class:`PersonalityEmbedding` / :class:`TranscriptChunkEmbedding` —
+  pgvector-backed similarity store (BUF-28, ADR-006). One personality
+  row per entity, many transcript chunks per media. The cross-entity
+  ``similar_players`` helper lives in :mod:`esports_sim.embeddings`.
 
 The ``Base`` metadata is exported so Alembic and tests can introspect the
 schema. Migrations live at ``packages/shared/alembic/``.
@@ -24,27 +28,32 @@ schema. Migrations live at ``packages/shared/alembic/``.
 from esports_sim.db.base import Base
 from esports_sim.db.enums import EntityType, Platform, ReviewStatus, StagingStatus
 from esports_sim.db.models import (
+    EMBEDDING_DIM,
     AliasReviewQueue,
     Entity,
     EntityAlias,
     PatchEra,
     PatchIntent,
     PatchNote,
+    PersonalityEmbedding,
     RawRecord,
     StagingInvariantError,
     StagingRecord,
     TemporalBleedError,
+    TranscriptChunkEmbedding,
 )
 
 __all__ = [
     "AliasReviewQueue",
     "Base",
+    "EMBEDDING_DIM",
     "Entity",
     "EntityAlias",
     "EntityType",
     "PatchEra",
     "PatchIntent",
     "PatchNote",
+    "PersonalityEmbedding",
     "Platform",
     "RawRecord",
     "ReviewStatus",
@@ -52,4 +61,5 @@ __all__ = [
     "StagingRecord",
     "StagingStatus",
     "TemporalBleedError",
+    "TranscriptChunkEmbedding",
 ]

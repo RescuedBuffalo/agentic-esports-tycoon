@@ -1,7 +1,7 @@
 # Bootstrap targets for the agentic-esports-tycoon monorepo.
 #
 # `make dev` is the single entrypoint promised by BUF-5: it brings up the local
-# data plane (Postgres + Qdrant) and syncs the uv workspace.
+# data plane (Postgres with pgvector — see ADR-006) and syncs the uv workspace.
 
 SHELL := /bin/bash
 
@@ -14,7 +14,7 @@ COVERAGE_FAIL_UNDER ?= 80
 
 help:
 	@echo "Targets:"
-	@echo "  dev         Sync uv workspace + bring up Postgres & Qdrant."
+	@echo "  dev         Sync uv workspace + bring up Postgres (pgvector)."
 	@echo "  up          Bring up the docker-compose data plane."
 	@echo "  down        Stop & remove the data plane (volumes preserved)."
 	@echo "  sync        Resolve and install the uv workspace (incl. dev group)."
@@ -32,14 +32,13 @@ dev: sync up
 	@echo ""
 	@echo "Dev stack ready."
 	@echo "  Postgres: localhost:$${POSTGRES_PORT:-5432}"
-	@echo "  Qdrant:   http://localhost:$${QDRANT_HTTP_PORT:-6333}"
 
 up:
-	# `--wait` blocks until each service's healthcheck reports healthy. Without
-	# it, compose returns as soon as containers are started (not ready), and
-	# follow-on commands race the Postgres/Qdrant startup. See
+	# `--wait` blocks until the service's healthcheck reports healthy. Without
+	# it, compose returns as soon as the container starts (not ready), and
+	# follow-on commands race the Postgres startup. See
 	# https://docs.docker.com/reference/cli/docker/compose/up/#options
-	docker compose up -d --wait postgres qdrant
+	docker compose up -d --wait postgres
 
 down:
 	docker compose down
