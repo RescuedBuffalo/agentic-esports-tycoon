@@ -110,12 +110,13 @@ def test_get_normalizer_unknown_raises() -> None:
 
 
 def test_nan_inputs_are_ignored_in_fit() -> None:
-    """NaN values shouldn't shift the fit but still get a sensible transform."""
+    """NaN values shouldn't shift the fit; downstream fill_policy handles missing."""
     out, fit = normalize_column(
         np.array([1.0, np.nan, 9.0]), normalizer_name="minmax"
     )
-    # The two finite values bound the fit; the NaN row gets the
-    # post-clip output, which is NaN passed through arithmetic.
+    # The two finite values bound the fit. The NaN passes through
+    # arithmetic untouched here — the *builder* applies fill_policy on
+    # top of normalize_column's output (see test_graph_builder.py).
     assert fit.params["min"] == 1.0
     assert fit.params["max"] == 9.0
     assert np.isnan(out[1])

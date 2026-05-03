@@ -142,7 +142,13 @@ def _build_node_block(
             [_extract_raw(r.features, col) for r in rows],
             dtype=np.float64,
         )
+        # ``normalize_column`` ignores NaN inputs during fit but leaves
+        # them in the output for the missing rows — that's the point at
+        # which the column's declared ``fill_policy`` has to step in.
+        # Without this fill the snapshot would carry NaN cells and
+        # tip the validator's ``non_finite_features`` check.
         normed, fit = normalize_column(raw, normalizer_name=col.normalizer)
+        normed = _apply_fill_policy(normed, raw, col)
         cols.append(normed)
         fit_by_col[col.name] = fit
 
@@ -154,6 +160,48 @@ def _build_node_block(
         column_names=spec.column_names(),
     )
     return block, fit_by_col
+
+
+def _apply_fill_policy(
+    normed: np.ndarray, raw: np.ndarray, col: FeatureColumn
+) -> np.ndarray:
+    """Replace NaN cells (originally missing values) per the column's policy.
+
+    ``raw`` is the pre-normalisation column; we use it to identify
+    which rows were missing rather than re-checking ``normed`` —
+    the normalisers themselves can't *introduce* NaN, so the two
+    masks are equivalent, but reading from ``raw`` keeps the
+    intent visible to readers.
+
+    ``drop_node`` rows have already been filtered upstream, so
+    that policy never reaches this function. We still defensively
+    no-op on it rather than asserting, so a future refactor can't
+    crash here.
+    """
+    missing = np.isnan(raw)
+    if not missing.any():
+        return normed
+    if col.fill_policy == "zero":
+        normed = normed.copy()
+        normed[missing] = 0.0
+        return normed
+    if col.fill_policy == "mean":
+        # Post-normalisation mean is well-defined for every kind: it's
+        # the mean of the surviving (non-NaN) cells in ``normed`` itself.
+        # If every cell is missing, fall back to 0.5 — the "neutral"
+        # post-normalisation centre — rather than propagating NaN.
+        normed = normed.copy()
+        finite = normed[~missing]
+        fill_value = float(finite.mean()) if finite.size else 0.5
+        normed[missing] = fill_value
+        return normed
+    # ``drop_node`` reaches here only if the upstream filter let a
+    # row through anyway (e.g. a passthrough column with the policy
+    # nominally set). Treat as zero rather than failing — the
+    # validator catches anything genuinely broken.
+    normed = normed.copy()
+    normed[missing] = 0.0
+    return normed
 
 
 def _extract_raw(features: dict[str, Any], col: FeatureColumn) -> float:
@@ -240,6 +288,11 @@ def _build_edge_block(
                     dtype=np.float64,
                 )
                 normed, fit = normalize_column(raw, normalizer_name=col.normalizer)
+                # Same fill story as the node-block path — without
+                # this, an edge row missing one attribute would
+                # leave a NaN in ``edge_attr`` and trip
+                # ``non_finite_edge_attr``.
+                normed = _apply_fill_policy(normed, raw, col)
                 cols.append(normed)
                 fit_by_col[col.name] = fit
             edge_attr = np.stack(cols, axis=1).astype(np.float32, copy=False)

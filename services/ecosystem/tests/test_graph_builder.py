@@ -189,3 +189,99 @@ def test_empty_era_produces_zero_row_blocks() -> None:
         assert snap.edges(k).num_edges == 0
     # Validator still passes — empty is structurally valid.
     assert validate_snapshot(snap).passed
+
+
+# ---- fill_policy on missing values ---------------------------------------
+
+
+def _player_features_full(seed: float) -> dict[str, float]:
+    """Helper: a full player feature dict so we can blank one column at a time."""
+    return {
+        "acs": 200.0 + seed,
+        "kast": 0.65,
+        "adr": 130.0,
+        "hs_pct": 0.22,
+        "rating": 1.0,
+        "fb_rate": 0.10,
+        "fd_rate": 0.10,
+        "clutch_rate": 0.10,
+        "multikill_rate": 0.05,
+        "latent_skill": 0.0,
+        "role_fit": 0.5,
+        "synergy_mag": 0.5,
+        "age_days": 365.0,
+        "region_americas": 1.0,
+        "region_emea": 0.0,
+        "region_pacific": 0.0,
+        "region_china": 0.0,
+        "tier_rank": 0.5,
+    }
+
+
+def test_missing_feature_does_not_propagate_nan() -> None:
+    """Codex P1 (PR #24): omitted source columns must be back-filled.
+
+    Without ``_apply_fill_policy``, a NaN raw value would survive the
+    normaliser's arithmetic and trip the validator's
+    ``non_finite_features`` check on the first real source row that
+    happens to be missing a column.
+    """
+    src = InMemoryDataSource()
+    src.set_patch("e_t", {"era_ordinal": 0.0})
+    feats_complete = _player_features_full(seed=0.0)
+    feats_missing = _player_features_full(seed=10.0)
+    del feats_missing["acs"]  # simulate an upstream gap
+    src.add_node("e_t", "player", NodeRow(id="p-0", features=feats_complete))
+    src.add_node("e_t", "player", NodeRow(id="p-1", features=feats_missing))
+
+    snap = build_snapshot(src, era_slug="e_t")
+    player = snap.nodes("player")
+    # No NaN cells anywhere.
+    assert np.all(np.isfinite(player.x))
+    # The missing ``acs`` cell got back-filled to 0.0 (the column's
+    # declared fill_policy="zero" default).
+    acs_idx = list(player.column_names).index("acs")
+    p1_idx = player.ids.index("p-1")
+    assert player.x[p1_idx, acs_idx] == 0.0
+    # And the snapshot still validates.
+    assert validate_snapshot(snap).passed
+
+
+def test_missing_edge_attribute_does_not_propagate_nan() -> None:
+    """Edge attributes go through the same fill path; protect that too."""
+    src = InMemoryDataSource()
+    src.set_patch("e_t", {"era_ordinal": 0.0})
+    src.add_node("e_t", "player", NodeRow(id="p-0", features=_player_features_full(0.0)))
+    # One team with full feature dict so the team block validates.
+    team_features = {
+        "avg_acs": 210.0,
+        "avg_kast": 0.68,
+        "win_rate": 0.5,
+        "map_win_rate": 0.5,
+        "attack_rwr": 0.5,
+        "defense_rwr": 0.5,
+        "eco_efficiency": 0.5,
+        "comeback_rate": 0.1,
+        "strength_rating": 0.0,
+        "style_aggression": 0.5,
+        "style_utility": 0.5,
+        "region_americas": 1.0,
+        "region_emea": 0.0,
+        "region_pacific": 0.0,
+        "region_china": 0.0,
+        "tier_rank": 0.5,
+        "roster_age_days": 365.0,
+    }
+    src.add_node("e_t", "team", NodeRow(id="t-0", features=team_features))
+    # Edge with one attribute deliberately omitted.
+    src.add_edge(
+        "e_t",
+        ("player", "plays_for", "team"),
+        EdgeRow(src_id="p-0", dst_id="t-0", attributes={"role_slot": 0.4}),
+    )
+
+    snap = build_snapshot(src, era_slug="e_t")
+    plays_for = snap.edges(("player", "plays_for", "team"))
+    assert plays_for.edge_attr is not None
+    assert np.all(np.isfinite(plays_for.edge_attr))
+    assert validate_snapshot(snap).passed
