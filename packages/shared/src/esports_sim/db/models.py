@@ -368,6 +368,85 @@ class PatchNote(Base):
     )
 
 
+class PatchIntent(Base):
+    """Structured patch classification produced by the BUF-24 extractor (System 06).
+
+    One row per ``(patch_note_id, prompt_version)`` — re-running the same
+    prompt on the same patch UPSERTs in place; bumping the prompt version
+    (because the spec or the rubric changed) lands a new row so the older
+    classification is auditable.
+
+    ``patch_note_id`` is the FK back to the source document. ``ON DELETE
+    CASCADE`` means a patch note rotated out of the corpus takes its
+    derived intent with it — there is no useful interpretation of an
+    intent record without the underlying notes.
+
+    Float columns (``pro_play_driven_score``,
+    ``community_controversy_predicted``, ``confidence``) are 0..1 with
+    DB-level CHECK constraints; a buggy model output that emits 1.5 fails
+    at insert time rather than silently corrupting downstream weighted
+    aggregates. The Pydantic ``PatchIntentResult`` (in
+    :mod:`esports_sim.patch_intent.schema`) enforces the same bounds at
+    the application boundary so the failure mode is "bad model output"
+    not "bad SQL".
+    """
+
+    __tablename__ = "patch_intent"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    patch_note_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("patch_note.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(64), nullable=False)
+    primary_intent: Mapped[str] = mapped_column(String(64), nullable=False)
+    pro_play_driven_score: Mapped[float] = mapped_column(Float, nullable=False)
+    agents_affected: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    maps_affected: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    econ_changed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    expected_pickrate_shifts: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    community_controversy_predicted: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    reasoning: Mapped[str] = mapped_column(Text, nullable=False)
+    # Usage attribution — lets a budget retrospective tie an intent row
+    # back to its ledger entry without joining on timestamp.
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    usd_cost: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "patch_note_id",
+            "prompt_version",
+            name="uq_patch_intent_patch_note_id_prompt_version",
+        ),
+        CheckConstraint(
+            "pro_play_driven_score >= 0 AND pro_play_driven_score <= 1",
+            name="ck_patch_intent_pro_play_driven_score_range",
+        ),
+        CheckConstraint(
+            "community_controversy_predicted >= 0 AND community_controversy_predicted <= 1",
+            name="ck_patch_intent_community_controversy_range",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_patch_intent_confidence_range",
+        ),
+    )
+
+
 class AliasReviewQueue(Base):
     """Items the fuzzy matcher couldn't auto-decide.
 
@@ -866,6 +945,7 @@ __all__ = [
     "MapResult",
     "Match",
     "PatchEra",
+    "PatchIntent",
     "PatchNote",
     "PersonalityEmbedding",
     "PlayerMatchStat",
