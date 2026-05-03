@@ -170,9 +170,7 @@ class _Passthrough(_Normalizer):
 
     def fit(self, values: np.ndarray) -> FitParams:
         finite = values[np.isfinite(values)]
-        if finite.size and (
-            (finite < -_UNIT_SLACK).any() or (finite > 1.0 + _UNIT_SLACK).any()
-        ):
+        if finite.size and ((finite < -_UNIT_SLACK).any() or (finite > 1.0 + _UNIT_SLACK).any()):
             raise NormalizerError(
                 f"passthrough column got values outside [0, 1]: "
                 f"min={float(finite.min())}, max={float(finite.max())}. "
@@ -185,8 +183,7 @@ class _Passthrough(_Normalizer):
 
 
 _NORMALIZERS: dict[str, _Normalizer] = {
-    n.name: n
-    for n in (_MinMax(), _ZScore(), _Log1pMinMax(), _Passthrough())
+    n.name: n for n in (_MinMax(), _ZScore(), _Log1pMinMax(), _Passthrough())
 }
 
 
@@ -194,9 +191,7 @@ def get_normalizer(name: str) -> _Normalizer:
     try:
         return _NORMALIZERS[name]
     except KeyError as e:
-        raise NormalizerError(
-            f"unknown normaliser {name!r}; known: {sorted(_NORMALIZERS)}"
-        ) from e
+        raise NormalizerError(f"unknown normaliser {name!r}; known: {sorted(_NORMALIZERS)}") from e
 
 
 def normalize_column(

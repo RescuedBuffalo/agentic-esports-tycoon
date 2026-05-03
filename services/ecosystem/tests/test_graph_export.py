@@ -39,9 +39,7 @@ def registry(tmp_path: Path) -> Registry:
 @pytest.fixture
 def config_path(tmp_path: Path) -> Path:
     p = tmp_path / "graph_snapshot.yaml"
-    p.write_text(
-        "kind: graph-snapshot\nschema_version: 1.0.0\n", encoding="utf-8"
-    )
+    p.write_text("kind: graph-snapshot\nschema_version: 1.0.0\n", encoding="utf-8")
     return p
 
 
@@ -57,15 +55,11 @@ def test_snapshot_round_trips_through_npz(tmp_path: Path) -> None:
     loaded = GraphSnapshot.read(out_dir)
     assert loaded.era_slug == snap.era_slug
     for nt in snap.node_types():
-        np.testing.assert_array_equal(
-            loaded.nodes(nt).x, snap.nodes(nt).x
-        )
+        np.testing.assert_array_equal(loaded.nodes(nt).x, snap.nodes(nt).x)
         assert loaded.nodes(nt).ids == snap.nodes(nt).ids
         assert loaded.nodes(nt).column_names == snap.nodes(nt).column_names
     for k in snap.edge_types():
-        np.testing.assert_array_equal(
-            loaded.edges(k).edge_index, snap.edges(k).edge_index
-        )
+        np.testing.assert_array_equal(loaded.edges(k).edge_index, snap.edges(k).edge_index)
     assert_schema_known(loaded)
 
 
@@ -87,13 +81,9 @@ def test_manifest_records_per_node_columns(tmp_path: Path) -> None:
 # ---- export orchestrator ---------------------------------------------------
 
 
-def test_export_era_creates_registered_completed_run(
-    registry: Registry, config_path: Path
-) -> None:
+def test_export_era_creates_registered_completed_run(registry: Registry, config_path: Path) -> None:
     src = build_three_era_source()
-    result = export_era(
-        src, era_slug="e2024_01", config_path=config_path, registry=registry
-    )
+    result = export_era(src, era_slug="e2024_01", config_path=config_path, registry=registry)
 
     assert result.passed
     assert result.snapshot_path.exists()
@@ -104,9 +94,7 @@ def test_export_era_creates_registered_completed_run(
     assert record.kind == GRAPH_SNAPSHOT_KIND
 
 
-def test_export_eras_three_era_acceptance(
-    registry: Registry, config_path: Path
-) -> None:
+def test_export_eras_three_era_acceptance(registry: Registry, config_path: Path) -> None:
     """BUF-53 acceptance: full graph export for 3 eras passes structural validation."""
     src = build_three_era_source()
     results = export_eras(
@@ -122,9 +110,7 @@ def test_export_eras_three_era_acceptance(
     assert len({r.run_id for r in results}) == 3
 
 
-def test_export_eras_runs_in_under_two_minutes(
-    registry: Registry, config_path: Path
-) -> None:
+def test_export_eras_runs_in_under_two_minutes(registry: Registry, config_path: Path) -> None:
     """BUF-53 acceptance: export runs in under 2 minutes per era.
 
     The fixture is small enough that the per-era cost should be in
@@ -144,17 +130,11 @@ def test_export_eras_runs_in_under_two_minutes(
     assert duration < 30.0, f"3-era export took {duration:.2f}s, budget is 30s"
 
 
-def test_export_era_is_idempotent(
-    registry: Registry, config_path: Path
-) -> None:
+def test_export_era_is_idempotent(registry: Registry, config_path: Path) -> None:
     """Re-exporting the same era + same source returns the same run_id (no-op)."""
     src = build_three_era_source()
-    first = export_era(
-        src, era_slug="e2024_01", config_path=config_path, registry=registry
-    )
-    second = export_era(
-        src, era_slug="e2024_01", config_path=config_path, registry=registry
-    )
+    first = export_era(src, era_slug="e2024_01", config_path=config_path, registry=registry)
+    second = export_era(src, era_slug="e2024_01", config_path=config_path, registry=registry)
     assert first.run_id == second.run_id
     assert second.passed
 
@@ -192,9 +172,7 @@ def test_manifest_serializes_datetime_metadata(tmp_path: Path) -> None:
     assert "2024-01-09" in patch_meta["starts_at"]
 
 
-def test_metadata_change_changes_run_id(
-    registry: Registry, config_path: Path
-) -> None:
+def test_metadata_change_changes_run_id(registry: Registry, config_path: Path) -> None:
     """Codex P2 (PR #24): a metadata-only source change must mint a new run_id.
 
     The fingerprint previously hashed only tensors, so a source that
@@ -227,9 +205,9 @@ def test_metadata_change_changes_run_id(
         config_path=config_path,
         registry=registry,
     )
-    assert first.run_id != second.run_id, (
-        "metadata-only source change must produce a new fingerprint"
-    )
+    assert (
+        first.run_id != second.run_id
+    ), "metadata-only source change must produce a new fingerprint"
 
 
 def test_failed_run_short_circuits_on_re_export(
@@ -252,33 +230,21 @@ def test_failed_run_short_circuits_on_re_export(
         report = real_validate(snapshot)
         from ecosystem.graph.validate import ValidationIssue
 
-        report.issues.append(
-            ValidationIssue("injected", "error", "test", "forced fail")
-        )
+        report.issues.append(ValidationIssue("injected", "error", "test", "forced fail"))
         return report
 
-    monkeypatch.setattr(
-        "ecosystem.graph.export.validate_snapshot", force_failing_report
-    )
-    first = export_era(
-        src, era_slug="e2024_01", config_path=config_path, registry=registry
-    )
+    monkeypatch.setattr("ecosystem.graph.export.validate_snapshot", force_failing_report)
+    first = export_era(src, era_slug="e2024_01", config_path=config_path, registry=registry)
     assert not first.passed
     assert registry.get(first.run_id).status is RunStatus.FAILED
 
     # Lift the injected failure for the second pass — were the
     # orchestrator to rebuild instead of short-circuiting, the
     # rebuild would now pass and contradict the FAILED row.
-    monkeypatch.setattr(
-        "ecosystem.graph.export.validate_snapshot", real_validate
-    )
-    second = export_era(
-        src, era_slug="e2024_01", config_path=config_path, registry=registry
-    )
+    monkeypatch.setattr("ecosystem.graph.export.validate_snapshot", real_validate)
+    second = export_era(src, era_slug="e2024_01", config_path=config_path, registry=registry)
     assert second.run_id == first.run_id
-    assert not second.passed, (
-        "re-export should return the cached FAILED report, not relabel"
-    )
+    assert not second.passed, "re-export should return the cached FAILED report, not relabel"
     assert registry.get(second.run_id).status is RunStatus.FAILED
 
 
@@ -295,9 +261,7 @@ def test_terminal_run_with_missing_artifacts_raises(
     from ecosystem.graph.export import GraphExportStateError
 
     src = build_three_era_source()
-    first = export_era(
-        src, era_slug="e2024_01", config_path=config_path, registry=registry
-    )
+    first = export_era(src, era_slug="e2024_01", config_path=config_path, registry=registry)
     assert first.passed
     # Operator manually deleted the artifacts but left the row.
     first.snapshot_path.unlink()
@@ -305,9 +269,7 @@ def test_terminal_run_with_missing_artifacts_raises(
     first.validation_path.unlink()
 
     with pytest.raises(GraphExportStateError):
-        export_era(
-            src, era_slug="e2024_01", config_path=config_path, registry=registry
-        )
+        export_era(src, era_slug="e2024_01", config_path=config_path, registry=registry)
 
 
 def test_failed_validation_writes_failed_status(
@@ -333,12 +295,8 @@ def test_failed_validation_writes_failed_status(
         )
         return report
 
-    monkeypatch.setattr(
-        "ecosystem.graph.export.validate_snapshot", force_failing_report
-    )
-    result = export_era(
-        src, era_slug="e2024_01", config_path=config_path, registry=registry
-    )
+    monkeypatch.setattr("ecosystem.graph.export.validate_snapshot", force_failing_report)
+    result = export_era(src, era_slug="e2024_01", config_path=config_path, registry=registry)
     assert not result.passed
     assert result.snapshot_path.exists()
     assert result.validation_path.exists()

@@ -56,9 +56,7 @@ def test_builder_is_deterministic(source: InMemoryDataSource) -> None:
         np.testing.assert_array_equal(a.nodes(nt).x, b.nodes(nt).x)
         assert a.nodes(nt).ids == b.nodes(nt).ids
     for k in a.edge_types():
-        np.testing.assert_array_equal(
-            a.edges(k).edge_index, b.edges(k).edge_index
-        )
+        np.testing.assert_array_equal(a.edges(k).edge_index, b.edges(k).edge_index)
 
 
 def test_node_ids_are_sorted(snapshot: GraphSnapshot) -> None:
@@ -310,6 +308,7 @@ def test_duplicate_edges_get_deterministic_order() -> None:
     otherwise the registry's content fingerprint changes on every
     re-run and the idempotency contract breaks.
     """
+
     def _build_one(order: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
         src = InMemoryDataSource()
         src.set_patch("e_t", {"era_ordinal": 0.0})

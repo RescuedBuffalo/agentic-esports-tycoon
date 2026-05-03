@@ -66,8 +66,7 @@ class NodeBlock:
         n = len(self.ids)
         if self.x.shape[0] != n:
             raise ValueError(
-                f"NodeBlock[{self.node_type}]: x.shape[0]={self.x.shape[0]} "
-                f"but len(ids)={n}"
+                f"NodeBlock[{self.node_type}]: x.shape[0]={self.x.shape[0]} " f"but len(ids)={n}"
             )
         if self.x.shape[1] != len(self.column_names):
             raise ValueError(
@@ -196,16 +195,9 @@ class GraphSnapshot:
             "era_slug": self.era_slug,
             "schema_version": self.schema_version,
             "snapshot_format_version": self.snapshot_format_version,
-            "node_counts": {
-                nt: blk.num_nodes for nt, blk in self.node_blocks.items()
-            },
-            "node_feature_dims": {
-                nt: blk.feature_dim for nt, blk in self.node_blocks.items()
-            },
-            "edge_counts": {
-                _edge_key_str(k): blk.num_edges
-                for k, blk in self.edge_blocks.items()
-            },
+            "node_counts": {nt: blk.num_nodes for nt, blk in self.node_blocks.items()},
+            "node_feature_dims": {nt: blk.feature_dim for nt, blk in self.node_blocks.items()},
+            "edge_counts": {_edge_key_str(k): blk.num_edges for k, blk in self.edge_blocks.items()},
         }
 
     # ---- IO --------------------------------------------------------------
@@ -275,12 +267,9 @@ class GraphSnapshot:
             "schema_version": self.schema_version,
             "snapshot_format_version": self.snapshot_format_version,
             "summary": self.summary(),
-            "node_columns": {
-                nt: list(blk.column_names) for nt, blk in self.node_blocks.items()
-            },
+            "node_columns": {nt: list(blk.column_names) for nt, blk in self.node_blocks.items()},
             "edge_attr_columns": {
-                _edge_key_str(k): list(blk.edge_attr_columns)
-                for k, blk in self.edge_blocks.items()
+                _edge_key_str(k): list(blk.edge_attr_columns) for k, blk in self.edge_blocks.items()
             },
             "metadata": self.metadata,
         }
@@ -420,14 +409,12 @@ def assert_schema_known(snapshot: GraphSnapshot) -> None:
     for nt in snapshot.node_blocks:
         if nt not in NODE_TYPES:
             raise ValueError(
-                f"snapshot carries unknown node type {nt!r}; runtime knows "
-                f"{sorted(NODE_TYPES)}"
+                f"snapshot carries unknown node type {nt!r}; runtime knows " f"{sorted(NODE_TYPES)}"
             )
     for k in snapshot.edge_blocks:
         if k not in EDGE_TYPES:
             raise ValueError(
-                f"snapshot carries unknown edge type {k!r}; runtime knows "
-                f"{sorted(EDGE_TYPES)}"
+                f"snapshot carries unknown edge type {k!r}; runtime knows " f"{sorted(EDGE_TYPES)}"
             )
 
 

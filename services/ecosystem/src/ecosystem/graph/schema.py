@@ -388,18 +388,14 @@ def node_spec(name: str) -> NodeSpec:
     try:
         return NODE_TYPES[name]
     except KeyError as e:
-        raise SchemaError(
-            f"unknown node type {name!r}; known: {sorted(NODE_TYPES)}"
-        ) from e
+        raise SchemaError(f"unknown node type {name!r}; known: {sorted(NODE_TYPES)}") from e
 
 
 def edge_spec(key: tuple[str, str, str]) -> EdgeSpec:
     try:
         return EDGE_TYPES[key]
     except KeyError as e:
-        raise SchemaError(
-            f"unknown edge type {key!r}; known: {sorted(EDGE_TYPES)}"
-        ) from e
+        raise SchemaError(f"unknown edge type {key!r}; known: {sorted(EDGE_TYPES)}") from e
 
 
 __all__ = [

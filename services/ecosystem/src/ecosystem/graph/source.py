@@ -59,9 +59,7 @@ class GraphDataSource(Protocol):
         """Yield every node of ``node_type`` active in ``era_slug``."""
         ...
 
-    def iter_edges(
-        self, key: tuple[str, str, str], *, era_slug: str
-    ) -> Iterable[EdgeRow]:
+    def iter_edges(self, key: tuple[str, str, str], *, era_slug: str) -> Iterable[EdgeRow]:
         """Yield every edge of canonical type ``key`` active in ``era_slug``."""
         ...
 
@@ -97,9 +95,7 @@ class InMemoryDataSource:
     def iter_nodes(self, node_type: str, *, era_slug: str) -> Iterable[NodeRow]:
         return iter(self.nodes.get(era_slug, {}).get(node_type, ()))
 
-    def iter_edges(
-        self, key: tuple[str, str, str], *, era_slug: str
-    ) -> Iterable[EdgeRow]:
+    def iter_edges(self, key: tuple[str, str, str], *, era_slug: str) -> Iterable[EdgeRow]:
         return iter(self.edges.get(era_slug, {}).get(key, ()))
 
     def patch_meta(self, era_slug: str) -> dict[str, Any]:
@@ -110,9 +106,7 @@ class InMemoryDataSource:
     def add_node(self, era_slug: str, node_type: str, row: NodeRow) -> None:
         self.nodes.setdefault(era_slug, {}).setdefault(node_type, []).append(row)
 
-    def add_edge(
-        self, era_slug: str, key: tuple[str, str, str], row: EdgeRow
-    ) -> None:
+    def add_edge(self, era_slug: str, key: tuple[str, str, str], row: EdgeRow) -> None:
         self.edges.setdefault(era_slug, {}).setdefault(key, []).append(row)
 
     def set_patch(self, era_slug: str, meta: dict[str, Any]) -> None:

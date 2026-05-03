@@ -98,13 +98,10 @@ class ValidationReport:
     def assert_passed(self) -> None:
         if self.passed:
             return
-        joined = "; ".join(
-            f"[{i.code} @ {i.location}] {i.message}" for i in self.errors[:5]
-        )
+        joined = "; ".join(f"[{i.code} @ {i.location}] {i.message}" for i in self.errors[:5])
         more = f" (+{len(self.errors) - 5} more)" if len(self.errors) > 5 else ""
         raise StructuralValidationError(
-            f"snapshot for era {self.era_slug!r} failed structural validation: "
-            f"{joined}{more}"
+            f"snapshot for era {self.era_slug!r} failed structural validation: " f"{joined}{more}"
         )
 
 
@@ -123,9 +120,7 @@ def validate_snapshot(snapshot: GraphSnapshot) -> ValidationReport:
 # ---- individual check groups ----------------------------------------------
 
 
-def _check_schema_version(
-    snapshot: GraphSnapshot, report: ValidationReport
-) -> None:
+def _check_schema_version(snapshot: GraphSnapshot, report: ValidationReport) -> None:
     if snapshot.schema_version != SCHEMA_VERSION:
         report.issues.append(
             ValidationIssue(
@@ -140,9 +135,7 @@ def _check_schema_version(
         )
 
 
-def _check_node_blocks(
-    snapshot: GraphSnapshot, report: ValidationReport
-) -> None:
+def _check_node_blocks(snapshot: GraphSnapshot, report: ValidationReport) -> None:
     # Cover every declared node type — missing is an error, not a warn,
     # since the trainer's fixed-shape ingestion would index off the end.
     for node_type, spec in NODE_TYPES.items():
@@ -167,8 +160,7 @@ def _check_node_blocks(
                     "column_mismatch",
                     "error",
                     loc,
-                    f"column_names={block.column_names!r} != "
-                    f"expected={expected_cols!r}",
+                    f"column_names={block.column_names!r} != " f"expected={expected_cols!r}",
                 )
             )
 
@@ -247,9 +239,7 @@ def _check_node_blocks(
             )
 
 
-def _check_edge_blocks(
-    snapshot: GraphSnapshot, report: ValidationReport
-) -> None:
+def _check_edge_blocks(snapshot: GraphSnapshot, report: ValidationReport) -> None:
     for key, spec in EDGE_TYPES.items():
         loc = f"edge:{'__'.join(key)}"
         block = snapshot.edge_blocks.get(key)

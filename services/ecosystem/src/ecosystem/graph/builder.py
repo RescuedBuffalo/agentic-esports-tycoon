@@ -70,9 +70,7 @@ def build_snapshot(
         node_block, node_fit = _build_node_block(node_schema, node_rows)
         snapshot.node_blocks[node_type] = node_block
         ids_by_type[node_type] = {nid: idx for idx, nid in enumerate(node_block.ids)}
-        normalizer_params[node_type] = {
-            col: fit.to_jsonable() for col, fit in node_fit.items()
-        }
+        normalizer_params[node_type] = {col: fit.to_jsonable() for col, fit in node_fit.items()}
 
     # Edge blocks --------------------------------------------------------
     edge_normalizer_params: dict[str, dict[str, dict[str, Any]]] = {}
@@ -109,10 +107,7 @@ def _build_node_block(
     # First pass: drop any rows where a ``drop_node`` column is missing.
     drop_required = [col.name for col in columns if col.fill_policy == "drop_node"]
     if drop_required:
-        rows = [
-            r for r in rows
-            if all(_is_present(r.features.get(name)) for name in drop_required)
-        ]
+        rows = [r for r in rows if all(_is_present(r.features.get(name)) for name in drop_required)]
 
     n = len(rows)
     if n == 0:
@@ -175,9 +170,7 @@ def _attr_sort_key(attrs: dict[str, Any]) -> tuple[tuple[str, str], ...]:
     return tuple(sorted((k, str(attrs[k])) for k in attrs))
 
 
-def _apply_fill_policy(
-    normed: np.ndarray, raw: np.ndarray, col: FeatureColumn
-) -> np.ndarray:
+def _apply_fill_policy(normed: np.ndarray, raw: np.ndarray, col: FeatureColumn) -> np.ndarray:
     """Replace NaN cells (originally missing values) per the column's policy.
 
     ``raw`` is the pre-normalisation column; we use it to identify
@@ -303,9 +296,7 @@ def _build_edge_block(
     fit_by_col: dict[str, FitParams] = {}
     if spec.edge_attr_columns:
         if not kept_rows:
-            edge_attr = np.zeros(
-                (0, len(spec.edge_attr_columns)), dtype=np.float32
-            )
+            edge_attr = np.zeros((0, len(spec.edge_attr_columns)), dtype=np.float32)
         else:
             cols: list[np.ndarray] = []
             for col in spec.edge_attr_columns:

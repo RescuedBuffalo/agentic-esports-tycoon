@@ -126,10 +126,7 @@ def export_era(
     artifacts_present = (
         snapshot_path.exists() and manifest_path.exists() and validation_path.exists()
     )
-    if (
-        record.status in (RunStatus.COMPLETED, RunStatus.FAILED)
-        and artifacts_present
-    ):
+    if record.status in (RunStatus.COMPLETED, RunStatus.FAILED) and artifacts_present:
         report = _load_report(validation_path, era_slug)
         _log.info(
             "graph-snapshot.idempotent_hit",
@@ -216,9 +213,7 @@ def export_eras(
     registry = registry or Registry()
     results: list[ExportResult] = []
     for slug in era_slugs:
-        result = export_era(
-            source, era_slug=slug, config_path=config_path, registry=registry
-        )
+        result = export_era(source, era_slug=slug, config_path=config_path, registry=registry)
         results.append(result)
         if fail_fast and not result.passed:
             raise StructuralValidationError(
