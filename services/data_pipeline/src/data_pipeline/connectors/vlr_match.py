@@ -518,9 +518,7 @@ def scrape_vlr_match_players(
     # Pre-load existing (map_result_id, entity_id) pairs so the
     # idempotent re-run path doesn't hit the DB at all per row. We
     # query in one shot rather than per-row.
-    existing_stat_keys = _load_existing_stat_keys(
-        session, list(map_id_by_game_id.values())
-    )
+    existing_stat_keys = _load_existing_stat_keys(session, list(map_id_by_game_id.values()))
 
     for vlr_match_id in vlr_match_ids:
         stats.matches_seen += 1

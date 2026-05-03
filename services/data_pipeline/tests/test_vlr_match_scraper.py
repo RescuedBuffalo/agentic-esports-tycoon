@@ -102,9 +102,7 @@ def test_parser_extracts_agent_from_image_title() -> None:
 def test_parser_extracts_headline_stats_in_correct_columns() -> None:
     """The position-based mapping must put ACS in ACS, K in K, etc."""
     rows = parse_match_page(_read_fixture("match_300001.html"))
-    tenz_map1 = next(
-        r for r in rows if r.vlr_game_id == "g-100001" and r.vlr_player_id == "9"
-    )
+    tenz_map1 = next(r for r in rows if r.vlr_game_id == "g-100001" and r.vlr_player_id == "9")
     assert tenz_map1.rating == pytest.approx(1.32)
     assert tenz_map1.acs == pytest.approx(285.0)
     assert tenz_map1.kills == 22
@@ -120,9 +118,7 @@ def test_parser_extracts_headline_stats_in_correct_columns() -> None:
 def test_parser_handles_negative_diff_and_percent_signs() -> None:
     """Stats like KD diff ship as ``+11`` / ``-1`` and KAST as ``75%``."""
     rows = parse_match_page(_read_fixture("match_300001.html"))
-    asuna_map1 = next(
-        r for r in rows if r.vlr_game_id == "g-100001" and r.vlr_player_id == "2329"
-    )
+    asuna_map1 = next(r for r in rows if r.vlr_game_id == "g-100001" and r.vlr_player_id == "2329")
     # Negative diff kept on the unmapped column wouldn't surface here,
     # but kast/hs need the % stripping path.
     assert asuna_map1.kast_pct == pytest.approx(68.0)
@@ -359,9 +355,7 @@ def test_player_aliases_reused_across_maps_and_matches(db_session) -> None:
     # TenZ (vlr id 9) appears on both maps. The two stat rows must
     # share one entity_id.
     rows = (
-        db_session.execute(
-            select(PlayerMatchStat).where(PlayerMatchStat.source_player_id == "9")
-        )
+        db_session.execute(select(PlayerMatchStat).where(PlayerMatchStat.source_player_id == "9"))
         .scalars()
         .all()
     )
