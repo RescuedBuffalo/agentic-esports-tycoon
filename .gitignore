@@ -7,6 +7,14 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
+# Coverage artifacts (`make coverage` / pytest-cov). The XML report is
+# uploaded by CI as an artifact; the binary ``.coverage`` file is a
+# per-run intermediate that should not land in source control.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # Virtualenvs
 .venv/
 venv/
