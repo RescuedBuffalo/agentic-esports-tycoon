@@ -591,6 +591,91 @@ class Match(Base):
     __table_args__ = (UniqueConstraint("vlr_match_id", name="uq_match_vlr_match_id"),)
 
 
+class PlayerMatchStat(Base):
+    """One per-map player participation row (BUF-85).
+
+    Lands one row per (map, player): which canonical entity played
+    which agent on which map, plus the headline stats VLR's per-match
+    page exposes (rating, ACS, K/D/A, KAST, ADR, HS%, FK/FD). Source-
+    specific long-tail columns live in the ``extra`` JSONB blob so
+    the typed schema doesn't have to grow per-source.
+
+    Idempotency: the unique constraint on ``(map_result_id,
+    entity_id)`` is the dedup anchor the BUF-85 spec calls for
+    (``vlr_game_id`` is 1:1 with ``map_result``, so this is the same
+    key without the join). A re-run of the scraper for the same match
+    no-ops on conflict; first-writer-wins keeps the schema simple
+    until cross-source merge logic is needed.
+
+    Source-agnostic by design. ``source`` + ``source_player_id``
+    preserve the upstream identity (VLR numeric id, Riot PUUID) so
+    the scraper can audit "who did we attribute this stat to" without
+    re-reading the alias table. The Riot connector
+    (RescuedBuffalo/agentic-esports-tycoon#2) currently writes only
+    to ``staging_record``; once it grows a stat-extraction step it
+    can land in this same table without a schema change.
+    """
+
+    __tablename__ = "player_match_stat"
+
+    player_match_stat_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    map_result_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("map_result.map_result_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entity.canonical_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_player_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # ``team1`` / ``team2`` — matches the ``map_result.team{1,2}_*``
+    # column naming so a join on side does not need a translation.
+    team_side: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    agent: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    acs: Mapped[float | None] = mapped_column(Float, nullable=True)
+    kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    deaths: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    assists: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kast_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    adr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hs_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    first_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    first_deaths: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    extra: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "map_result_id",
+            "entity_id",
+            name="uq_player_match_stat_map_result_entity",
+        ),
+        CheckConstraint(
+            "team_side IS NULL OR team_side IN ('team1', 'team2')",
+            name="ck_player_match_stat_team_side",
+        ),
+    )
+
+
 class MapResult(Base):
     """One map within a :class:`Match` (BUF-8 v2).
 
@@ -660,6 +745,7 @@ __all__ = [
     "Match",
     "PatchEra",
     "PatchNote",
+    "PlayerMatchStat",
     "RawRecord",
     "StagingInvariantError",
     "StagingRecord",

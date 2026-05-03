@@ -260,15 +260,14 @@ def seed_from_vlr_csv(
     # so a re-run that lands a new map under an already-seeded match
     # has its parent UUID in hand without an extra SELECT. Same for
     # the existing-game-id set, which only needs membership checks.
-    # SQLAlchemy 2.0 ``Row`` objects are tuple-like at runtime but
-    # typed as ``Row[tuple[str, UUID]]``, which mypy refuses to feed
-    # to ``dict()``. Iterate explicitly so the runtime tuple-unpack
-    # is independent of the typed-result wrapper — no risk of a
-    # ``.tuples()`` quirk in a particular SQLAlchemy minor version
-    # changing semantics.
-    match_canonical_by_vlr_id: dict[str, uuid.UUID] = {
-        row[0]: row[1] for row in session.execute(select(Match.vlr_match_id, Match.match_id)).all()
-    }
+    # ``.tuples()`` projects the SELECT result as ``Sequence[tuple[str, UUID]]``
+    # rather than the default ``Sequence[Row[...]]``, which the ``dict()``
+    # constructor's signature expects. Without it mypy flags the conversion
+    # — Row is iterable at runtime but not declared as the ``tuple`` shape
+    # ``dict.__init__`` types its iterable argument as.
+    match_canonical_by_vlr_id: dict[str, uuid.UUID] = dict(
+        session.execute(select(Match.vlr_match_id, Match.match_id)).tuples().all()
+    )
     pre_existing_match_ids: frozenset[str] = frozenset(match_canonical_by_vlr_id)
     existing_game_ids: set[str] = set(
         session.execute(select(MapResult.vlr_game_id)).scalars().all()
