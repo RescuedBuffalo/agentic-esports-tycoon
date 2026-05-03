@@ -1,0 +1,195 @@
+"""Snapshot IO + export-orchestrator tests (BUF-53).
+
+The acceptance scenario is "full graph export for 3 eras passes
+structural validation"; these tests run that flow end-to-end through
+the real BUF-69 :class:`Registry` and assert the on-disk artifacts
+are present, well-formed, and round-trip cleanly back into a
+:class:`GraphSnapshot`.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+from ecosystem.graph import GraphSnapshot, build_snapshot, validate_snapshot
+from ecosystem.graph.export import (
+    GRAPH_SNAPSHOT_KIND,
+    export_era,
+    export_eras,
+)
+from ecosystem.graph.snapshot import assert_schema_known
+from esports_sim.registry import Registry, RunStatus
+from graph_fixtures import ERA_SLUGS, build_three_era_source
+
+# ---- fixtures --------------------------------------------------------------
+
+
+@pytest.fixture
+def registry(tmp_path: Path) -> Registry:
+    return Registry(
+        db_path=tmp_path / "state" / "registry.db",
+        runs_dir=tmp_path / "runs",
+    )
+
+
+@pytest.fixture
+def config_path(tmp_path: Path) -> Path:
+    p = tmp_path / "graph_snapshot.yaml"
+    p.write_text(
+        "kind: graph-snapshot\nschema_version: 1.0.0\n", encoding="utf-8"
+    )
+    return p
+
+
+# ---- snapshot round-trip ---------------------------------------------------
+
+
+def test_snapshot_round_trips_through_npz(tmp_path: Path) -> None:
+    src = build_three_era_source()
+    snap = build_snapshot(src, era_slug="e2024_01")
+    out_dir = tmp_path / "snap"
+    snap.write(out_dir)
+
+    loaded = GraphSnapshot.read(out_dir)
+    assert loaded.era_slug == snap.era_slug
+    for nt in snap.node_types():
+        np.testing.assert_array_equal(
+            loaded.nodes(nt).x, snap.nodes(nt).x
+        )
+        assert loaded.nodes(nt).ids == snap.nodes(nt).ids
+        assert loaded.nodes(nt).column_names == snap.nodes(nt).column_names
+    for k in snap.edge_types():
+        np.testing.assert_array_equal(
+            loaded.edges(k).edge_index, snap.edges(k).edge_index
+        )
+    assert_schema_known(loaded)
+
+
+def test_manifest_records_per_node_columns(tmp_path: Path) -> None:
+    src = build_three_era_source()
+    snap = build_snapshot(src, era_slug="e2024_01")
+    snap.write(tmp_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+
+    assert "node_columns" in manifest
+    assert "player" in manifest["node_columns"]
+    # acs / kast / adr / hs_pct / rating headline + derived + inferred + context
+    assert "acs" in manifest["node_columns"]["player"]
+    # Edge columns surfaced too.
+    assert "edge_attr_columns" in manifest
+    assert "player__plays_for__team" in manifest["edge_attr_columns"]
+
+
+# ---- export orchestrator ---------------------------------------------------
+
+
+def test_export_era_creates_registered_completed_run(
+    registry: Registry, config_path: Path
+) -> None:
+    src = build_three_era_source()
+    result = export_era(
+        src, era_slug="e2024_01", config_path=config_path, registry=registry
+    )
+
+    assert result.passed
+    assert result.snapshot_path.exists()
+    assert result.manifest_path.exists()
+    assert result.validation_path.exists()
+    record = registry.get(result.run_id)
+    assert record.status is RunStatus.COMPLETED
+    assert record.kind == GRAPH_SNAPSHOT_KIND
+
+
+def test_export_eras_three_era_acceptance(
+    registry: Registry, config_path: Path
+) -> None:
+    """BUF-53 acceptance: full graph export for 3 eras passes structural validation."""
+    src = build_three_era_source()
+    results = export_eras(
+        src,
+        era_slugs=list(ERA_SLUGS),
+        config_path=config_path,
+        registry=registry,
+    )
+
+    assert len(results) == 3
+    assert all(r.passed for r in results)
+    # Three distinct run ids — different fingerprints per era.
+    assert len({r.run_id for r in results}) == 3
+
+
+def test_export_eras_runs_in_under_two_minutes(
+    registry: Registry, config_path: Path
+) -> None:
+    """BUF-53 acceptance: export runs in under 2 minutes per era.
+
+    The fixture is small enough that the per-era cost should be in
+    the 10s of milliseconds; this test asserts the budget for the
+    *whole batch* with two orders of magnitude of headroom so a
+    legitimate slowdown trips it before a real era ever does.
+    """
+    src = build_three_era_source()
+    start = time.monotonic()
+    export_eras(
+        src,
+        era_slugs=list(ERA_SLUGS),
+        config_path=config_path,
+        registry=registry,
+    )
+    duration = time.monotonic() - start
+    assert duration < 30.0, f"3-era export took {duration:.2f}s, budget is 30s"
+
+
+def test_export_era_is_idempotent(
+    registry: Registry, config_path: Path
+) -> None:
+    """Re-exporting the same era + same source returns the same run_id (no-op)."""
+    src = build_three_era_source()
+    first = export_era(
+        src, era_slug="e2024_01", config_path=config_path, registry=registry
+    )
+    second = export_era(
+        src, era_slug="e2024_01", config_path=config_path, registry=registry
+    )
+    assert first.run_id == second.run_id
+    assert second.passed
+
+
+def test_failed_validation_writes_failed_status(
+    registry: Registry, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot that fails validation still writes artifacts but finalises FAILED."""
+    src = build_three_era_source()
+
+    real_validate = validate_snapshot
+
+    def force_failing_report(snapshot: GraphSnapshot):
+        report = real_validate(snapshot)
+        # Inject a synthetic error so the orchestrator records FAILED.
+        from ecosystem.graph.validate import ValidationIssue
+
+        report.issues.append(
+            ValidationIssue(
+                code="injected",
+                severity="error",
+                location="test",
+                message="forced failure for orchestrator coverage",
+            )
+        )
+        return report
+
+    monkeypatch.setattr(
+        "ecosystem.graph.export.validate_snapshot", force_failing_report
+    )
+    result = export_era(
+        src, era_slug="e2024_01", config_path=config_path, registry=registry
+    )
+    assert not result.passed
+    assert result.snapshot_path.exists()
+    assert result.validation_path.exists()
+    record = registry.get(result.run_id)
+    assert record.status is RunStatus.FAILED

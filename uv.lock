@@ -277,10 +277,14 @@ version = "0.0.1"
 source = { editable = "services/ecosystem" }
 dependencies = [
     { name = "esports-sim-shared" },
+    { name = "numpy" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "esports-sim-shared", editable = "packages/shared" }]
+requires-dist = [
+    { name = "esports-sim-shared", editable = "packages/shared" },
+    { name = "numpy", specifier = ">=1.26" },
+]
 
 [[package]]
 name = "esports-sim-shared"

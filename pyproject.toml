@@ -119,3 +119,11 @@ mypy_path = [
 [[tool.mypy.overrides]]
 module = ["numpy", "numpy.*"]
 ignore_missing_imports = true
+
+# torch / torch_geometric are *optional* — the graph exporter
+# (BUF-53) imports them lazily inside ``GraphSnapshot.to_pyg`` so a
+# downstream trainer can opt into PyG without forcing every CI job to
+# install the heavy stack. Tell mypy not to fail on the missing stubs.
+[[tool.mypy.overrides]]
+module = ["torch", "torch.*", "torch_geometric", "torch_geometric.*"]
+ignore_missing_imports = true
