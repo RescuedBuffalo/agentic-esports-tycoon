@@ -144,6 +144,15 @@ def similar_players(
     The target row is excluded from the result (a player is always
     most similar to themselves; including them would crowd out the
     k slots).
+
+    Model-version isolation: cosine distance is only meaningful
+    between vectors produced by the same embedder. The query
+    constrains neighbors to rows whose ``model_version`` matches
+    the target's, so a partial re-embed rollout (some rows on the
+    new model, some on the old) returns same-space neighbors only
+    rather than silently mixing incompatible vectors. Once a
+    rollout completes, every row shares the same model_version and
+    the filter becomes a no-op.
     """
     if k <= 0:
         raise ValueError(f"k must be positive, got {k}")
@@ -159,7 +168,9 @@ def similar_players(
 
     sql = text(f"""
         WITH target AS (
-            SELECT embedding FROM personality_embedding WHERE entity_id = :target_id
+            SELECT embedding, model_version
+            FROM personality_embedding
+            WHERE entity_id = :target_id
         )
         SELECT pe.entity_id, (pe.embedding <=> target.embedding)::float8 AS distance
         FROM personality_embedding pe
@@ -167,6 +178,7 @@ def similar_players(
         CROSS JOIN target
         WHERE pe.entity_id <> :target_id
           AND e.entity_type = 'player'
+          AND pe.model_version = target.model_version
           {where_clause}
         ORDER BY pe.embedding <=> target.embedding
         LIMIT :k

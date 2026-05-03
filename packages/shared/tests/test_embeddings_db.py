@@ -375,3 +375,41 @@ def test_similar_players_unknown_uuid_raises(db_session) -> None:
     """
     with pytest.raises(SimilarPlayerNotFoundError, match="does not exist"):
         similar_players(db_session, uuid.uuid4(), k=3)
+
+
+def test_similar_players_isolates_by_model_version(db_session) -> None:
+    """Mid-rollout state (some rows on a new embedder, some on the old)
+    must not leak across embedding spaces. Cosine distance between
+    vectors from different models is meaningless; the kNN restricts
+    neighbors to the target's ``model_version``.
+    """
+    old_model = _DictEmbedder(
+        {
+            "aspas": _direction(axis=0),
+            "old-near": _unit([0.95, 0.31] + [0.0] * (EMBEDDING_DIM - 2)),
+        },
+        version="model@v1",
+    )
+    new_model = _DictEmbedder(
+        {
+            # Same axis-0 vector as the old model's near match, so a
+            # naive query that ignored model_version would rank this
+            # row alongside ``old-near`` — exactly the silent-mix bug
+            # we're guarding against.
+            "new-impostor": _direction(axis=0),
+        },
+        version="model@v2",
+    )
+
+    target = _seed_player(db_session, handle="aspas", text="aspas", embedder=old_model)
+    same_model_neighbor = _seed_player(
+        db_session, handle="old-near", text="old-near", embedder=old_model
+    )
+    other_model_neighbor = _seed_player(
+        db_session, handle="new-impostor", text="new-impostor", embedder=new_model
+    )
+
+    results = similar_players(db_session, target.canonical_id, k=5)
+    ids = {r.entity_id for r in results}
+    assert same_model_neighbor.canonical_id in ids
+    assert other_model_neighbor.canonical_id not in ids
