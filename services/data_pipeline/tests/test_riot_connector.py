@@ -78,7 +78,14 @@ def _ok(json_body: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ok_match() -> dict[str, Any]:
-    return _ok({"match": _load_fixture("match.json")})
+    # Fixture body must match the shape ``RiotConnector._fetch_match``
+    # returns, which is the parsed JSON body verbatim. The
+    # ``fetch`` loop then wraps that in ``{"match_id": ..., "match": ...}``
+    # before yielding, and ``validate`` reads ``raw_payload["match"]``
+    # to find ``matchInfo`` / ``players`` / ``roundResults``. An extra
+    # ``{"match": ...}`` wrapper here would shift the expected keys
+    # one level deeper and trip ``SCHEMA_DRIFT``.
+    return _ok(_load_fixture("match.json"))
 
 
 def _matchlist_response() -> dict[str, Any]:

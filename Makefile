@@ -63,6 +63,7 @@ coverage:
 	# patterns, branch coverage) lives in pyproject.toml under
 	# ``[tool.coverage.*]``.
 	uv run pytest \
+		-v \
 		--cov \
 		--cov-report=term-missing \
 		--cov-report=xml \

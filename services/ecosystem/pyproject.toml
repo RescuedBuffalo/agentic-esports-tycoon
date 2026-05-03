@@ -9,6 +9,11 @@ description = "Tycoon / management simulation service."
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "esports-sim-shared",
+    # Graph exporter (BUF-53, Systems-spec System 08) emits feature
+    # matrices as numpy arrays. torch / torch_geometric stay optional —
+    # the exporter is numpy-only at the boundary; HeteroData.to_pyg()
+    # imports them lazily for trainer code that actually needs them.
+    "numpy>=1.26",
 ]
 
 [tool.uv.sources]
