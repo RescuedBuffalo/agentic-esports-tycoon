@@ -203,6 +203,64 @@ def test_transcript_empty_input_is_noop(db_session, embedder: Embedder) -> None:
     assert written == 0
 
 
+def test_transcript_re_run_with_fewer_chunks_drops_tail(db_session, embedder: Embedder) -> None:
+    """A re-transcription that produces fewer chunks must converge the
+    table to the new state. Without the tail-cleanup step, old chunks
+    at higher ``chunk_idx`` values would remain queryable and surface
+    as outdated text in retrieval results.
+    """
+    media_id = uuid.uuid4()
+    long_run = [
+        "transcript-chunk-a",
+        "transcript-chunk-b",
+        "duelist-aggressive",
+        "controller-cerebral",
+    ]
+    upsert_transcript_chunks(
+        db_session,
+        media_id=media_id,
+        chunks=long_run,
+        embedder=embedder,
+    )
+    db_session.flush()
+    assert (
+        len(
+            db_session.execute(
+                select(TranscriptChunkEmbedding).where(
+                    TranscriptChunkEmbedding.media_id == media_id
+                )
+            )
+            .scalars()
+            .all()
+        )
+        == 4
+    )
+
+    # Re-run with a shorter list (Whisper re-segmentation, transcript
+    # cleanup, etc.). The tail rows for chunk_idx 2 and 3 must be
+    # dropped, not left over as stale embeddings.
+    short_run = ["transcript-chunk-a", "transcript-chunk-b"]
+    upsert_transcript_chunks(
+        db_session,
+        media_id=media_id,
+        chunks=short_run,
+        embedder=embedder,
+    )
+    db_session.flush()
+
+    rows = (
+        db_session.execute(
+            select(TranscriptChunkEmbedding)
+            .where(TranscriptChunkEmbedding.media_id == media_id)
+            .order_by(TranscriptChunkEmbedding.chunk_idx)
+        )
+        .scalars()
+        .all()
+    )
+    assert [r.chunk_idx for r in rows] == [0, 1]
+    assert [r.chunk_text for r in rows] == short_run
+
+
 def _seed_player(
     session,
     *,

@@ -19,7 +19,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import func
+from sqlalchemy import delete, func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -95,15 +95,21 @@ def upsert_transcript_chunks(
 
     Conflicts on ``(media_id, chunk_idx)``: a re-transcription that
     produces a slightly different chunking still upserts cleanly
-    because ``chunk_idx`` is positional. The Whisper pipeline's
-    contract is that the chunk count for a given media may shrink
-    on re-run; callers that need to drop trailing chunks must
-    DELETE-by-media_id-AND-chunk_idx-greater-than first (the schema
-    has no way to express "delete the tail" automatically).
+    because ``chunk_idx`` is positional. After the UPSERT, any rows
+    whose ``chunk_idx`` falls outside the new ``[0, len(chunks))``
+    range are deleted, so a re-transcription that produces fewer
+    chunks (after a Whisper segmentation change, for example)
+    converges the table to the new state instead of leaving a stale
+    tail that retrieval would surface as outdated text.
 
     Returns the number of chunks written. Empty input is a no-op
     that returns 0 — convenient for call sites that skip an empty
-    transcript without branching.
+    transcript without branching. Note: empty input also leaves
+    existing chunks untouched. A caller who genuinely wants to
+    drop every chunk for a media (e.g., the upstream audio was
+    pulled) must issue an explicit
+    ``DELETE FROM transcript_chunk_embedding WHERE media_id = ...``
+    so the intent is unambiguous.
     """
     if not chunks:
         return 0
@@ -142,4 +148,17 @@ def upsert_transcript_chunks(
         },
     )
     session.execute(stmt)
+    # Drop any stale tail from a previous longer transcription.
+    # ``chunk_idx`` is a contiguous 0-based positional index, so
+    # anything at or above ``len(chunks)`` is from a prior run and
+    # would otherwise be returned by retrieval as stale text. The
+    # DELETE is bounded to one media_id and runs after the UPSERT
+    # so a partial failure rolls back together inside the caller's
+    # transaction.
+    session.execute(
+        delete(TranscriptChunkEmbedding).where(
+            TranscriptChunkEmbedding.media_id == media_id,
+            TranscriptChunkEmbedding.chunk_idx >= len(chunks),
+        )
+    )
     return len(payload)
