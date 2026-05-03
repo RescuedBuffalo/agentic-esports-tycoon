@@ -234,7 +234,7 @@ class GraphSnapshot:
                 self._build_manifest(),
                 indent=2,
                 sort_keys=True,
-                default=_jsonable_default,
+                default=jsonable_default,
             ),
             encoding="utf-8",
         )
@@ -360,7 +360,7 @@ class GraphSnapshot:
 # ---- helpers ---------------------------------------------------------------
 
 
-def _jsonable_default(obj: Any) -> Any:
+def jsonable_default(obj: Any) -> Any:
     """Coerce non-native types (datetime, numpy scalars, ...) for ``json.dumps``.
 
     The snapshot's metadata block carries whatever the data source
@@ -373,6 +373,11 @@ def _jsonable_default(obj: Any) -> Any:
     manifest is a human-readable record, not a typed contract — losing
     a millisecond of precision on a stored timestamp is a fair price
     for not failing the export.
+
+    Public so :mod:`ecosystem.graph.export` can reuse it when folding
+    metadata into the run fingerprint — the registry's idempotency
+    contract requires that the bytes the fingerprint sees match the
+    bytes the manifest persists.
     """
     # ``datetime`` and ``date`` carry ``.isoformat()``; numpy datetimes
     # do not, but ``str(np.datetime64(...))`` returns ISO-like text.
@@ -432,4 +437,5 @@ __all__ = [
     "NodeBlock",
     "SNAPSHOT_FORMAT_VERSION",
     "assert_schema_known",
+    "jsonable_default",
 ]

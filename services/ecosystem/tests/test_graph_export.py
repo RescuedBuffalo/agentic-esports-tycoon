@@ -192,6 +192,46 @@ def test_manifest_serializes_datetime_metadata(tmp_path: Path) -> None:
     assert "2024-01-09" in patch_meta["starts_at"]
 
 
+def test_metadata_change_changes_run_id(
+    registry: Registry, config_path: Path
+) -> None:
+    """Codex P2 (PR #24): a metadata-only source change must mint a new run_id.
+
+    The fingerprint previously hashed only tensors, so a source that
+    shifted ``patch_meta.starts_at`` (or any other manifest-only
+    field) would short-circuit to the prior run_id and the manifest
+    on disk would silently disagree with the source — broken
+    auditability.
+    """
+    from datetime import UTC, datetime
+
+    from ecosystem.graph.source import InMemoryDataSource
+
+    def _build_source(starts_at: datetime) -> InMemoryDataSource:
+        s = InMemoryDataSource()
+        s.set_patch(
+            "e_t",
+            {"era_ordinal": 0.0, "starts_at": starts_at},
+        )
+        return s
+
+    first = export_era(
+        _build_source(datetime(2024, 1, 9, tzinfo=UTC)),
+        era_slug="e_t",
+        config_path=config_path,
+        registry=registry,
+    )
+    second = export_era(
+        _build_source(datetime(2024, 1, 10, tzinfo=UTC)),
+        era_slug="e_t",
+        config_path=config_path,
+        registry=registry,
+    )
+    assert first.run_id != second.run_id, (
+        "metadata-only source change must produce a new fingerprint"
+    )
+
+
 def test_failed_run_short_circuits_on_re_export(
     registry: Registry, config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

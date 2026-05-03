@@ -23,7 +23,7 @@ from esports_sim.registry import Registry, RunStatus
 
 from ecosystem.graph.builder import build_snapshot
 from ecosystem.graph.schema import SCHEMA_VERSION
-from ecosystem.graph.snapshot import GraphSnapshot
+from ecosystem.graph.snapshot import GraphSnapshot, jsonable_default
 from ecosystem.graph.source import GraphDataSource
 from ecosystem.graph.validate import (
     StructuralValidationError,
@@ -239,6 +239,13 @@ def _fingerprint_snapshot(snapshot: GraphSnapshot) -> str:
     pure function of the tensors, so folding them in would be
     redundant. We *do* include the schema version so a schema bump
     forces a re-register even if the underlying ids are unchanged.
+
+    The snapshot's ``metadata`` block is folded in too: the manifest
+    persists it verbatim, so two builds with the same tensors but
+    different metadata (e.g. shifted ``patch_meta.starts_at``) would
+    otherwise share a fingerprint and the orchestrator's idempotent
+    short-circuit would reuse stale artifacts. (See Codex review on
+    PR #24.)
     """
     h = hashlib.sha256()
     h.update(SCHEMA_VERSION.encode("utf-8"))
@@ -255,6 +262,16 @@ def _fingerprint_snapshot(snapshot: GraphSnapshot) -> str:
         h.update(edge_block.edge_index.tobytes())
         if edge_block.edge_attr is not None:
             h.update(edge_block.edge_attr.tobytes())
+    # Reuse the manifest's JSON encoder so the fingerprint sees the
+    # same bytes the persisted manifest would. ``sort_keys=True`` is
+    # what makes the digest order-independent across dict iterations.
+    metadata_bytes = json.dumps(
+        snapshot.metadata,
+        sort_keys=True,
+        default=jsonable_default,
+    ).encode("utf-8")
+    h.update(b"metadata:")
+    h.update(metadata_bytes)
     return h.hexdigest()
 
 
