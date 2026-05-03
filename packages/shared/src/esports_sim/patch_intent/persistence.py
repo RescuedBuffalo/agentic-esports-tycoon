@@ -136,20 +136,29 @@ def extract_intent_for_pending(
     client: anthropic.Anthropic | None = None,
     source: str | None = None,
     limit: int | None = None,
-    prompt_version: str = PROMPT_VERSION,
 ) -> SchedulerStats:
     """Phase 0 scheduler hook: extract intents for every patch without one.
 
     Driven by the new-patch event in spirit but implemented as a poll:
     enumerate ``patch_note`` rows that don't yet have a ``patch_intent``
-    for ``prompt_version``, then run :func:`extract_patch_intent` for
-    each. Idempotent — a subsequent call with the same prompt version
-    is a no-op once every patch has its intent.
+    for the current ``PROMPT_VERSION``, then run
+    :func:`extract_patch_intent` for each. Idempotent — a subsequent
+    call is a no-op once every patch has its intent.
 
     Stops cleanly on :class:`BudgetExhausted`: increments the counter,
     logs which patch was skipped, and returns. The next scheduled pass
     will pick up where this one left off once the weekly window rolls
     forward and credits free up.
+
+    The selected ``prompt_version`` is always the module-level
+    ``PROMPT_VERSION`` constant, mirroring what the extractor stamps on
+    its outcome. There is no override knob: a "v1 classification" can
+    only be produced by a v1 prompt rubric, and the prompt is the
+    versioned artefact — bumping ``PROMPT_VERSION`` (and the rubric in
+    :mod:`prompt`) is the way to land a new generation of rows on the
+    next pass. An override that filtered on a different version while
+    the extractor stamped the current one would silently UPSERT the
+    default-version row repeatedly while the pending list never shrunk.
 
     Parameters
     ----------
@@ -161,17 +170,13 @@ def extract_intent_for_pending(
         means "process every pending patch"; a finite cap is the
         operator-facing knob for "extract one patch and let me eyeball
         the result before draining the rest of the queue".
-    prompt_version:
-        Defaults to the current ``PROMPT_VERSION`` constant. Override
-        only for replay / backfill paths that want to land an older
-        version's classification on a freshly-ingested patch.
     """
     stats = SchedulerStats()
 
-    pending = list(_select_pending_patches(session, source=source, prompt_version=prompt_version))
+    pending = list(_select_pending_patches(session, source=source))
     _logger.info(
         "patch_intent.scheduler_start",
-        extra={"pending_count": len(pending), "prompt_version": prompt_version},
+        extra={"pending_count": len(pending), "prompt_version": PROMPT_VERSION},
     )
 
     for patch_note in pending:
@@ -220,10 +225,10 @@ def extract_intent_for_pending(
         )
 
     # The pending list was computed once at the top; rows that already
-    # had an intent for this prompt_version were excluded from the
-    # iteration. Report them as ``skipped_existing`` so the on-call
+    # had an intent for the current prompt_version were excluded from
+    # the iteration. Report them as ``skipped_existing`` so the on-call
     # dashboard sees a clean "nothing to do" on a quiet pass.
-    stats.skipped_existing = _count_existing(session, source=source, prompt_version=prompt_version)
+    stats.skipped_existing = _count_existing(session, source=source)
     _logger.info(
         "patch_intent.scheduler_done",
         extra={
@@ -240,9 +245,8 @@ def _select_pending_patches(
     session: Session,
     *,
     source: str | None,
-    prompt_version: str,
 ) -> list[PatchNote]:
-    """Patches without an intent for ``prompt_version``, oldest first.
+    """Patches without an intent for the current ``PROMPT_VERSION``, oldest first.
 
     Oldest-first so a backfill processes history in chronological
     order — the cheapest path to noticing a regression where the model
@@ -250,10 +254,11 @@ def _select_pending_patches(
     prompt-version bump).
     """
     # Scalar subquery returning patch_note_ids that already have an
-    # intent for this prompt_version. The outer query excludes them.
+    # intent for the current prompt_version. The outer query excludes
+    # them.
     classified = (
         select(PatchIntent.patch_note_id)
-        .where(PatchIntent.prompt_version == prompt_version)
+        .where(PatchIntent.prompt_version == PROMPT_VERSION)
         .scalar_subquery()
     )
     stmt = (
@@ -270,13 +275,12 @@ def _count_existing(
     session: Session,
     *,
     source: str | None,
-    prompt_version: str,
 ) -> int:
-    """Number of patch notes that already have an intent for ``prompt_version``."""
+    """Number of patch notes that already have an intent for the current prompt."""
     stmt = (
         select(PatchIntent)
         .join(PatchNote, PatchIntent.patch_note_id == PatchNote.id)
-        .where(PatchIntent.prompt_version == prompt_version)
+        .where(PatchIntent.prompt_version == PROMPT_VERSION)
     )
     if source is not None:
         stmt = stmt.where(PatchNote.source == source)

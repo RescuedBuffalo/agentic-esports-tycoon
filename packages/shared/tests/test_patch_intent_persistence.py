@@ -440,6 +440,24 @@ def test_scheduler_hook_respects_limit(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert stats.inserted == 1
 
 
+def test_scheduler_hook_does_not_accept_prompt_version_override() -> None:
+    """Regression for codex P2 review: the hook used to expose a
+    ``prompt_version=`` knob that filtered selection by the override
+    but always persisted the extractor's ``PROMPT_VERSION``. In a
+    backfill the pending list never shrunk because no row was ever
+    written under the override version. The fix is to remove the knob
+    entirely — the prompt is the versioned artefact, so a v1
+    classification can only come from a v1 prompt rubric.
+
+    Pins the absence of the kwarg so a later refactor can't quietly
+    bring back the foot-gun.
+    """
+    import inspect
+
+    sig = inspect.signature(extract_intent_for_pending)
+    assert "prompt_version" not in sig.parameters
+
+
 # --- DTO sanity -----------------------------------------------------------
 
 
