@@ -129,12 +129,24 @@ def upsert_patch_intent(
     return existing, "updated"
 
 
+# Default ``source`` filter on the scheduler hook. The prompt rubric in
+# :mod:`prompt` is hard-coded as a Valorant classifier, so the *only*
+# safe default is the ``playvalorant`` connector's source name. A future
+# game's connector landing rows in ``patch_note`` (which the
+# ``PatchNoteConnector`` ABC explicitly supports) would otherwise get
+# classified with the wrong rubric and persist misleading rows. Callers
+# that genuinely want the cross-source path must pass ``source=None``
+# explicitly — which is also the signal that they've thought about the
+# rubric mismatch.
+_DEFAULT_SOURCE = "playvalorant"
+
+
 def extract_intent_for_pending(
     session: Session,
     *,
     governor: Governor,
     client: anthropic.Anthropic | None = None,
-    source: str | None = None,
+    source: str | None = _DEFAULT_SOURCE,
     limit: int | None = None,
 ) -> SchedulerStats:
     """Phase 0 scheduler hook: extract intents for every patch without one.
@@ -163,8 +175,12 @@ def extract_intent_for_pending(
     Parameters
     ----------
     source:
-        Optional connector source filter (``"playvalorant"``). Useful
-        for narrow re-runs against one game's history.
+        Connector source filter. Defaults to ``"playvalorant"`` —
+        :mod:`prompt` ships a Valorant-specific rubric, so the safe
+        default is to scope to that game's connector. Pass another
+        source string to scope a backfill to a different connector that
+        ships its own Valorant patch notes; pass ``None`` to disable
+        the filter (only safe once a game-agnostic rubric ships).
     limit:
         Optional cap on the number of extractions per call. ``None``
         means "process every pending patch"; a finite cap is the
@@ -172,6 +188,13 @@ def extract_intent_for_pending(
         the result before draining the rest of the queue".
     """
     stats = SchedulerStats()
+
+    # Snapshot the count of already-classified rows *before* the loop
+    # writes anything. Computing it after the loop would count a row
+    # we just inserted as "skipped", which contradicts the
+    # ``skipped_existing`` definition and inflates the on-call
+    # dashboard's idle metric on every backfill pass.
+    stats.skipped_existing = _count_existing(session, source=source)
 
     pending = list(_select_pending_patches(session, source=source))
     _logger.info(
@@ -224,11 +247,11 @@ def extract_intent_for_pending(
             },
         )
 
-    # The pending list was computed once at the top; rows that already
-    # had an intent for the current prompt_version were excluded from
-    # the iteration. Report them as ``skipped_existing`` so the on-call
-    # dashboard sees a clean "nothing to do" on a quiet pass.
-    stats.skipped_existing = _count_existing(session, source=source)
+    # ``skipped_existing`` was snapshotted before the loop ran (see
+    # above) so a freshly-inserted row in this pass isn't double-
+    # counted as "skipped". On a quiet pass with no pending work, the
+    # snapshot still equals the full classified count, which is what
+    # the on-call dashboard reads as "nothing to do".
     _logger.info(
         "patch_intent.scheduler_done",
         extra={

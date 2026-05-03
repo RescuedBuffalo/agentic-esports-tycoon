@@ -131,6 +131,8 @@ patch is classified is a no-op:
 from esports_sim.budget import Governor, default_caps
 from esports_sim.patch_intent import extract_intent_for_pending
 
+# ``source`` defaults to "playvalorant" — the prompt rubric is
+# Valorant-specific so the hook scopes to that connector's rows.
 stats = extract_intent_for_pending(session, governor=Governor(caps=default_caps()))
 # stats.inserted, stats.updated, stats.skipped_existing, stats.budget_exhausted
 ```

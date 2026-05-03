@@ -248,6 +248,7 @@ class _FakeSchedulerSession:
         # Three queries the production code emits — disambiguate on the
         # SELECT projection (FROM clauses overlap because of subqueries
         # and joins).
+        source_filter = _maybe_between(compiled, "patch_note.source = '", "'")
         if compiled.lstrip().startswith("SELECT patch_intent"):
             # Two callers project patch_intent.*: the per-row upsert
             # SELECT (filters by patch_note_id =) and the
@@ -266,21 +267,38 @@ class _FakeSchedulerSession:
                     None,
                 )
                 return _ScalarsResult([match] if match is not None else [])
-            # Existing-count select.
-            existing = [i for i in self._intents if i.prompt_version == PROMPT_VERSION]
+            # Existing-count select. Honour the optional source filter
+            # so a test asserting "playvalorant only" gets the right
+            # subtotal even when other-source intents are present.
+            existing = [
+                i
+                for i in self._intents
+                if i.prompt_version == PROMPT_VERSION
+                and (
+                    source_filter is None
+                    or self._patch_for_intent(i) is None
+                    or self._patch_for_intent(i).source == source_filter
+                )
+            ]
             return _ScalarsResult(existing)
         if compiled.lstrip().startswith("SELECT patch_note"):
             classified_ids = {
                 i.patch_note_id for i in self._intents if i.prompt_version == PROMPT_VERSION
             }
             pending = [p for p in self._patches if p.id not in classified_ids]
+            if source_filter is not None:
+                pending = [p for p in pending if p.source == source_filter]
             return _ScalarsResult(pending)
         raise AssertionError(f"unexpected query: {compiled}")
 
+    def _patch_for_intent(self, intent: _FakeIntent) -> _FakePatchNote | None:
+        return next((p for p in self._patches if p.id == intent.patch_note_id), None)
+
     def add(self, intent: Any) -> None:
         # The real upsert path inserts a PatchIntent ORM row. The fake
-        # session just appends to its list so the scheduler-hook count
-        # of "skipped_existing" reflects this pass's writes too.
+        # session appends to its list so a follow-up upsert SELECT in
+        # the same pass sees the freshly-written row (the per-row
+        # SELECT-then-INSERT-or-UPDATE pattern relies on that).
         self._intents.append(
             _FakeIntent(
                 patch_note_id=intent.patch_note_id,
@@ -308,6 +326,14 @@ def _between(text: str, start: str, end: str) -> str:
     i = text.index(start) + len(start)
     j = text.index(end, i)
     return text[i:j]
+
+
+def _maybe_between(text: str, start: str, end: str) -> str | None:
+    """Like :func:`_between` but returns ``None`` if ``start`` is absent."""
+    try:
+        return _between(text, start, end)
+    except ValueError:
+        return None
 
 
 def test_scheduler_hook_calls_extractor_for_each_pending_patch(
@@ -372,7 +398,10 @@ def test_scheduler_hook_skips_already_classified_patches(
     # Only p2 was extracted.
     assert len(calls) == 1
     assert stats.inserted == 1
-    assert stats.skipped_existing == 2  # p1 (pre-existing) + p2 (just added)
+    # ``skipped_existing`` is the pre-loop snapshot: just p1, the row
+    # that already had an intent before this pass started. p2 was
+    # freshly inserted, not skipped.
+    assert stats.skipped_existing == 1
 
 
 def test_scheduler_hook_stops_cleanly_on_budget_exhausted(
@@ -438,6 +467,78 @@ def test_scheduler_hook_respects_limit(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     assert len(calls) == 1
     assert stats.inserted == 1
+
+
+def test_scheduler_hook_defaults_source_to_playvalorant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex P1: a future game's connector landing rows in ``patch_note``
+    must not get classified by the Valorant-specific rubric.
+
+    Seeds two patches — one playvalorant, one a fictional ``other-game``
+    source. Default-call (no explicit ``source=``) must only classify
+    the playvalorant row.
+    """
+    pv = _FakePatchNote(patch_version="8.04")  # source defaults to "playvalorant"
+    other = _FakePatchNote(patch_version="1.0", body_text="other game body")
+    other.source = "other-game"
+    session = _FakeSchedulerSession(patches=[pv, other])
+
+    extracted: list[str] = []
+
+    def _fake_extract(*, governor: Any, patch_notes_text: str, **kwargs: Any) -> ExtractionOutcome:
+        extracted.append(patch_notes_text)
+        return _outcome()
+
+    monkeypatch.setattr(
+        "esports_sim.patch_intent.persistence.extract_patch_intent",
+        _fake_extract,
+    )
+
+    governor = Governor(
+        ledger=Ledger(db_path=tmp_path / "b.sqlite"),
+        caps=BudgetCaps(weekly_hard_cap_usd=30.0),
+    )
+    stats = extract_intent_for_pending(session, governor=governor)  # type: ignore[arg-type]
+
+    # Only the playvalorant patch was classified.
+    assert len(extracted) == 1
+    assert extracted[0] != "other game body"
+    assert stats.inserted == 1
+
+
+def test_scheduler_hook_skipped_existing_is_snapshotted_pre_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex P2: ``skipped_existing`` is the count at the *start* of the
+    pass — freshly-inserted rows must not be double-counted as skipped.
+
+    Setup: two pending patches, zero pre-existing intents. After the
+    pass, two rows have been written. ``skipped_existing`` must report
+    ``0`` (nothing was skipped — both were freshly written).
+    """
+    p1 = _FakePatchNote(patch_version="8.04")
+    p2 = _FakePatchNote(patch_version="8.05")
+    session = _FakeSchedulerSession(patches=[p1, p2])
+
+    def _fake_extract(*, governor: Any, patch_notes_text: str, **kwargs: Any) -> ExtractionOutcome:
+        return _outcome()
+
+    monkeypatch.setattr(
+        "esports_sim.patch_intent.persistence.extract_patch_intent",
+        _fake_extract,
+    )
+
+    governor = Governor(
+        ledger=Ledger(db_path=tmp_path / "b.sqlite"),
+        caps=BudgetCaps(weekly_hard_cap_usd=30.0),
+    )
+    stats = extract_intent_for_pending(session, governor=governor)  # type: ignore[arg-type]
+
+    assert stats.inserted == 2
+    # Pre-existing snapshot was zero — newly-written rows are NOT
+    # counted here even though they exist by the end of the pass.
+    assert stats.skipped_existing == 0
 
 
 def test_scheduler_hook_does_not_accept_prompt_version_override() -> None:
