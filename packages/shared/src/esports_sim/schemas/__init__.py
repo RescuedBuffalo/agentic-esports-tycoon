@@ -5,6 +5,7 @@ from esports_sim.schemas.dtos import (
     EntityAliasDTO,
     EntityDTO,
     PatchEraDTO,
+    PatchIntentDTO,
     RawRecordDTO,
     StagingRecordDTO,
 )
@@ -16,4 +17,5 @@ __all__ = [
     "RawRecordDTO",
     "AliasReviewQueueDTO",
     "PatchEraDTO",
+    "PatchIntentDTO",
 ]
