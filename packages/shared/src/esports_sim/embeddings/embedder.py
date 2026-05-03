@@ -79,8 +79,21 @@ class SentenceTransformerEmbedder:
         # Lazy import: pulling ``sentence_transformers`` drags in
         # torch + transformers, both of which we don't want in the
         # ``packages/shared`` import graph for callers that only need
-        # the schema models.
-        from sentence_transformers import SentenceTransformer
+        # the schema models. The package is shipped under the
+        # ``[embeddings]`` extra (see ``packages/shared/pyproject.toml``);
+        # surface a pointed install hint instead of the bare
+        # ImportError so an operator missing the extra doesn't have to
+        # cross-reference the codebase to figure out which package
+        # name to install.
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(
+                "SentenceTransformerEmbedder requires the sentence-transformers "
+                "package, which ships under the optional `embeddings` extra. "
+                "Install it with `uv pip install 'esports-sim-shared[embeddings]'` "
+                "(or pass a pre-loaded model via the constructor)."
+            ) from exc
 
         self._model = SentenceTransformer(self._model_name)
         return self._model

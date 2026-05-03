@@ -4,8 +4,9 @@ Lands the two tables that hold vector representations of:
 
 * one personality summary per canonical entity (one row per entity, the
   paragraph-level summary BUF-25 produces), and
-* one ~500-token chunk of a transcript per row (BUF-21's Whisper output
-  sliced and embedded).
+* one MiniLM-context-sized chunk of a transcript per row (BUF-21's
+  Whisper output sliced — see :mod:`esports_sim.embeddings.chunker`
+  for the wordpiece-budget rationale).
 
 Both columns are ``vector(384)`` — the output width of
 ``sentence-transformers/all-MiniLM-L6-v2``, the local CPU/GPU embedder

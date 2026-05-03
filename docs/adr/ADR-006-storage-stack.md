@@ -50,7 +50,17 @@ provisioned, via the `vector` extension.
   `sentence-transformers/all-MiniLM-L6-v2` (384-dim). No API cost,
   runs on the project's 5090. The model identifier is recorded
   per row in `model_version` so a future rotation can re-embed
-  in-place without losing the audit trail.
+  in-place without losing the audit trail. The `sentence-transformers`
+  package itself ships under the `[embeddings]` extra on
+  `esports-sim-shared` — installs that don't run an embedding worker
+  (CI, devs only touching the data pipeline) skip the torch + HF
+  download.
+* Transcript chunk size is bounded by the embedder's input limit:
+  MiniLM-L6-v2 truncates inputs longer than 256 wordpieces, so the
+  chunker targets ~180 whitespace tokens per chunk (≈ 234 wordpieces
+  with a margin). The BUF-28 issue's "~500 tokens" figure assumed a
+  longer-context embedder; a future swap to one lifts the chunk
+  budget without a schema change.
 * Qdrant is removed from `docker-compose.yml` and `.env.example`.
   One fewer service to keep healthy in CI and on dev laptops.
 

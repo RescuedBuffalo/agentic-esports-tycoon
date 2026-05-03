@@ -36,6 +36,10 @@ def test_invalid_chunk_size_rejected() -> None:
         chunk_transcript("anything", chunk_tokens=0)
 
 
-def test_default_chunk_size_matches_spec() -> None:
-    """BUF-28 spec target — ~500 tokens per chunk."""
-    assert DEFAULT_CHUNK_TOKENS == 500
+def test_default_chunk_size_fits_minilm_context() -> None:
+    """The default whitespace-token budget must stay under MiniLM's
+    256-wordpiece input limit. English wordpiece-tokenises at ~1.3x
+    word count; budgets above ~196 risk silent truncation that
+    degrades retrieval quality (see BUF-28 PR #26 review).
+    """
+    assert DEFAULT_CHUNK_TOKENS <= 196

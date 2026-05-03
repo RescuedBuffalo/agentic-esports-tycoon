@@ -1,21 +1,24 @@
 """Transcript chunker (BUF-28).
 
 Whisper (BUF-21) emits per-segment text; the embedding store wants
-roughly-500-token chunks so each row is dense enough to retrieve
-meaningfully but small enough not to exceed the embedder's context.
-The "tokens" the spec calls for are the embedder's tokens, but
-counting them precisely requires loading the model — too heavy for
-the chunker's call sites. Whitespace tokens are a reliable
-approximation for English-language transcripts (the actual MiniLM
-tokenizer produces ~1.3x as many subword tokens, well inside the
-256-token context the model handles cleanly even at our 500-word
-target).
+chunks dense enough to retrieve meaningfully but short enough that
+the embedder doesn't truncate them. The BUF-28 spec wrote "~500
+tokens" assuming a long-context embedder — but ADR-006 picks
+``sentence-transformers/all-MiniLM-L6-v2``, whose model card pins a
+hard 256-wordpiece input limit (anything longer is silently
+truncated). English-language transcripts wordpiece-tokenize at
+~1.3x word count, so the safe whitespace-token budget is
+``floor(256 / 1.3) ≈ 196``. We round down to 180 to leave headroom
+for dense names + numbers that tokenize denser than running prose.
+A future migration to a longer-context embedder can lift this
+without changing the schema.
 """
 
 from __future__ import annotations
 
-DEFAULT_CHUNK_TOKENS: int = 500
-"""BUF-28 spec target — ~500 tokens per chunk."""
+DEFAULT_CHUNK_TOKENS: int = 180
+"""Whitespace tokens per chunk — sized to fit MiniLM's 256-wordpiece limit
+with margin (see module docstring)."""
 
 
 def chunk_transcript(
