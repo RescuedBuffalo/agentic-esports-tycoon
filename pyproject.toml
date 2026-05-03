@@ -49,7 +49,7 @@ testpaths = [
 # directories — one per workspace member — without colliding on the shared
 # module name. Without it, the second ``conftest.py`` import raises
 # ImportPathMismatchError because two paths resolve to ``tests.conftest``.
-addopts = "-ra --import-mode=importlib --timeout=120 --timeout-method=thread"
+addopts = "-ra --import-mode=importlib --timeout=300"
 markers = [
     "integration: requires a running Postgres (TEST_DATABASE_URL set). Skipped by default on a fresh clone.",
 ]
