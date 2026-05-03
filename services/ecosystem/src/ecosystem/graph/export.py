@@ -39,6 +39,19 @@ _log = logging.getLogger(__name__)
 GRAPH_SNAPSHOT_KIND = "graph-snapshot"
 
 
+class GraphExportStateError(RuntimeError):
+    """Raised when the registry and on-disk artifacts disagree.
+
+    The orchestrator's exit contract is binary: a terminal registry
+    row matches a complete on-disk artifact set. If a re-run finds
+    a terminal row whose artifacts vanished, neither rebuilding (the
+    registry would silently keep the old status because
+    ``Registry.finalize`` no-ops on terminal rows) nor blindly
+    returning the cached status (there is no cache) is correct.
+    Surface it as an operator-actionable error instead.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ExportResult:
     """Compact summary of one ``export_era`` invocation.
@@ -99,23 +112,32 @@ def export_era(
     record = registry.get(run_id)
 
     # Idempotent re-runs: the registry returned an existing run_id.
-    # If the on-disk artifacts are still there, skip the rebuild — the
-    # contract is "same input → same output", and writing the same
-    # bytes twice is wasted I/O. If they're missing (operator deleted
-    # them), rebuild them under the existing run_id.
+    # Both terminal statuses are valid resting states (per the
+    # function docstring's exit contract), so a hit on either
+    # COMPLETED *or* FAILED with intact artifacts short-circuits to
+    # the cached report. Treating only COMPLETED as a hit would
+    # rebuild after a prior FAILED, then call ``Registry.finalize``
+    # which is a no-op on terminal rows — leaving ``ExportResult.passed``
+    # potentially True while the registry says FAILED, contradicting
+    # the contract. (See Codex review on PR #24.)
     snapshot_path = record.run_dir / "snapshot.npz"
     manifest_path = record.run_dir / "manifest.json"
     validation_path = record.run_dir / "validation.json"
+    artifacts_present = (
+        snapshot_path.exists() and manifest_path.exists() and validation_path.exists()
+    )
     if (
-        record.status is RunStatus.COMPLETED
-        and snapshot_path.exists()
-        and manifest_path.exists()
-        and validation_path.exists()
+        record.status in (RunStatus.COMPLETED, RunStatus.FAILED)
+        and artifacts_present
     ):
         report = _load_report(validation_path, era_slug)
         _log.info(
             "graph-snapshot.idempotent_hit",
-            extra={"run_id": run_id, "era_slug": era_slug},
+            extra={
+                "run_id": run_id,
+                "era_slug": era_slug,
+                "status": record.status.value,
+            },
         )
         return ExportResult(
             run_id=run_id,
@@ -125,6 +147,21 @@ def export_era(
             validation_path=validation_path,
             report=report,
             snapshot=snapshot,
+        )
+
+    # Existing terminal row but artifacts gone (operator deleted
+    # them or never ran). ``Registry.finalize`` is a no-op on
+    # non-RUNNING rows so we cannot legitimately re-mint the status,
+    # which means rebuilding here would leave the registry and the
+    # ``ExportResult.passed`` flag in conflicting states. Refuse
+    # rather than silently produce that contradiction.
+    if record.status in (RunStatus.COMPLETED, RunStatus.FAILED):
+        raise GraphExportStateError(
+            f"run_id={run_id!r} for era {era_slug!r} is already terminal "
+            f"({record.status.value}) but artifacts are missing under "
+            f"{record.run_dir}. Restore the artifacts or delete the row "
+            f"before re-exporting; the registry refuses to relabel a "
+            f"terminal run."
         )
 
     # Validate before writing so a fail-on-validation run still has
@@ -251,6 +288,7 @@ def _load_report(path: Path, era_slug: str) -> ValidationReport:
 __all__ = [
     "ExportResult",
     "GRAPH_SNAPSHOT_KIND",
+    "GraphExportStateError",
     "export_era",
     "export_eras",
 ]

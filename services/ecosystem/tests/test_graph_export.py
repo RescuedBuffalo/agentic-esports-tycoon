@@ -192,6 +192,84 @@ def test_manifest_serializes_datetime_metadata(tmp_path: Path) -> None:
     assert "2024-01-09" in patch_meta["starts_at"]
 
 
+def test_failed_run_short_circuits_on_re_export(
+    registry: Registry, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P1 (PR #24): re-exporting after a FAILED run must not relabel.
+
+    First export forces a validation failure → row finalises FAILED
+    with artifacts. Second export hits the same idempotency triple
+    so ``register`` returns the existing FAILED row. The orchestrator
+    must short-circuit to the cached report (passed=False) rather
+    than rebuild and silently report passed=True against a registry
+    row that ``Registry.finalize`` cannot transition out of FAILED.
+    """
+    src = build_three_era_source()
+
+    real_validate = validate_snapshot
+
+    def force_failing_report(snapshot: GraphSnapshot):
+        report = real_validate(snapshot)
+        from ecosystem.graph.validate import ValidationIssue
+
+        report.issues.append(
+            ValidationIssue("injected", "error", "test", "forced fail")
+        )
+        return report
+
+    monkeypatch.setattr(
+        "ecosystem.graph.export.validate_snapshot", force_failing_report
+    )
+    first = export_era(
+        src, era_slug="e2024_01", config_path=config_path, registry=registry
+    )
+    assert not first.passed
+    assert registry.get(first.run_id).status is RunStatus.FAILED
+
+    # Lift the injected failure for the second pass — were the
+    # orchestrator to rebuild instead of short-circuiting, the
+    # rebuild would now pass and contradict the FAILED row.
+    monkeypatch.setattr(
+        "ecosystem.graph.export.validate_snapshot", real_validate
+    )
+    second = export_era(
+        src, era_slug="e2024_01", config_path=config_path, registry=registry
+    )
+    assert second.run_id == first.run_id
+    assert not second.passed, (
+        "re-export should return the cached FAILED report, not relabel"
+    )
+    assert registry.get(second.run_id).status is RunStatus.FAILED
+
+
+def test_terminal_run_with_missing_artifacts_raises(
+    registry: Registry, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex P1 (PR #24): missing artifacts on a terminal row → operator action.
+
+    Rebuilding silently would leave the registry stuck on the
+    pre-existing terminal status (since ``Registry.finalize`` no-ops
+    on non-RUNNING rows), so the orchestrator surfaces the conflict
+    instead of producing contradictory state.
+    """
+    from ecosystem.graph.export import GraphExportStateError
+
+    src = build_three_era_source()
+    first = export_era(
+        src, era_slug="e2024_01", config_path=config_path, registry=registry
+    )
+    assert first.passed
+    # Operator manually deleted the artifacts but left the row.
+    first.snapshot_path.unlink()
+    first.manifest_path.unlink()
+    first.validation_path.unlink()
+
+    with pytest.raises(GraphExportStateError):
+        export_era(
+            src, era_slug="e2024_01", config_path=config_path, registry=registry
+        )
+
+
 def test_failed_validation_writes_failed_status(
     registry: Registry, config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

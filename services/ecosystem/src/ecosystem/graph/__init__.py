@@ -25,7 +25,7 @@ Public API::
 """
 
 from ecosystem.graph.builder import build_snapshot
-from ecosystem.graph.export import export_era
+from ecosystem.graph.export import GraphExportStateError, export_era
 from ecosystem.graph.schema import (
     EDGE_TYPES,
     NODE_TYPES,
@@ -62,6 +62,7 @@ __all__ = [
     "ValidationReport",
     "build_snapshot",
     "edge_spec",
+    "GraphExportStateError",
     "export_era",
     "node_spec",
     "validate_snapshot",
