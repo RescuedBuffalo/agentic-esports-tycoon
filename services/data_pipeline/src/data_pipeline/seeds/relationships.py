@@ -49,8 +49,14 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from esports_sim.db.enums import RelationshipEdgeType
-from esports_sim.db.models import MapResult, Match, PlayerMatchStat, RelationshipEdge
-from sqlalchemy import select
+from esports_sim.db.models import (
+    MapResult,
+    Match,
+    PlayerMatchStat,
+    RelationshipEdge,
+    RelationshipEvent,
+)
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 _logger = logging.getLogger("data_pipeline.seeds.relationships")
@@ -273,15 +279,39 @@ def bootstrap_teammate_edges(
         }
 
         # On a kind-flip (e.g. a fresh ingest moved a pair from
-        # ex-teammate to teammate) drop the old row and mint the
-        # new one rather than mutating in place — kind is part of
-        # the unique constraint, so swapping it with the row in
-        # place would still need a delete + insert.
+        # ex-teammate to teammate) mutate the existing row's
+        # ``edge_type`` in place rather than delete-and-reinsert.
+        # ``relationship_event.edge_id`` is ``ON DELETE CASCADE``,
+        # so dropping the row would wipe the append-only audit
+        # trail attached to it (Codex P1 on PR #28). The unique
+        # constraint is ``(src, dst, edge_type)`` and we're
+        # swapping the third column on a single row, which stays
+        # unique by construction.
         for stale_kind in (RelationshipEdgeType.TEAMMATE, RelationshipEdgeType.EX_TEAMMATE):
             if stale_kind == edge_type:
                 continue
             stale = existing.pop((src_id, dst_id, stale_kind), None)
-            if stale is not None:
+            if stale is None:
+                continue
+            target = existing.get((src_id, dst_id, edge_type))
+            if target is None:
+                # Single-row flip: mutate kind in place and
+                # re-key the lookup so the update branch below
+                # finds it.
+                stale.edge_type = edge_type
+                existing[(src_id, dst_id, edge_type)] = stale
+            else:
+                # Defensive case: both kinds exist for the same
+                # pair (shouldn't happen via the bootstrap, but
+                # could arise from a hand-written event-driven
+                # writer). Migrate the stale row's events onto
+                # the target row before deleting, so the audit
+                # trail survives the consolidation.
+                session.execute(
+                    update(RelationshipEvent)
+                    .where(RelationshipEvent.edge_id == stale.edge_id)
+                    .values(edge_id=target.edge_id)
+                )
                 session.delete(stale)
 
         existing_edge = existing.get((src_id, dst_id, edge_type))
@@ -303,8 +333,15 @@ def bootstrap_teammate_edges(
             else:
                 manifest.ex_teammate_edges_inserted += 1
         else:
+            # Refresh strength + audit metadata from the latest
+            # match history. Sentiment is intentionally **not**
+            # touched: an event-driven writer (Codex P1 on PR
+            # #28) may have evolved the valence past the
+            # bootstrap default, and resetting it to 1.0 here
+            # would silently corrupt that signal. The bootstrap
+            # owns "did they share rosters and how recently";
+            # ``relationship_event`` owns valence over time.
             existing_edge.strength = strength
-            existing_edge.sentiment = 1.0
             existing_edge.last_updated_at = acc.last_match_at
             existing_edge.extra = extras
             manifest.edges_updated += 1

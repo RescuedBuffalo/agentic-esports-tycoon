@@ -25,6 +25,7 @@ from esports_sim.db.models import (
     Match,
     PlayerMatchStat,
     RelationshipEdge,
+    RelationshipEvent,
 )
 from sqlalchemy import select
 
@@ -305,3 +306,88 @@ def test_bootstrap_handles_kind_flip_on_rerun(db_session) -> None:
 
     after = db_session.execute(select(RelationshipEdge)).scalar_one()
     assert after.edge_type is RelationshipEdgeType.TEAMMATE
+
+
+def test_bootstrap_rerun_preserves_post_bootstrap_sentiment(db_session) -> None:
+    """Codex P1 (PR #28): an event-driven writer may have evolved the
+    valence past the +1.0 bootstrap default. A re-run must refresh
+    strength + audit metadata without clobbering that learned
+    sentiment."""
+    a = _make_player(db_session)
+    b = _make_player(db_session)
+    db_session.flush()
+
+    _seed_map(
+        db_session,
+        match_date=datetime(2026, 4, 1, tzinfo=UTC),
+        team1_players=[a, b],
+        team2_players=[],
+    )
+    bootstrap_teammate_edges(db_session, reference_timestamp=datetime(2026, 5, 1, tzinfo=UTC))
+
+    edge = db_session.execute(select(RelationshipEdge)).scalar_one()
+    # Simulate a downstream event-driven writer evolving the valence
+    # below the bootstrap default (a feud broke out post-bootstrap).
+    edge.sentiment = -0.4
+    db_session.flush()
+
+    bootstrap_teammate_edges(db_session, reference_timestamp=datetime(2026, 5, 1, tzinfo=UTC))
+    refreshed = db_session.execute(select(RelationshipEdge)).scalar_one()
+    assert refreshed.sentiment == pytest.approx(-0.4)
+
+
+def test_bootstrap_kind_flip_preserves_event_audit_trail(db_session) -> None:
+    """Codex P1 (PR #28): ``relationship_event`` cascades on the parent
+    edge's delete. A naive delete-and-reinsert on a kind flip would
+    wipe the append-only audit log; the in-place mutation keeps the
+    history."""
+    a = _make_player(db_session)
+    b = _make_player(db_session)
+    db_session.flush()
+
+    older = datetime(2026, 1, 1, tzinfo=UTC)
+    refresh_ref = datetime(2026, 5, 1, tzinfo=UTC)
+
+    _seed_map(
+        db_session,
+        match_date=older,
+        team1_players=[a, b],
+        team2_players=[],
+    )
+    bootstrap_teammate_edges(db_session, reference_timestamp=refresh_ref)
+    initial = db_session.execute(select(RelationshipEdge)).scalar_one()
+    assert initial.edge_type is RelationshipEdgeType.EX_TEAMMATE
+
+    # An event-driven writer logs a post-bootstrap signal against this
+    # edge — exactly the audit-trail row Codex's review flagged.
+    db_session.add(
+        RelationshipEvent(
+            event_id=uuid.uuid4(),
+            edge_id=initial.edge_id,
+            event_kind="public_feud",
+            delta_strength=0.0,
+            delta_sentiment=-0.5,
+            occurred_at=older + timedelta(days=30),
+            payload={"source": "test"},
+        )
+    )
+    db_session.flush()
+
+    # Fresh recent map flips the kind; the event log must survive.
+    _seed_map(
+        db_session,
+        match_date=refresh_ref - timedelta(days=5),
+        team1_players=[a, b],
+        team2_players=[],
+    )
+    bootstrap_teammate_edges(db_session, reference_timestamp=refresh_ref)
+
+    after = db_session.execute(select(RelationshipEdge)).scalar_one()
+    assert after.edge_type is RelationshipEdgeType.TEAMMATE
+    # The event_id-stable check: the row that was attached to the
+    # ex-teammate edge is now attached to the same (mutated) edge —
+    # we keep the same edge_id so the audit trail is contiguous.
+    events = db_session.execute(select(RelationshipEvent)).scalars().all()
+    assert len(events) == 1
+    assert events[0].event_kind == "public_feud"
+    assert events[0].edge_id == after.edge_id
