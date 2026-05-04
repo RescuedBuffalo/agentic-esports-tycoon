@@ -479,3 +479,79 @@ def test_bootstrap_consolidation_path_preserves_event_audit_trail(db_session) ->
     events = db_session.execute(select(RelationshipEvent)).scalars().all()
     assert {e.event_kind for e in events} == {"legacy_feud", "recent_clutch"}
     assert all(e.edge_id == teammate_edge.edge_id for e in events)
+
+
+def test_bootstrap_rerun_preserves_event_evolved_strength_and_anchor(db_session) -> None:
+    """Codex P1 (PR #28, 3rd round): once a post-bootstrap writer has
+    advanced ``last_updated_at`` past the match-history baseline (an
+    event was folded in, or the monthly decay job ran), the rerun
+    must NOT re-derive ``strength`` from shared-map count or rewind
+    the anchor — both moves would wipe the writer's adjustments and
+    cause the next decay pass to over-apply elapsed weeks."""
+    a = _make_player(db_session)
+    b = _make_player(db_session)
+    db_session.flush()
+
+    last_match_at = datetime(2026, 4, 1, tzinfo=UTC)
+    _seed_map(
+        db_session,
+        match_date=last_match_at,
+        team1_players=[a, b],
+        team2_players=[],
+    )
+    bootstrap_teammate_edges(db_session, reference_timestamp=datetime(2026, 5, 1, tzinfo=UTC))
+    edge = db_session.execute(select(RelationshipEdge)).scalar_one()
+
+    # Simulate a post-bootstrap event-driven writer: a delta_strength
+    # was folded in and the anchor was advanced past the match-history
+    # baseline (the contract on ``last_updated_at`` per the model
+    # docstring).
+    bumped_strength = 0.85
+    bumped_anchor = last_match_at + timedelta(days=7)
+    edge.strength = bumped_strength
+    edge.last_updated_at = bumped_anchor
+    db_session.flush()
+
+    bootstrap_teammate_edges(db_session, reference_timestamp=datetime(2026, 5, 1, tzinfo=UTC))
+    refreshed = db_session.execute(select(RelationshipEdge)).scalar_one()
+    assert refreshed.strength == pytest.approx(bumped_strength)
+    assert refreshed.last_updated_at == bumped_anchor
+
+
+def test_bootstrap_rerun_refreshes_strength_when_no_event_writer_has_taken_over(
+    db_session,
+) -> None:
+    """Counterpart to the preservation test: if the existing edge is
+    still anchored at the bootstrap baseline (``last_updated_at <=
+    acc.last_match_at``), a fresh ingest with more shared maps should
+    legitimately refresh ``strength``."""
+    a = _make_player(db_session)
+    b = _make_player(db_session)
+    db_session.flush()
+
+    early_match = datetime(2026, 4, 1, tzinfo=UTC)
+    _seed_map(
+        db_session,
+        match_date=early_match,
+        team1_players=[a, b],
+        team2_players=[],
+    )
+    bootstrap_teammate_edges(db_session, reference_timestamp=datetime(2026, 5, 1, tzinfo=UTC))
+    initial = db_session.execute(select(RelationshipEdge)).scalar_one()
+    initial_strength = initial.strength
+
+    # Fresh ingest brings more shared maps for the same pair; the
+    # event-driven path has not touched the edge.
+    for i in range(5):
+        _seed_map(
+            db_session,
+            match_date=early_match + timedelta(days=i + 1),
+            team1_players=[a, b],
+            team2_players=[],
+        )
+
+    bootstrap_teammate_edges(db_session, reference_timestamp=datetime(2026, 5, 1, tzinfo=UTC))
+    refreshed = db_session.execute(select(RelationshipEdge)).scalar_one()
+    assert refreshed.strength > initial_strength
+    # Anchor advances to the latest shared map.
+    assert refreshed.last_updated_at == early_match + timedelta(days=5)

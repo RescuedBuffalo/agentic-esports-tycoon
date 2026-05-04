@@ -339,16 +339,25 @@ def bootstrap_teammate_edges(
             else:
                 manifest.ex_teammate_edges_inserted += 1
         else:
-            # Refresh strength + audit metadata from the latest
-            # match history. Sentiment is intentionally **not**
-            # touched: an event-driven writer (Codex P1 on PR
-            # #28) may have evolved the valence past the
-            # bootstrap default, and resetting it to 1.0 here
-            # would silently corrupt that signal. The bootstrap
-            # owns "did they share rosters and how recently";
-            # ``relationship_event`` owns valence over time.
-            existing_edge.strength = strength
-            existing_edge.last_updated_at = acc.last_match_at
+            # Rerun against an already-seeded edge. The bootstrap is a
+            # baseline-seeding pass — once a post-bootstrap writer
+            # (the event-driven path: ``relationship_event`` rows
+            # folded into the edge, or the monthly decay job) has
+            # advanced ``last_updated_at`` past ``acc.last_match_at``,
+            # they own the live magnitude. Re-deriving ``strength``
+            # from shared-map count would wipe their adjustments AND
+            # rewind the decay anchor, so the next decay pass would
+            # over-apply the elapsed weeks (Codex P1 on PR #28).
+            # Sentiment is never touched on rerun, same rationale.
+            #
+            # The provenance ``extra`` is always refreshed so an
+            # operator can see what the latest match history looks
+            # like for this pair, regardless of whether the event-
+            # driven writer has taken over.
+            event_writer_has_taken_over = existing_edge.last_updated_at > acc.last_match_at
+            if not event_writer_has_taken_over:
+                existing_edge.strength = strength
+                existing_edge.last_updated_at = acc.last_match_at
             existing_edge.extra = extras
             manifest.edges_updated += 1
 
