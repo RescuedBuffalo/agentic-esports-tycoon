@@ -54,9 +54,8 @@ from esports_sim.db.models import (
     Match,
     PlayerMatchStat,
     RelationshipEdge,
-    RelationshipEvent,
 )
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 _logger = logging.getLogger("data_pipeline.seeds.relationships")
@@ -304,14 +303,21 @@ def bootstrap_teammate_edges(
                 # Defensive case: both kinds exist for the same
                 # pair (shouldn't happen via the bootstrap, but
                 # could arise from a hand-written event-driven
-                # writer). Migrate the stale row's events onto
-                # the target row before deleting, so the audit
-                # trail survives the consolidation.
-                session.execute(
-                    update(RelationshipEvent)
-                    .where(RelationshipEvent.edge_id == stale.edge_id)
-                    .values(edge_id=target.edge_id)
-                )
+                # writer). Re-parent the stale row's events onto
+                # the target at the ORM level so the cascade-delete
+                # on ``stale`` doesn't propagate into the audit
+                # trail. A bulk SQL UPDATE is *not* enough here:
+                # ``RelationshipEdge.events`` is loaded eagerly
+                # (``selectin``) with ``cascade="all, delete-orphan"``,
+                # so SA's in-memory collection still anchors the
+                # events to ``stale`` and the next flush would
+                # delete them despite the SQL-level reparenting
+                # (Codex P1 on PR #28). Re-assigning ``event.edge``
+                # walks the bidirectional relationship and atomically
+                # moves each child onto the target, so neither orphan
+                # cascade nor delete cascade fires.
+                for event in list(stale.events):
+                    event.edge = target
                 session.delete(stale)
 
         existing_edge = existing.get((src_id, dst_id, edge_type))

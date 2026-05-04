@@ -17,6 +17,7 @@ from ecosystem.relationships import (
     DecayError,
     decay_edge,
     decay_strength,
+    run_monthly_decay,
     weeks_between,
 )
 from esports_sim.db.enums import RelationshipEdgeType
@@ -189,3 +190,68 @@ def test_weeks_between_returns_fractional_weeks() -> None:
     a = datetime(2026, 1, 1, tzinfo=UTC)
     b = a + timedelta(days=10, hours=12)
     assert weeks_between(a, b) == pytest.approx(10.5 / 7.0, abs=1e-12)
+
+
+# ---- run_monthly_decay touched-counter contract ---------------------------
+
+
+class _StubSession:
+    """Minimal SA-shaped session stub for the touched-counter unit test.
+
+    Only implements the surface ``run_monthly_decay`` actually exercises:
+    ``execute(...).scalars().all()`` and ``flush()``. Avoids the Postgres
+    fixture dependency for what is a pure-Python invariant.
+    """
+
+    def __init__(self, edges: list[RelationshipEdge]) -> None:
+        self._edges = edges
+
+    def execute(self, _statement: object) -> _StubSession:
+        return self
+
+    def scalars(self) -> _StubSession:
+        return self
+
+    def all(self) -> list[RelationshipEdge]:
+        return self._edges
+
+    def flush(self) -> None:
+        return None
+
+
+def test_run_monthly_decay_does_not_count_idempotent_rerun() -> None:
+    """Codex P2 (PR #28): on an immediate re-run with the same ``now``,
+    ``decay_edge`` is a no-op and the touched-counter must report 0.
+    The earlier ``or last_updated_at == now`` clause was true even for
+    rows the job did not actually move."""
+    anchor = datetime(2026, 1, 1, tzinfo=UTC)
+    later = anchor + timedelta(weeks=4)
+    edges = [_make_edge(strength=1.0, last_updated_at=anchor)]
+    session = _StubSession(edges)
+
+    first = run_monthly_decay(session, now=later)  # type: ignore[arg-type]
+    assert first == 1
+    assert edges[0].last_updated_at == later
+    assert edges[0].strength < 1.0
+
+    second = run_monthly_decay(session, now=later)  # type: ignore[arg-type]
+    assert second == 0
+
+
+def test_run_monthly_decay_counts_only_actually_decayed_edges() -> None:
+    """Mixed batch: a fresh edge plus an already-anchored edge. Only the
+    fresh one moves, so the count is 1 even though the job sees both."""
+    now = datetime(2026, 5, 1, tzinfo=UTC)
+    fresh_edge = _make_edge(
+        strength=1.0,
+        last_updated_at=now - timedelta(weeks=8),
+    )
+    already_anchored = _make_edge(
+        strength=0.42,
+        last_updated_at=now,
+    )
+    session = _StubSession([fresh_edge, already_anchored])
+
+    touched = run_monthly_decay(session, now=now)  # type: ignore[arg-type]
+    assert touched == 1
+    assert already_anchored.strength == 0.42  # unchanged

@@ -391,3 +391,91 @@ def test_bootstrap_kind_flip_preserves_event_audit_trail(db_session) -> None:
     assert len(events) == 1
     assert events[0].event_kind == "public_feud"
     assert events[0].edge_id == after.edge_id
+
+
+def test_bootstrap_consolidation_path_preserves_event_audit_trail(db_session) -> None:
+    """Codex P1 (2nd round, PR #28): defensive case where both teammate
+    kinds happen to coexist for the same pair. Re-parenting must move
+    the stale row's events onto the target *at the ORM level*; a bulk
+    SQL UPDATE alone leaves the in-memory ``stale.events`` collection
+    populated and the cascade-delete on ``stale`` would still wipe the
+    audit trail."""
+    a = _make_player(db_session)
+    b = _make_player(db_session)
+    db_session.flush()
+    src_id, dst_id = (
+        (a.canonical_id, b.canonical_id)
+        if a.canonical_id < b.canonical_id
+        else (b.canonical_id, a.canonical_id)
+    )
+
+    # Hand-construct the inconsistent state: both a TEAMMATE and an
+    # EX_TEAMMATE row for the same pair, each with its own event log.
+    teammate_edge = RelationshipEdge(
+        edge_id=uuid.uuid4(),
+        src_id=src_id,
+        dst_id=dst_id,
+        edge_type=RelationshipEdgeType.TEAMMATE,
+        strength=0.5,
+        sentiment=0.2,
+        last_updated_at=datetime(2026, 4, 1, tzinfo=UTC),
+        extra={},
+    )
+    ex_teammate_edge = RelationshipEdge(
+        edge_id=uuid.uuid4(),
+        src_id=src_id,
+        dst_id=dst_id,
+        edge_type=RelationshipEdgeType.EX_TEAMMATE,
+        strength=0.3,
+        sentiment=-0.4,
+        last_updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+        extra={},
+    )
+    db_session.add_all([teammate_edge, ex_teammate_edge])
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            RelationshipEvent(
+                event_id=uuid.uuid4(),
+                edge_id=ex_teammate_edge.edge_id,
+                event_kind="legacy_feud",
+                delta_strength=0.0,
+                delta_sentiment=-0.4,
+                occurred_at=datetime(2026, 2, 1, tzinfo=UTC),
+                payload={},
+            ),
+            RelationshipEvent(
+                event_id=uuid.uuid4(),
+                edge_id=teammate_edge.edge_id,
+                event_kind="recent_clutch",
+                delta_strength=0.1,
+                delta_sentiment=0.0,
+                occurred_at=datetime(2026, 4, 15, tzinfo=UTC),
+                payload={},
+            ),
+        ]
+    )
+    db_session.flush()
+
+    # Drive the bootstrap with a recent shared map so it converges on
+    # the TEAMMATE kind and has to consolidate the stale EX_TEAMMATE row.
+    refresh_ref = datetime(2026, 5, 1, tzinfo=UTC)
+    _seed_map(
+        db_session,
+        match_date=refresh_ref - timedelta(days=5),
+        team1_players=[a, b],
+        team2_players=[],
+    )
+    bootstrap_teammate_edges(db_session, reference_timestamp=refresh_ref)
+    db_session.flush()
+
+    # Only the target row survives, and both events are attached to it.
+    edges = db_session.execute(select(RelationshipEdge)).scalars().all()
+    assert len(edges) == 1
+    assert edges[0].edge_type is RelationshipEdgeType.TEAMMATE
+    assert edges[0].edge_id == teammate_edge.edge_id
+
+    events = db_session.execute(select(RelationshipEvent)).scalars().all()
+    assert {e.event_kind for e in events} == {"legacy_feud", "recent_clutch"}
+    assert all(e.edge_id == teammate_edge.edge_id for e in events)

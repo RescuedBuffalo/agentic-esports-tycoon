@@ -204,8 +204,15 @@ def run_monthly_decay(
     touched = 0
     for edge in rows:
         previous_strength = edge.strength
+        previous_anchor = edge.last_updated_at
         decay_edge(edge, now=now)
-        if edge.strength != previous_strength or edge.last_updated_at == now:
+        # Count only rows where decay actually moved state. The
+        # earlier ``or last_updated_at == now`` clause was true for
+        # rows already anchored at ``now`` from a prior pass — an
+        # immediate rerun would log work that didn't happen and
+        # break the function's idempotence signal (Codex P2 on PR
+        # #28).
+        if edge.strength != previous_strength or edge.last_updated_at != previous_anchor:
             touched += 1
     _logger.info(
         "monthly_decay applied",
