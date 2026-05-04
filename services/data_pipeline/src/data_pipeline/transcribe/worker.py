@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -222,20 +221,40 @@ def _select_pending(
     of transcript state, ordered by created-time. Used by the
     "re-transcribe everything with the new model" workflow that
     follows a model rotation.
+
+    Concurrency: the SELECT takes a row-level ``FOR UPDATE SKIP
+    LOCKED`` on ``media_record`` so two overlapping worker runs
+    can't claim the same media. Without it, both workers would race
+    to ``INSERT INTO transcript`` for the same ``media_id`` and the
+    second one would crash on the PK constraint, rolling back its
+    whole transaction. ``SKIP LOCKED`` is the right primitive here
+    rather than ``NOWAIT``: a second worker should silently skip
+    over claimed rows and pick the next unlocked batch, not fail
+    with "could not obtain lock". The lock is held until the
+    enclosing transaction commits, which the worker contract
+    requires the caller to provide (the CLI wraps the pass in
+    ``session.begin()``).
+
+    ``of=`` pins the lock target to ``MediaRecord`` only — without
+    it Postgres locks every row produced by the join, which on the
+    LEFT JOIN side would mean trying to lock the (NULL) Transcript
+    row and fail with "FOR UPDATE cannot be applied to the nullable
+    side of an outer join".
     """
+    base = select(MediaRecord)
     if include_existing:
-        stmt = select(MediaRecord).order_by(MediaRecord.created_at)
+        stmt = base.order_by(MediaRecord.created_at)
     else:
         # LEFT JOIN + WHERE transcript.media_id IS NULL is the
         # idiomatic "rows in A without a row in B" SQL pattern. Index
         # support: ``transcript.media_id`` is the PK, so the join is
         # an index-only lookup on the right side.
         stmt = (
-            select(MediaRecord)
-            .outerjoin(Transcript, Transcript.media_id == MediaRecord.id)
+            base.outerjoin(Transcript, Transcript.media_id == MediaRecord.id)
             .where(Transcript.media_id.is_(None))
             .order_by(MediaRecord.created_at)
         )
+    stmt = stmt.with_for_update(skip_locked=True, of=MediaRecord)
     if limit is not None:
         stmt = stmt.limit(limit)
     return list(session.execute(stmt).scalars().all())
@@ -346,18 +365,7 @@ def _safe_ratio(numerator: float, denominator: float) -> float | None:
     return numerator / denominator
 
 
-def iter_pending_media(session: Session) -> Iterable[MediaRecord]:
-    """Iterator over every untranscribed media row, ordered by creation.
-
-    Exposed for callers that want to drive their own loop (debugging,
-    bespoke filtering) without the worker's logging or stats. Most
-    callers should use :func:`transcribe_pending` instead.
-    """
-    yield from _select_pending(session, limit=None, include_existing=False)
-
-
 __all__ = [
     "TranscribePendingStats",
-    "iter_pending_media",
     "transcribe_pending",
 ]

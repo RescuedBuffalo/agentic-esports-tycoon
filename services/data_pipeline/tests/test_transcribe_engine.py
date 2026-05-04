@@ -135,3 +135,55 @@ def test_engine_protocol_accepts_minimal_implementation() -> None:
     engine: TranscriptionEngine = _StubEngine()
     assert isinstance(engine, TranscriptionEngine)
     assert engine.model_version == "stub-model"
+
+
+def test_pending_select_uses_for_update_skip_locked() -> None:
+    """The pending-row scan must lock with ``FOR UPDATE SKIP LOCKED``.
+
+    Codex flagged the pre-fix query as racy (PR #29 review): two
+    overlapping worker passes could SELECT the same media, both try
+    to ``INSERT INTO transcript`` for the same ``media_id``, and the
+    second would crash on the PK constraint and roll back its whole
+    transaction.
+
+    Asserting on the compiled SQL (rather than driving two real
+    sessions concurrently — awkward against the per-test savepoint
+    fixture) is the cheapest way to keep the contract: a future
+    refactor that drops the lock clause fails here loudly.
+    """
+    from unittest.mock import MagicMock
+
+    from data_pipeline.transcribe.worker import _select_pending  # noqa: PLC0415
+    from sqlalchemy.dialects import postgresql
+
+    captured: dict[str, str] = {}
+
+    def fake_execute(stmt, *args, **kwargs):  # type: ignore[no-untyped-def]
+        captured["sql"] = str(
+            stmt.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+        )
+        # Return an object that satisfies ``.scalars().all()`` returning [].
+        scalars = MagicMock()
+        scalars.all.return_value = []
+        result = MagicMock()
+        result.scalars.return_value = scalars
+        return result
+
+    session = MagicMock()
+    session.execute.side_effect = fake_execute
+
+    _select_pending(session, limit=10, include_existing=False)
+    assert "FOR UPDATE" in captured["sql"]
+    assert "SKIP LOCKED" in captured["sql"]
+    # ``OF media_record`` pins the lock target to the parent table
+    # only — without it Postgres would try to lock the (NULL)
+    # Transcript side of the LEFT JOIN and bail with "FOR UPDATE
+    # cannot be applied to the nullable side of an outer join".
+    assert "OF media_record" in captured["sql"]
+
+    # Same contract on the include_existing path so a re-transcribe
+    # job overlapping with a normal pass doesn't double up either.
+    captured.clear()
+    _select_pending(session, limit=None, include_existing=True)
+    assert "FOR UPDATE" in captured["sql"]
+    assert "SKIP LOCKED" in captured["sql"]
