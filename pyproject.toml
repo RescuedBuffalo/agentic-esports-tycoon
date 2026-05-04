@@ -151,3 +151,13 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["pgvector", "pgvector.*"]
 ignore_missing_imports = true
+
+# ``faster-whisper`` is the BUF-21 default transcription backend.
+# Same lazy-import posture as ``sentence_transformers`` above: the
+# package ships under the ``data-pipeline[transcribe]`` extra and is
+# imported lazily inside ``FasterWhisperEngine._load`` so the rest of
+# the codebase (and the test suite, which injects a stub engine)
+# doesn't need it installed.
+[[tool.mypy.overrides]]
+module = ["faster_whisper", "faster_whisper.*"]
+ignore_missing_imports = true

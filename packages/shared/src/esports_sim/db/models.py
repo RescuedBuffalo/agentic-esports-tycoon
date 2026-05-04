@@ -35,6 +35,7 @@ from sqlalchemy.orm import Mapped, Mapper, Session, mapped_column, relationship
 from esports_sim.db.base import Base
 from esports_sim.db.enums import (
     EntityType,
+    MediaKind,
     Platform,
     RelationshipEdgeType,
     ReviewStatus,
@@ -77,6 +78,12 @@ _review_status = PgEnum(
 _relationship_edge_type = PgEnum(
     RelationshipEdgeType,
     name="relationship_edge_type",
+    create_type=False,
+    values_callable=lambda e: [v.value for v in e],
+)
+_media_kind = PgEnum(
+    MediaKind,
+    name="media_kind",
     create_type=False,
     values_callable=lambda e: [v.value for v in e],
 )
@@ -881,6 +888,190 @@ class PersonalityEmbedding(Base):
     )
 
 
+class MediaRecord(Base):
+    """One audio/video file the local Whisper worker may transcribe (BUF-21).
+
+    The cardinality is "one row per upstream media artifact, regardless
+    of whether we've transcribed it yet". The Whisper batch worker
+    pulls rows that don't have a corresponding :class:`Transcript`
+    child and produces one. Re-runs replace the existing transcript
+    in place — the ``transcript`` relationship is one-to-zero-or-one.
+
+    ``source`` + ``source_uri`` is the dedup key — a re-ingest of the
+    same Twitch VOD or YouTube upload UPSERTs in place rather than
+    minting a duplicate row. The unique constraint at the schema
+    layer is the runtime guarantee.
+
+    ``local_path`` is the path on the worker host's filesystem. We
+    keep it as a plain string rather than an FK to a blob store
+    because the Whisper worker just needs ffmpeg-readable bytes;
+    where they live (a local SSD vs. a network mount vs. a copy
+    materialised from object storage) is an operational concern,
+    not a schema one.
+
+    ``entity_id`` is nullable because not every media artifact maps
+    cleanly to one canonical entity — a podcast with three guests,
+    a tournament broadcast — and forcing every upstream to pick a
+    canonical would be a worse failure mode than leaving the column
+    null and letting downstream feature joins handle the multi-
+    speaker case explicitly.
+    """
+
+    __tablename__ = "media_record"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    # Free-form identifier for the upstream that produced this row.
+    # ``twitch_vod`` / ``youtube`` / ``podcast`` / ``manual`` are the
+    # current populations; new sources just pick a new string. Same
+    # convention as :class:`StagingRecord.source` so a single audit
+    # query (``SELECT source, count(*) FROM media_record GROUP BY 1``)
+    # gives the corpus mix at a glance.
+    source: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # The canonical upstream URL or platform identifier. Unique per
+    # source so a re-ingest doesn't fork the row. 1024 chars is plenty
+    # for any plausible URL — Twitch VOD URLs sit around 80, YouTube
+    # ones around 50; tightening this would risk truncating a
+    # legitimate redirect chain.
+    source_uri: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # On-disk location for the worker. Not unique: nothing stops two
+    # rows from pointing at the same file (e.g., two upstreams of the
+    # same VOD). Keeping it nullable would make every worker check
+    # for a NULL before launching ffmpeg — easier to require it at
+    # ingest time and have a separate ``download_pending`` workflow
+    # if we later want async downloads.
+    local_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    media_kind: Mapped[MediaKind] = mapped_column(_media_kind, nullable=False)
+    # Probed media duration in seconds. Nullable because a fresh
+    # ingest may register the row before the file is ffprobe'd; the
+    # worker is allowed to populate it as a side-effect when it opens
+    # the file. The transcript row carries its own duration counter
+    # for the actually-transcribed span (silence excluded by VAD), so
+    # this column is the upstream-reported total.
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # BCP-47 language tag if known up-front (e.g. ``"en"``, ``"ko"``);
+    # null lets Whisper auto-detect on first transcription. The
+    # transcript row records the *detected* language separately so a
+    # mismatch is auditable.
+    language: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # Optional canonical-entity attribution. ``ON DELETE SET NULL``
+    # keeps the media row alive if the entity gets merged or deleted
+    # — the audio file itself is still useful as raw corpus even
+    # after the canonical it pointed at goes away.
+    entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entity.canonical_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Free-form provenance: episode title, broadcast date, ingest run
+    # id. JSONB so a future feature query can pull a structured field
+    # out without a follow-up migration.
+    extra: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    transcript: Mapped[Transcript | None] = relationship(
+        back_populates="media",
+        cascade="all, delete-orphan",
+        uselist=False,
+        lazy="selectin",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source",
+            "source_uri",
+            name="uq_media_record_source_source_uri",
+        ),
+    )
+
+
+class Transcript(Base):
+    """Whisper transcription output for one :class:`MediaRecord` (BUF-21).
+
+    One row per ``media_id`` — re-running the worker on the same
+    media UPSERTs in place. ``model_version`` is recorded on the row
+    rather than the unique key because BUF-21's contract is "we have
+    one canonical transcript per file"; if a future workflow wants
+    to keep multiple transcripts per media (e.g. for diarization
+    A/B), promote ``(media_id, model_version)`` to the unique key
+    in that follow-up migration.
+
+    ``text`` is the full concatenated transcript and is the column
+    BUF-21's acceptance criterion targets ("transcripts searchable
+    via SQL on the transcript column"). A future migration can layer
+    a tsvector + GIN index on top for proper full-text search; for
+    now plain ``text`` keeps the column queryable with ``ILIKE`` /
+    ``%`` matches without forcing a tsvector maintenance cost on
+    every insert.
+
+    ``segments`` is the per-segment list Whisper emits, preserved
+    as JSONB so a downstream feature extractor (timestamp-aligned
+    sentiment, speaker turns) doesn't have to re-run the model.
+    """
+
+    __tablename__ = "transcript"
+
+    media_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("media_record.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # BCP-47 tag of what Whisper actually decoded. May differ from
+    # the parent ``MediaRecord.language`` (e.g., a "mixed" stream
+    # where the upstream-declared tag was wrong); keeping both lets
+    # an auditor see the disagreement.
+    language: Mapped[str] = mapped_column(String(8), nullable=False)
+    # Whisper model identity (e.g. ``"large-v3"``). Per-row so a
+    # mixed corpus that's been partly re-transcribed with a newer
+    # model is auditable from the table itself.
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # List of objects, one per Whisper segment::
+    #   [{"start": 0.0, "end": 4.2, "text": "...", "speaker": null}, ...]
+    # ``speaker`` is null for now; pyannote-driven diarization (gated
+    # behind a flag in BUF-21's note) will populate it later.
+    segments: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+    )
+    # The actually-transcribed audio span in seconds. Equal to the
+    # parent's ``duration_seconds`` minus VAD-skipped silence. Stored
+    # so a throughput query (``SUM(duration_seconds) / SUM(wallclock)``)
+    # has the right numerator without re-deriving from segments.
+    duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    # Wallclock the model spent on this file. Lets the dashboard show
+    # "audio-seconds per wallclock-second" — BUF-21 acceptance asks
+    # for 10h in <30min, i.e., ≥20× realtime, and this is the column
+    # that proves it.
+    wallclock_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    # Optional path to the per-media ``transcript.json`` sidecar the
+    # worker writes. Nullable so a callers that doesn't materialise a
+    # sidecar (e.g., a one-off re-transcription called from a unit
+    # test) can still land a row.
+    transcript_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    transcribed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    media: Mapped[MediaRecord] = relationship(back_populates="transcript")
+
+
 class TranscriptChunkEmbedding(Base):
     """One embedded chunk of a transcript (BUF-28, ADR-006).
 
@@ -896,14 +1087,12 @@ class TranscriptChunkEmbedding(Base):
     out of the hot path. Costs ~2 KB per row in TOAST storage; the
     saving is one less JOIN on every retrieval call.
 
-    ``media_id`` is intentionally **not** a foreign key in this
-    revision. The ``media`` table that BUF-21 owns isn't in the
-    schema yet; minting an FK constraint pointing at a non-existent
-    table would force this migration to wait. The next migration
-    after BUF-21 lands will add the FK + ``ON DELETE CASCADE`` so a
-    deleted media row drops its chunks. Until then, the cleanup
-    contract is the writer's responsibility — the Whisper pipeline
-    deletes the per-media chunks before re-inserting on a re-run.
+    ``media_id`` FKs to :class:`MediaRecord` with ``ON DELETE
+    CASCADE`` (added in migration 0011 once BUF-21's media table
+    landed) — pulling a media row drops its chunks atomically. Until
+    that migration ran, the writer was the cleanup authority; this
+    docstring is kept for the historical record but the FK is now
+    the runtime guarantee.
 
     Idempotency: ``(media_id, chunk_idx)`` is unique. A re-embedding
     pass for the same media UPSERTs by that key, so a re-run of the
@@ -917,12 +1106,13 @@ class TranscriptChunkEmbedding(Base):
         primary_key=True,
         default=uuid.uuid4,
     )
-    # No FK yet — see class docstring. Indexed because every read
-    # path filters on it (either "all chunks for this media" during
-    # cleanup, or "select chunk_text where media_id IN (...)" after
-    # the kNN narrows down the candidate set).
+    # FK installed by migration 0011 (BUF-21). Indexed because every
+    # read path filters on it (either "all chunks for this media"
+    # during cleanup, or "select chunk_text where media_id IN (...)"
+    # after the kNN narrows down the candidate set).
     media_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
+        ForeignKey("media_record.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -1164,6 +1354,7 @@ __all__ = [
     "EntityAlias",
     "MapResult",
     "Match",
+    "MediaRecord",
     "PatchEra",
     "PatchIntent",
     "PatchNote",
@@ -1175,5 +1366,6 @@ __all__ = [
     "StagingInvariantError",
     "StagingRecord",
     "TemporalBleedError",
+    "Transcript",
     "TranscriptChunkEmbedding",
 ]

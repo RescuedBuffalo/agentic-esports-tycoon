@@ -97,6 +97,7 @@ def db_engine() -> Generator[Engine, None, None]:
             Base.metadata.drop_all(bind=conn)
             conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
             for typename in (
+                "media_kind",
                 "relationship_edge_type",
                 "review_status",
                 "staging_status",

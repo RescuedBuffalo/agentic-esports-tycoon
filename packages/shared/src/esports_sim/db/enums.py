@@ -70,6 +70,22 @@ class ReviewStatus(enum.StrEnum):
     BLOCKED = "blocked"
 
 
+class MediaKind(enum.StrEnum):
+    """The two media shapes BUF-21's local Whisper worker accepts.
+
+    Whisper itself only consumes a decoded audio stream, but the
+    distinction matters upstream: a ``video`` row tells the worker to
+    demux the audio track first, while ``audio`` rows can stream
+    straight into the model. Keeping the distinction at the schema
+    layer also lets a downstream feature query split caster commentary
+    (``audio`` from podcasts) from in-game footage (``video`` from
+    VODs) without re-deriving it.
+    """
+
+    AUDIO = "audio"
+    VIDEO = "video"
+
+
 class RelationshipEdgeType(enum.StrEnum):
     """Kinds of pairwise relationships the ecosystem layer tracks (BUF-26, System 07).
 
