@@ -144,6 +144,40 @@ System prompt is wrapped in `cache_control` (1 h TTL) so a corpus-wide
 re-classification amortises the rubric across patches. One patch costs
 well under the BUF-22 `patch_intent` per-purpose soft cap ($3/wk).
 
+## Local Whisper transcription (BUF-21)
+
+Transcripts of player and caster media are produced locally on the
+5090 — cloud Whisper APIs would burn the BUF-22 budget in days.
+The worker pulls `media_record` rows that don't yet have a
+`transcript` child, runs `faster-whisper large-v3` (CTranslate2 +
+Silero VAD), writes the row, and optionally drops a
+`transcript.json` sidecar:
+
+```bash
+DATABASE_URL=postgresql+psycopg://nexus:nexus@localhost:5432/nexus \
+    uv run nexus-transcribe run \
+        --sidecar-root data/transcripts \
+        --limit 100
+```
+
+A re-run is a no-op once every media is transcribed; pass
+`--include-existing` after rotating the model to re-transcribe in
+place (DELETE-then-INSERT, cleanly replacing `segments` JSONB).
+
+The `faster-whisper` package ships under the `[transcribe]` extra
+so the rest of the pipeline doesn't pull CTranslate2 + cuDNN by
+default:
+
+```bash
+uv pip install 'data-pipeline[transcribe]'
+```
+
+`transcript.text` is a plain TEXT column and is the BUF-21
+acceptance target — searchable today with `ILIKE`, promotable to a
+tsvector + GIN index later if usage demands it. Public Python API:
+`from data_pipeline.transcribe import transcribe_pending,
+FasterWhisperEngine`.
+
 ## Claude API budget governor (BUF-22)
 
 Every Claude call goes through `esports_sim.budget.claude_call`. The governor

@@ -29,6 +29,7 @@ from esports_sim.db.base import Base
 from esports_sim.db.enums import (
     SYMMETRIC_RELATIONSHIP_EDGE_TYPES,
     EntityType,
+    MediaKind,
     Platform,
     RelationshipEdgeType,
     ReviewStatus,
@@ -39,6 +40,7 @@ from esports_sim.db.models import (
     AliasReviewQueue,
     Entity,
     EntityAlias,
+    MediaRecord,
     PatchEra,
     PatchIntent,
     PatchNote,
@@ -49,6 +51,7 @@ from esports_sim.db.models import (
     StagingInvariantError,
     StagingRecord,
     TemporalBleedError,
+    Transcript,
     TranscriptChunkEmbedding,
 )
 
@@ -59,6 +62,8 @@ __all__ = [
     "Entity",
     "EntityAlias",
     "EntityType",
+    "MediaKind",
+    "MediaRecord",
     "PatchEra",
     "PatchIntent",
     "PatchNote",
@@ -74,5 +79,6 @@ __all__ = [
     "StagingStatus",
     "SYMMETRIC_RELATIONSHIP_EDGE_TYPES",
     "TemporalBleedError",
+    "Transcript",
     "TranscriptChunkEmbedding",
 ]

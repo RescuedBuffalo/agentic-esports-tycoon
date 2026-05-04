@@ -30,6 +30,25 @@ dependencies = [
     "playwright>=1.45",
 ]
 
+# Optional extras keep the heavy ML stacks out of the default install.
+# The transcription worker (BUF-21) needs faster-whisper (CTranslate2 +
+# cuDNN); the data-pipeline import graph stays cheap because
+# :class:`FasterWhisperEngine` lazy-imports it on first use, and tests
+# inject a deterministic stub engine so CI doesn't have to install it.
+[project.optional-dependencies]
+transcribe = [
+    # CTranslate2-backed Whisper. Pinned floor matches the version we
+    # benchmarked the ≥20× realtime acceptance against on a 5090.
+    "faster-whisper>=1.0",
+]
+
+[project.scripts]
+# BUF-21 local Whisper batch worker. Lives next to the cross-cutting
+# ``nexus`` script (defined in packages/shared) rather than as a
+# subcommand of it because the worker is service-layer code and a
+# nexus subcommand would invert the dependency arrow.
+nexus-transcribe = "data_pipeline.transcribe.cli:main"
+
 [tool.uv.sources]
 esports-sim-shared = { workspace = true }
 

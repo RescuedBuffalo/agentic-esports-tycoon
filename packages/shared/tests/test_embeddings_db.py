@@ -25,7 +25,7 @@ from esports_sim.embeddings import (
     upsert_transcript_chunks,
 )
 from esports_sim.embeddings.embedder import Embedder
-from fixtures import make_entity, make_entity_alias
+from fixtures import make_entity, make_entity_alias, make_media_record
 from sqlalchemy import inspect, select, text
 
 pytestmark = pytest.mark.integration
@@ -164,7 +164,15 @@ def test_personality_cascade_deletes_with_entity(db_session, embedder: Embedder)
 
 def test_transcript_chunks_upsert_by_media_idx(db_session, embedder: Embedder) -> None:
     """`(media_id, chunk_idx)` is the dedup anchor; re-runs UPSERT in place."""
-    media_id = uuid.uuid4()
+    # BUF-21's migration 0011 wired the FK
+    # ``transcript_chunk_embedding.media_id → media_record.id``;
+    # planting a parent row keeps the insert legal without
+    # changing what the test is actually exercising (the
+    # idempotency contract on (media_id, chunk_idx)).
+    media = make_media_record()
+    db_session.add(media)
+    db_session.flush()
+    media_id = media.id
     written = upsert_transcript_chunks(
         db_session,
         media_id=media_id,
@@ -209,7 +217,13 @@ def test_transcript_re_run_with_fewer_chunks_drops_tail(db_session, embedder: Em
     at higher ``chunk_idx`` values would remain queryable and surface
     as outdated text in retrieval results.
     """
-    media_id = uuid.uuid4()
+    # FK back to ``media_record`` (added by BUF-21's migration 0011) —
+    # see :func:`test_transcript_chunks_upsert_by_media_idx` for the
+    # rationale.
+    media = make_media_record()
+    db_session.add(media)
+    db_session.flush()
+    media_id = media.id
     long_run = [
         "transcript-chunk-a",
         "transcript-chunk-b",
