@@ -33,7 +33,13 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Mapped, Mapper, Session, mapped_column, relationship
 
 from esports_sim.db.base import Base
-from esports_sim.db.enums import EntityType, Platform, ReviewStatus, StagingStatus
+from esports_sim.db.enums import (
+    EntityType,
+    Platform,
+    RelationshipEdgeType,
+    ReviewStatus,
+    StagingStatus,
+)
 
 # all-MiniLM-L6-v2's output width (BUF-28, ADR-006). Pinned as a
 # module-level constant so the model declarations, the migration, and
@@ -65,6 +71,12 @@ _staging_status = PgEnum(
 _review_status = PgEnum(
     ReviewStatus,
     name="review_status",
+    create_type=False,
+    values_callable=lambda e: [v.value for v in e],
+)
+_relationship_edge_type = PgEnum(
+    RelationshipEdgeType,
+    name="relationship_edge_type",
     create_type=False,
     values_callable=lambda e: [v.value for v in e],
 )
@@ -937,6 +949,214 @@ class TranscriptChunkEmbedding(Base):
     )
 
 
+class RelationshipEdge(Base):
+    """One pairwise relationship between two canonical entities (BUF-26, System 07).
+
+    Each row encodes a single directed claim of the form "``src_id``
+    relates to ``dst_id`` as ``edge_type``" together with two scalar
+    attributes:
+
+    * ``strength`` (``[0, 1]``) — how vigorous the relationship is
+      *right now*. Decays exponentially with no signal — see
+      :func:`ecosystem.relationships.decay_strength`. New
+      :class:`RelationshipEvent` rows reset the clock and add to it.
+    * ``sentiment`` (``[-1, 1]``) — valence. Does **not** decay; an
+      ex-teammate edge keeps its positive sentiment after the strength
+      has bled out. Negative sentiment is what turns a TEAMMATE edge
+      into a feud rather than a friendship.
+
+    Symmetric edge types (see
+    :data:`esports_sim.db.enums.SYMMETRIC_RELATIONSHIP_EDGE_TYPES`)
+    must be persisted with ``src_id < dst_id`` so a single canonical
+    pair owns at most one row of that type. The migration enforces the
+    rule with a CHECK; the bootstrap and the application API
+    canonicalise endpoints up front. Asymmetric kinds (mentor,
+    manager_of) keep their direction.
+
+    ``last_updated_at`` is the anchor :func:`decay_strength` reads to
+    decide how many weeks of decay to apply on the next read or job
+    pass. The monthly decay job (see
+    :func:`ecosystem.relationships.run_monthly_decay`) is the canonical
+    writer; ad-hoc updates set it explicitly.
+    """
+
+    __tablename__ = "relationship_edge"
+
+    edge_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    src_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entity.canonical_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    dst_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entity.canonical_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    edge_type: Mapped[RelationshipEdgeType] = mapped_column(
+        _relationship_edge_type,
+        nullable=False,
+        index=True,
+    )
+    strength: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        server_default="0",
+    )
+    sentiment: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        server_default="0",
+    )
+    # Anchor for the next ``decay_strength`` call. Initialised to the
+    # creation time of the row when the bootstrap or steady-state writer
+    # mints it; updated in place by the monthly decay job and by every
+    # event that touches strength so the next decay pass measures from
+    # the right reference point.
+    last_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    # Free-form provenance. The bootstrap stamps ``shared_maps`` /
+    # ``last_shared_match_at`` here so a downstream debug query can
+    # explain why a particular edge ended up TEAMMATE vs EX_TEAMMATE.
+    extra: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    events: Mapped[list[RelationshipEvent]] = relationship(
+        back_populates="edge",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    __table_args__ = (
+        # One row per (pair, kind). For symmetric kinds the bootstrap
+        # canonicalises endpoints to ``src < dst`` so the pair owns at
+        # most one row of that type; for asymmetric kinds (mentor,
+        # manager_of) the unique constraint distinguishes the two
+        # directions.
+        UniqueConstraint(
+            "src_id",
+            "dst_id",
+            "edge_type",
+            name="uq_relationship_edge_src_dst_type",
+        ),
+        # A self-edge is meaningless and would always sort to the wrong
+        # side of the symmetry CHECK below; pin it out at the schema
+        # layer rather than relying on every writer to remember.
+        CheckConstraint(
+            "src_id <> dst_id",
+            name="ck_relationship_edge_no_self_edge",
+        ),
+        # Symmetric kinds must be stored canonically (src < dst) so a
+        # pair owns at most one row of that type. Asymmetric kinds
+        # (mentor, manager_of) keep direction. Listing the symmetric
+        # kinds inline rather than referencing the Python frozenset
+        # keeps the migration self-contained — adding a new symmetric
+        # kind is a coordinated migration + enum + frozenset change.
+        CheckConstraint(
+            "edge_type NOT IN ('teammate', 'ex_teammate', 'rival', 'friend') " "OR src_id < dst_id",
+            name="ck_relationship_edge_symmetric_canonical",
+        ),
+        CheckConstraint(
+            "strength >= 0 AND strength <= 1",
+            name="ck_relationship_edge_strength_range",
+        ),
+        CheckConstraint(
+            "sentiment >= -1 AND sentiment <= 1",
+            name="ck_relationship_edge_sentiment_range",
+        ),
+    )
+
+
+class RelationshipEvent(Base):
+    """One signal that touched a :class:`RelationshipEdge` (BUF-26, System 07).
+
+    Append-only. Every signal that should affect strength or sentiment
+    lands as a row here first; the writer that produced it also folds
+    ``delta_strength`` / ``delta_sentiment`` into the parent edge and
+    bumps ``last_updated_at`` so the decay job's clock resets.
+
+    Keeping the event log separate from the in-place edge update is the
+    BUF-78 event-log pattern: an audit trail that lets a future
+    reducer rebuild edge state from genesis if the in-place column
+    drifts. The cardinality is several events per edge per season, so
+    the table is bounded by roster turnover, not by tick rate.
+
+    ``event_kind`` is a free-form string deliberately — the value
+    space is much larger than the small enum on the parent edge
+    (``"shared_clutch"``, ``"public_feud"``, ``"social_media_jab"``,
+    ``"won_together"``, ``"benched"``, …) and gating it on a
+    Postgres ENUM would force an ALTER TYPE migration every time a
+    new signal type ships.
+    """
+
+    __tablename__ = "relationship_event"
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    edge_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("relationship_edge.edge_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    event_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Both deltas are signed and can land outside ``[-1, 1]`` if a
+    # particularly weighty event swings the edge past saturation; the
+    # parent edge's CHECK constraints clamp the cumulative result.
+    delta_strength: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        server_default="0",
+    )
+    delta_sentiment: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        server_default="0",
+    )
+    # When the event happened in the simulation/world. Indexed because
+    # the event-stream queries (``last 30 days for this edge``,
+    # ``replay this edge from genesis``) all filter on it.
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    edge: Mapped[RelationshipEdge] = relationship(back_populates="events")
+
+
 __all__ = [
     "AliasReviewQueue",
     "EMBEDDING_DIM",
@@ -950,6 +1170,8 @@ __all__ = [
     "PersonalityEmbedding",
     "PlayerMatchStat",
     "RawRecord",
+    "RelationshipEdge",
+    "RelationshipEvent",
     "StagingInvariantError",
     "StagingRecord",
     "TemporalBleedError",
