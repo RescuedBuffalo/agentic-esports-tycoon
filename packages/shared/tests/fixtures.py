@@ -12,11 +12,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from esports_sim.db.enums import EntityType, Platform, ReviewStatus, StagingStatus
+from esports_sim.db.enums import EntityType, MediaKind, Platform, ReviewStatus, StagingStatus
 from esports_sim.db.models import (
     AliasReviewQueue,
     Entity,
     EntityAlias,
+    MediaRecord,
     RawRecord,
     StagingRecord,
 )
@@ -91,6 +92,36 @@ def make_raw_record(
         payload=body,
         content_hash=content_hash
         or hashlib.sha256(repr(sorted(body.items())).encode()).hexdigest(),
+    )
+
+
+def make_media_record(
+    *,
+    id: uuid.UUID | None = None,
+    source: str = "twitch_vod",
+    source_uri: str | None = None,
+    local_path: str = "/dev/null",
+    media_kind: MediaKind = MediaKind.AUDIO,
+    language: str | None = None,
+    entity_id: uuid.UUID | None = None,
+) -> MediaRecord:
+    """Mint a placeholder :class:`MediaRecord` row (BUF-21).
+
+    Useful for tests that need a valid ``media_id`` to satisfy the FK
+    on ``transcript_chunk_embedding`` (or ``transcript``) without
+    actually pointing at a real audio file. The default
+    ``local_path`` is ``/dev/null`` precisely to make the "no file
+    needed" intent obvious.
+    """
+    media_id = id or uuid.uuid4()
+    return MediaRecord(
+        id=media_id,
+        source=source,
+        source_uri=source_uri or f"https://example.test/{media_id}",
+        local_path=local_path,
+        media_kind=media_kind,
+        language=language,
+        entity_id=entity_id,
     )
 
 
